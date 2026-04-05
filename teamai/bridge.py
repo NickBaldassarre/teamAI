@@ -118,7 +118,7 @@ def default_bridge_artifacts(project_root: Path) -> BridgeArtifacts:
 
 
 def launch_bridge(config: BridgeLaunchConfig, *, dry_run: bool = False) -> dict[str, object]:
-    config = _apply_memory_guardrails(config)
+    config = prepare_bridge_config(config)
     config.project_root.mkdir(parents=True, exist_ok=True)
     config.artifacts.state_dir.mkdir(parents=True, exist_ok=True)
     _clear_previous_bridge_outputs(config.artifacts)
@@ -230,6 +230,10 @@ def _preflight_bridge_launch(config: BridgeLaunchConfig) -> None:
 def _apply_memory_guardrails(config: BridgeLaunchConfig) -> BridgeLaunchConfig:
     profile = _classify_memory_profile(task=config.task, execution_mode=config.execution_mode)
     return _apply_memory_profile(config, profile)
+
+
+def prepare_bridge_config(config: BridgeLaunchConfig) -> BridgeLaunchConfig:
+    return _apply_memory_guardrails(config)
 
 
 def _classify_memory_profile(*, task: str, execution_mode: str) -> str:
@@ -528,6 +532,15 @@ def load_bridge_status(artifacts: BridgeArtifacts) -> dict[str, object]:
 
 
 def _build_run_command(config: BridgeLaunchConfig) -> list[str]:
+    return build_run_command(config)
+
+
+def build_run_command(
+    config: BridgeLaunchConfig,
+    *,
+    output_format: str = "handoff_json",
+    output_file: Path | None = None,
+) -> list[str]:
     command = [
         str(config.python_executable),
         "-u",
@@ -536,9 +549,9 @@ def _build_run_command(config: BridgeLaunchConfig) -> list[str]:
         "run",
         config.task,
         "--output-format",
-        "handoff_json",
+        output_format,
         "--output-file",
-        str(config.artifacts.handoff_file),
+        str(output_file or config.artifacts.handoff_file),
         "--execution-mode",
         config.execution_mode,
     ]

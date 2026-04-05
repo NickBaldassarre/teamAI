@@ -22,6 +22,7 @@ MAX_IMPROVEMENT_NOTE_CHARS = 1_500
 MIN_IMPROVEMENT_NOTE_SCORE = 6
 SPECIALIZED_NOTE_STALE_AGE = 2
 LOW_SIGNAL_SINGLETON_STALE_AGE = 2
+MAX_EVAL_FAILURE_CASES = 4
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,70 @@ class WorkspaceMemoryStore:
         memory_path = state_dir / MEMORY_FILE_NAME
         memory_path.write_text(self._render_memory_markdown(records), encoding="utf-8")
 
+    def persist_eval_feedback(
+        self,
+        *,
+        workspace: Path,
+        suite_name: str,
+        completed_at: datetime,
+        metrics: dict[str, object],
+        cases: list[dict[str, object]],
+        description: str = "",
+        runtime_health: dict[str, object] | None = None,
+    ) -> None:
+        state_dir = self._state_dir(workspace)
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        summary = self._summarize_eval_feedback(
+            suite_name=suite_name,
+            metrics=metrics,
+            cases=cases,
+            description=description,
+            runtime_health=runtime_health,
+        )
+        next_tasks = self._derive_eval_next_tasks(metrics=metrics, cases=cases, runtime_health=runtime_health)
+        improvement_notes = self._derive_eval_feedback_notes(metrics=metrics, cases=cases, runtime_health=runtime_health)
+        warnings = self._derive_eval_feedback_warnings(cases, runtime_health=runtime_health)
+
+        total_cases = int(metrics.get("total_cases", len(cases)) or len(cases))
+        passed_cases = int(metrics.get("passed_cases", 0) or 0)
+        failed_cases = int(metrics.get("failed_cases", total_cases - passed_cases) or 0)
+
+        records = self._load_history_records(workspace)
+        records.append(
+            {
+                "source": "eval_suite",
+                "completed_at": completed_at.isoformat(),
+                "task": f"Eval suite: {suite_name}",
+                "status": "completed",
+                "stop_reason": "eval_feedback_recorded",
+                "task_route": "eval_feedback",
+                "execution_mode": "read_only",
+                "summary": summary,
+                "next_tasks": next_tasks,
+                "warnings": warnings,
+                "model_id": "eval_harness",
+                "successful_action_count": passed_cases,
+                "failed_action_count": failed_cases,
+                "approval_created": self._safe_float_from_mapping(metrics, "approval_rate") > 0.0,
+                "improvement_notes": improvement_notes,
+                "eval_metrics": metrics,
+                "runtime_health": runtime_health or {},
+                "total_cases": total_cases,
+                "passed_cases": passed_cases,
+                "failed_cases": failed_cases,
+                "description": description.strip(),
+            }
+        )
+        records = records[-MAX_HISTORY_ENTRIES:]
+
+        history_path = state_dir / RUN_HISTORY_FILE_NAME
+        history_payload = "\n".join(json.dumps(record, ensure_ascii=True) for record in records)
+        history_path.write_text(history_payload + ("\n" if history_payload else ""), encoding="utf-8")
+
+        memory_path = state_dir / MEMORY_FILE_NAME
+        memory_path.write_text(self._render_memory_markdown(records), encoding="utf-8")
+
     def _load_history_records(self, workspace: Path) -> list[dict[str, object]]:
         history_path = self._state_dir(workspace) / RUN_HISTORY_FILE_NAME
         if not history_path.exists():
@@ -172,13 +237,20 @@ class WorkspaceMemoryStore:
             task_route = str(record.get("task_route", "unknown-route"))
             task = str(record.get("task", "unknown-task"))
             stop_reason = str(record.get("stop_reason", "unknown-stop"))
-            successful_action_count = int(record.get("successful_action_count", 0) or 0)
-            failed_action_count = int(record.get("failed_action_count", 0) or 0)
             summary = str(record.get("summary", "")).strip()
             rendered.append(f"- {completed_at} | {status} | route={task_route} | {task}")
-            rendered.append(
-                f"  stop: {stop_reason}; actions: {successful_action_count} ok / {failed_action_count} failed"
-            )
+            if str(record.get("source", "")).strip() == "eval_suite":
+                passed_cases = int(record.get("passed_cases", 0) or 0)
+                failed_cases = int(record.get("failed_cases", 0) or 0)
+                rendered.append(
+                    f"  stop: {stop_reason}; eval cases: {passed_cases} passed / {failed_cases} failed"
+                )
+            else:
+                successful_action_count = int(record.get("successful_action_count", 0) or 0)
+                failed_action_count = int(record.get("failed_action_count", 0) or 0)
+                rendered.append(
+                    f"  stop: {stop_reason}; actions: {successful_action_count} ok / {failed_action_count} failed"
+                )
             if summary:
                 rendered.append(f"  summary: {summary[:200]}")
         return "\n".join(rendered)
@@ -212,17 +284,7 @@ class WorkspaceMemoryStore:
                     continue
                 note_stats.setdefault(note, []).append(index)
 
-        lines = [
-            (
-                "Latest route outcome: "
-                f"{latest.get('task_route', 'unknown-route')} -> {latest.get('stop_reason', 'unknown-stop')}."
-            ),
-            (
-                "Latest tool reliability: "
-                f"{int(latest.get('successful_action_count', 0) or 0)} successful action(s), "
-                f"{int(latest.get('failed_action_count', 0) or 0)} failed action(s)."
-            ),
-        ]
+        lines = [*self._render_latest_outcome_lines(latest)]
         if current_focus_tags:
             lines.append(f"Current task bias: {self._describe_focus_tags(current_focus_tags)}")
 
@@ -307,6 +369,8 @@ class WorkspaceMemoryStore:
             or "approved patch" in note_lower
         ):
             score += 3
+        if str(latest_record.get("source", "")).strip() == "eval_suite" and "eval suite" in note_lower:
+            score += 3
         if latest_stop_reason == "local_drift_rerouted" and "reroute earlier" in note_lower:
             score += 3
         if latest_stop_reason == "inspection_synthesized" and "repository inspection" in note_lower:
@@ -332,7 +396,7 @@ class WorkspaceMemoryStore:
         current_focus_tags: set[str],
     ) -> int:
         penalty = max(0, age - 1) * 3
-        specialized_tags = {"inspection", "patch_writes", "verification", "continuation", "codex_handoff"}
+        specialized_tags = {"inspection", "patch_writes", "verification", "continuation", "codex_handoff", "evaluation"}
         if count == 1 and age >= LOW_SIGNAL_SINGLETON_STALE_AGE:
             penalty += 4
         if note_tags & specialized_tags and age >= SPECIALIZED_NOTE_STALE_AGE:
@@ -343,6 +407,8 @@ class WorkspaceMemoryStore:
 
     @staticmethod
     def _base_improvement_note_score(note_lower: str) -> int:
+        if "eval suite" in note_lower or "evaluation harness" in note_lower:
+            return 6
         if "codex handoff" in note_lower or "deterministic patch route" in note_lower:
             return 6
         if "approval_required" in note_lower or "reroute earlier" in note_lower:
@@ -362,6 +428,8 @@ class WorkspaceMemoryStore:
     @staticmethod
     def _improvement_note_tags(note_lower: str) -> set[str]:
         tags: set[str] = set()
+        if "eval suite" in note_lower or "evaluation harness" in note_lower:
+            tags.add("evaluation")
         if "codex handoff" in note_lower:
             tags.add("codex_handoff")
         if (
@@ -372,7 +440,13 @@ class WorkspaceMemoryStore:
             tags.add("patch_writes")
         if "repository inspection tasks" in note_lower:
             tags.add("inspection")
-        if "most specific related unittest" in note_lower or "approved patch" in note_lower:
+        if (
+            "most specific related unittest" in note_lower
+            or "approved patch" in note_lower
+            or "verification" in note_lower
+            or "pytest" in note_lower
+            or "unittest" in note_lower
+        ):
             tags.update({"continuation", "verification"})
         if "strict and compact json" in note_lower:
             tags.add("structured_output")
@@ -396,11 +470,15 @@ class WorkspaceMemoryStore:
             tags.add("codex_handoff")
         if task_route in {"deterministic_patch", "explicit_write_loop"}:
             tags.add("patch_writes")
+        if task_route == "eval_feedback":
+            tags.add("evaluation")
         if continuation_context:
             tags.add("continuation")
             tags.add("verification")
         if "inspect this repository" in lowered_task or "identify the next engineering tasks" in lowered_task:
             tags.add("inspection")
+        if any(marker in lowered_task for marker in ["eval", "evaluation", "benchmark", "regression", "suite"]):
+            tags.add("evaluation")
         if any(marker in lowered_task for marker in ["implement", "improve", "harden", "optimize", "refactor"]):
             tags.add("codex_handoff")
         if "test" in lowered_task or "verify" in lowered_task or "unittest" in lowered_task:
@@ -431,12 +509,267 @@ class WorkspaceMemoryStore:
             ("inspection", "inspection lessons first"),
             ("patch_writes", "patch and approval lessons first"),
             ("verification", "verification and continuation lessons first"),
+            ("evaluation", "evaluation-feedback lessons first"),
             ("codex_handoff", "Codex-handoff lessons first"),
         ]
         for tag, label in mapping:
             if tag in tags:
                 ordered.append(label)
         return ", ".join(ordered) if ordered else "general efficiency lessons first"
+
+    @classmethod
+    def _render_latest_outcome_lines(cls, latest: dict[str, object]) -> list[str]:
+        if str(latest.get("source", "")).strip() == "eval_suite":
+            total_cases = int(latest.get("total_cases", 0) or 0)
+            passed_cases = int(latest.get("passed_cases", 0) or 0)
+            failed_cases = int(latest.get("failed_cases", 0) or 0)
+            eval_metrics = latest.get("eval_metrics", {})
+            local_completion_rate = cls._safe_float_from_mapping(eval_metrics, "local_completion_rate")
+            handoff_rate = cls._safe_float_from_mapping(eval_metrics, "handoff_rate")
+            verification_success_rate = cls._safe_float_from_mapping(eval_metrics, "verification_success_rate")
+            lines = [
+                f"Latest eval outcome: {passed_cases}/{total_cases} case(s) passed; {failed_cases} failed.",
+                (
+                    "Latest eval metrics: "
+                    f"local completion {cls._format_rate(local_completion_rate)}, "
+                    f"handoff {cls._format_rate(handoff_rate)}, "
+                    f"verification success {cls._format_rate(verification_success_rate)}."
+                ),
+            ]
+            runtime_health = latest.get("runtime_health", {})
+            if isinstance(runtime_health, dict):
+                status = str(runtime_health.get("status", "")).strip()
+                summary = str(runtime_health.get("summary", "")).strip()
+                if status:
+                    lines.append(f"Latest runtime health: {status}. {summary}".strip())
+            return lines
+
+        return [
+            (
+                "Latest route outcome: "
+                f"{latest.get('task_route', 'unknown-route')} -> {latest.get('stop_reason', 'unknown-stop')}."
+            ),
+            (
+                "Latest tool reliability: "
+                f"{int(latest.get('successful_action_count', 0) or 0)} successful action(s), "
+                f"{int(latest.get('failed_action_count', 0) or 0)} failed action(s)."
+            ),
+        ]
+
+    @staticmethod
+    def _safe_float_from_mapping(mapping: object, key: str) -> float:
+        if not isinstance(mapping, dict):
+            return 0.0
+        try:
+            return float(mapping.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _format_rate(value: float) -> str:
+        return f"{value * 100:.1f}%"
+
+    @classmethod
+    def _summarize_eval_feedback(
+        cls,
+        *,
+        suite_name: str,
+        metrics: dict[str, object],
+        cases: list[dict[str, object]],
+        description: str = "",
+        runtime_health: dict[str, object] | None = None,
+    ) -> str:
+        total_cases = int(metrics.get("total_cases", len(cases)) or len(cases))
+        passed_cases = int(metrics.get("passed_cases", 0) or 0)
+        failed_cases = int(metrics.get("failed_cases", total_cases - passed_cases) or 0)
+        infra_failure_cases = int(metrics.get("infra_failure_cases", 0) or 0)
+        local_completion_rate = cls._safe_float_from_mapping(metrics, "local_completion_rate")
+        handoff_rate = cls._safe_float_from_mapping(metrics, "handoff_rate")
+        verification_success_rate = cls._safe_float_from_mapping(metrics, "verification_success_rate")
+        summary = (
+            f"Eval suite `{suite_name}` completed with {passed_cases}/{total_cases} case(s) passing "
+            f"({failed_cases} failed). "
+            f"Local completion was {cls._format_rate(local_completion_rate)}, "
+            f"handoff rate was {cls._format_rate(handoff_rate)}, "
+            f"and verification success was {cls._format_rate(verification_success_rate)}."
+        )
+        if infra_failure_cases:
+            summary = (
+                f"{summary} {infra_failure_cases}/{total_cases} case(s) failed because the local runtime was unavailable, "
+                "so treat those results as infrastructure health signals instead of agent-quality regressions."
+            )
+        failing_case_ids = [str(case.get("case_id", "")).strip() for case in cases if not bool(case.get("passed", False))]
+        failing_case_ids = [case_id for case_id in failing_case_ids if case_id]
+        if failing_case_ids:
+            summary = f"{summary} Failing cases: {', '.join(failing_case_ids[:MAX_EVAL_FAILURE_CASES])}."
+        elif description.strip():
+            summary = f"{summary} {description.strip()}"
+        if isinstance(runtime_health, dict):
+            health_status = str(runtime_health.get("status", "")).strip()
+            health_summary = str(runtime_health.get("summary", "")).strip()
+            if health_status and health_status != "healthy" and health_summary:
+                summary = f"{summary} Runtime preflight: {health_summary}"
+        return summary
+
+    @classmethod
+    def _derive_eval_next_tasks(
+        cls,
+        *,
+        metrics: dict[str, object],
+        cases: list[dict[str, object]],
+        runtime_health: dict[str, object] | None = None,
+    ) -> list[str]:
+        tasks: list[str] = []
+        failed_cases = [case for case in cases if not bool(case.get("passed", False))]
+        failures_text = "\n".join(
+            failure
+            for case in failed_cases
+            for failure in case.get("failures", [])
+            if isinstance(failure, str)
+        ).lower()
+        failing_routes = {str(case.get("task_route", "")).strip() for case in failed_cases}
+
+        local_completion_rate = cls._safe_float_from_mapping(metrics, "local_completion_rate")
+        handoff_rate = cls._safe_float_from_mapping(metrics, "handoff_rate")
+        verification_success_rate = cls._safe_float_from_mapping(metrics, "verification_success_rate")
+        verification_attempt_rate = cls._safe_float_from_mapping(metrics, "verification_attempt_rate")
+        average_tool_success_rate = cls._safe_float_from_mapping(metrics, "average_tool_success_rate")
+        infra_failure_cases = int(metrics.get("infra_failure_cases", 0) or 0)
+        total_cases = int(metrics.get("total_cases", len(cases)) or len(cases))
+        runtime_unhealthy = isinstance(runtime_health, dict) and str(runtime_health.get("status", "")).strip() == "unavailable"
+
+        if infra_failure_cases:
+            tasks.append("Restore local MLX runtime health and rerun the eval suite before treating these failures as agent-behavior regressions.")
+        if runtime_unhealthy:
+            tasks.append("Harden or expand MLX runtime preflight checks so eval reports flag backend availability before scoring behavior.")
+        if infra_failure_cases >= total_cases > 0:
+            return tasks[:MAX_IMPROVEMENT_NOTES]
+
+        if "json" in failures_text:
+            tasks.append("Reduce structured-output repair overhead in planner and verifier responses.")
+        if verification_attempt_rate < 1.0 or verification_success_rate < 1.0:
+            tasks.append("Strengthen scoped verification so eval and continuation cases reliably run the most relevant tests.")
+        if "deterministic_patch" in failing_routes or "approval_required" in failures_text:
+            tasks.append("Harden the deterministic patch and approval flow for explicit narrow edit cases.")
+        if handoff_rate > local_completion_rate:
+            tasks.append("Improve decomposition and reconnaissance ranking so more eval cases stay local before escalating to a Codex handoff.")
+        if average_tool_success_rate < 0.95:
+            tasks.append("Reduce tool failures and repeated low-signal actions before expanding local autonomy.")
+        if not tasks and failed_cases:
+            tasks.append("Review the failed eval cases and tighten routing or note selection where the expectations drifted.")
+        if not tasks:
+            tasks.append("Expand the eval suite with more representative cases so learned-note changes are measured under broader pressure.")
+        return tasks[:MAX_IMPROVEMENT_NOTES]
+
+    @classmethod
+    def _derive_eval_feedback_notes(
+        cls,
+        *,
+        metrics: dict[str, object],
+        cases: list[dict[str, object]],
+        runtime_health: dict[str, object] | None = None,
+    ) -> list[str]:
+        notes: list[str] = []
+        local_completion_rate = cls._safe_float_from_mapping(metrics, "local_completion_rate")
+        handoff_rate = cls._safe_float_from_mapping(metrics, "handoff_rate")
+        handoff_completion_rate = cls._safe_float_from_mapping(metrics, "handoff_completion_rate")
+        approval_rate = cls._safe_float_from_mapping(metrics, "approval_rate")
+        verification_attempt_rate = cls._safe_float_from_mapping(metrics, "verification_attempt_rate")
+        verification_success_rate = cls._safe_float_from_mapping(metrics, "verification_success_rate")
+        infra_failure_cases = int(metrics.get("infra_failure_cases", 0) or 0)
+        total_cases = int(metrics.get("total_cases", len(cases)) or len(cases))
+        runtime_unhealthy = isinstance(runtime_health, dict) and str(runtime_health.get("status", "")).strip() == "unavailable"
+
+        failures_text = "\n".join(
+            failure
+            for case in cases
+            if not bool(case.get("passed", False))
+            for failure in case.get("failures", [])
+            if isinstance(failure, str)
+        ).lower()
+        failing_routes = {str(case.get("task_route", "")).strip() for case in cases if not bool(case.get("passed", False))}
+
+        if infra_failure_cases:
+            notes.append(
+                "The eval suite hit local-runtime failures; do not treat backend availability or Metal/MLX startup problems as agent-behavior regressions."
+            )
+        if runtime_unhealthy or infra_failure_cases >= total_cases > 0:
+            notes.append(
+                "Runtime-health checks should stay visible in the eval scoreboard so learning signals only come from cases where the local model actually got a fair attempt."
+            )
+        if infra_failure_cases >= total_cases > 0:
+            return notes[:MAX_IMPROVEMENT_NOTES]
+
+        if approval_rate > 0.0 and "deterministic_patch" not in failing_routes:
+            notes.append(
+                "The eval suite confirmed the deterministic patch route can stop cleanly at approval_required for narrow edit tasks."
+            )
+        if handoff_rate > 0.0 and handoff_completion_rate >= 1.0:
+            notes.append(
+                "The eval suite confirmed broad or ambiguous implementation work still behaves best as read-only reconnaissance plus a Codex handoff."
+            )
+        if local_completion_rate > 0.0:
+            notes.append(
+                "The eval suite showed local completion improves when tasks stay explicit, scoped, and easy to verify."
+            )
+        if verification_attempt_rate < 1.0 or verification_success_rate < 1.0:
+            notes.append(
+                "The eval suite showed verification should stay grounded in direct unittest or pytest execution before trusting a follow-up local pass."
+            )
+        if "json" in failures_text:
+            notes.append(
+                "The eval suite still loses effective rounds to JSON repair; keep structured outputs strict and compact before expanding autonomy."
+            )
+        if "codex_handoff" in failing_routes or handoff_rate > local_completion_rate:
+            notes.append(
+                "The eval suite suggests remote-load reduction depends on improving decomposition and reconnaissance so fewer broad cases fall through to a Codex handoff."
+            )
+        if "deterministic_patch" in failing_routes or "approval_required" in failures_text:
+            notes.append(
+                "The eval suite exposed approval or deterministic patch gaps; tighten narrow write routing before asking the local model to do broader edits."
+            )
+        if not notes:
+            notes.append(
+                "The eval suite is currently the best source of grounded self-improvement signal; keep using its outcomes to rank, prune, and route learned behaviors."
+            )
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for note in notes:
+            if note in seen:
+                continue
+            seen.add(note)
+            deduped.append(note)
+        return deduped[:MAX_IMPROVEMENT_NOTES]
+
+    @staticmethod
+    def _derive_eval_feedback_warnings(
+        cases: list[dict[str, object]],
+        runtime_health: dict[str, object] | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        seen: set[str] = set()
+        if isinstance(runtime_health, dict):
+            status = str(runtime_health.get("status", "")).strip()
+            summary = str(runtime_health.get("summary", "")).strip()
+            if status and status != "healthy" and summary:
+                warnings.append(f"runtime-health: {summary}")
+                seen.add(warnings[-1])
+        for case in cases:
+            if bool(case.get("passed", False)):
+                continue
+            case_id = str(case.get("case_id", "")).strip() or "unknown-case"
+            for failure in case.get("failures", []):
+                if not isinstance(failure, str):
+                    continue
+                entry = f"{case_id}: {failure}"
+                if entry in seen:
+                    continue
+                seen.add(entry)
+                warnings.append(entry)
+                if len(warnings) >= MAX_EVAL_FAILURE_CASES:
+                    return warnings
+        return warnings
 
     def _render_memory_markdown(self, records: list[dict[str, object]]) -> str:
         if not records:

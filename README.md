@@ -311,6 +311,26 @@ teamai eval --suite-file evals/teamai_smoke.json \
   --output-format summary_markdown
 ```
 
+By default, the CLI now runs eval cases in isolated subprocess mode instead of one long in-process run. Each case gets:
+
+- its own guarded `teamai run` process
+- the same memory-profile tuning used by the Terminal bridge
+- a per-case timeout so one stuck local-model case does not stall the whole suite
+
+If you want the older single-process behavior for a fast local smoke check, opt into it explicitly:
+
+```bash
+teamai eval --suite-file evals/teamai_smoke.json \
+  --runner-mode in_process
+```
+
+You can also tune the isolated timeout:
+
+```bash
+teamai eval --suite-file evals/teamai_smoke.json \
+  --per-case-timeout-seconds 120
+```
+
 Write the full JSON report to a file:
 
 ```bash
@@ -324,7 +344,13 @@ The bundled smoke suite tracks practical operator metrics across multiple cases,
 - handoff rate and handoff completion rate
 - approval rate
 - verification attempt and success rate
+- actionable pass rate after separating infra/runtime failures from agent-behavior failures
+- infra failure rate plus timeout and harness-failure counts
 - average rounds, duration, and tool success
+
+Every eval run now also writes a lightweight eval-feedback record into `.teamai/run-history.jsonl` and `.teamai/memory.md`. That feedback summarizes pass/fail rates, derives next tasks from failed cases, and turns the eval results into learned notes that can influence future ranking, pruning, and routing decisions.
+
+When you use the default isolated eval runner, the suite now also runs a lightweight MLX import preflight before scoring the cases. If the local runtime is unavailable, the report marks those cases as `infra_runtime` instead of treating them like clean agent-behavior regressions.
 
 Each case can also assert expectations such as:
 

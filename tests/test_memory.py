@@ -141,6 +141,136 @@ class WorkspaceMemoryStoreTest(unittest.TestCase):
         self.assertIn("Latest route outcome: deterministic_patch -> approval_required.", snapshot.improvement_notes_text)
         self.assertIn("Codex handoff", snapshot.improvement_notes_text)
 
+    def test_persist_eval_feedback_writes_ranked_eval_notes(self) -> None:
+        store = WorkspaceMemoryStore()
+        completed_at = datetime(2026, 4, 4, 21, 4, tzinfo=timezone.utc)
+
+        store.persist_eval_feedback(
+            workspace=self.workspace,
+            suite_name="teamai_smoke",
+            completed_at=completed_at,
+            metrics={
+                "total_cases": 3,
+                "passed_cases": 2,
+                "failed_cases": 1,
+                "local_completion_rate": 1 / 3,
+                "handoff_rate": 1 / 3,
+                "handoff_completion_rate": 1.0,
+                "approval_rate": 1 / 3,
+                "verification_attempt_rate": 0.0,
+                "verification_success_rate": 0.0,
+                "average_tool_success_rate": 0.8,
+                "infra_failure_cases": 0,
+            },
+            cases=[
+                {
+                    "case_id": "inspection_repo_tasks",
+                    "passed": True,
+                    "task_route": "repository_inspection",
+                    "stop_reason": "inspection_synthesized",
+                    "failures": [],
+                },
+                {
+                    "case_id": "broad_streaming_handoff",
+                    "passed": True,
+                    "task_route": "codex_handoff",
+                    "stop_reason": "codex_handoff_synthesized",
+                    "failures": [],
+                },
+                {
+                    "case_id": "deterministic_patch_append",
+                    "passed": False,
+                    "task_route": "deterministic_patch",
+                    "stop_reason": "approval_required",
+                    "failures": ["Expected verification success to be `True`, got `False`."],
+                },
+            ],
+            description="Smoke coverage for the local routing paths.",
+            runtime_health={
+                "status": "healthy",
+                "reason": "mlx_import_ok",
+                "summary": "MLX import preflight passed.",
+            },
+        )
+
+        history_path = self.workspace / ".teamai" / "run-history.jsonl"
+        records = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines() if line]
+        latest = records[-1]
+
+        self.assertEqual(latest["source"], "eval_suite")
+        self.assertEqual(latest["task_route"], "eval_feedback")
+        self.assertIn("Eval suite `teamai_smoke` completed", latest["summary"])
+        self.assertTrue(any("eval suite" in note.lower() for note in latest["improvement_notes"]))
+
+        snapshot = store.load_snapshot(
+            self.workspace,
+            task="Improve the eval harness and benchmark routing behavior.",
+            task_route="eval_feedback",
+        )
+
+        self.assertIn("evaluation-feedback lessons first", snapshot.improvement_notes_text)
+        self.assertIn("Latest eval outcome:", snapshot.improvement_notes_text)
+        self.assertIn("Latest runtime health: healthy.", snapshot.improvement_notes_text)
+        self.assertIn("Eval suite", snapshot.memory_text)
+
+    def test_persist_eval_feedback_prioritizes_runtime_health_when_eval_failures_are_infra(self) -> None:
+        store = WorkspaceMemoryStore()
+        completed_at = datetime(2026, 4, 4, 21, 6, tzinfo=timezone.utc)
+
+        store.persist_eval_feedback(
+            workspace=self.workspace,
+            suite_name="runtime_health",
+            completed_at=completed_at,
+            metrics={
+                "total_cases": 2,
+                "passed_cases": 0,
+                "failed_cases": 2,
+                "local_completion_rate": 0.0,
+                "handoff_rate": 0.0,
+                "handoff_completion_rate": 0.0,
+                "approval_rate": 0.0,
+                "verification_attempt_rate": 0.0,
+                "verification_success_rate": 0.0,
+                "average_tool_success_rate": 1.0,
+                "infra_failure_cases": 2,
+                "agent_failure_cases": 0,
+                "timeout_failure_cases": 0,
+                "harness_failure_cases": 0,
+            },
+            cases=[
+                {
+                    "case_id": "inspection",
+                    "passed": False,
+                    "task_route": "repository_inspection",
+                    "stop_reason": "model_backend_error",
+                    "failure_classification": "infra_runtime",
+                    "failures": ["Case was not scored as an agent-behavior failure because the local runtime failed first."],
+                },
+                {
+                    "case_id": "patch",
+                    "passed": False,
+                    "task_route": "explicit_write_loop",
+                    "stop_reason": "model_backend_error",
+                    "failure_classification": "infra_runtime",
+                    "failures": ["Case was not scored as an agent-behavior failure because the local runtime failed first."],
+                },
+            ],
+            runtime_health={
+                "status": "unavailable",
+                "reason": "mlx_import_failed",
+                "summary": "MLX import preflight failed: Metal initialization failed.",
+            },
+        )
+
+        snapshot = store.load_snapshot(
+            self.workspace,
+            task="Benchmark runtime health versus agent behavior.",
+            task_route="eval_feedback",
+        )
+
+        self.assertIn("runtime-health checks should stay visible", snapshot.improvement_notes_text.lower())
+        self.assertIn("restore local mlx runtime health", snapshot.memory_text.lower())
+
     def test_improvement_notes_prioritize_recurring_high_value_behaviors(self) -> None:
         store = WorkspaceMemoryStore()
         store.persist_run(

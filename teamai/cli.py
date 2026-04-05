@@ -69,6 +69,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Temporarily allow workspace_write eval cases without changing TEAMAI_ALLOW_WRITES in .env.",
     )
     eval_parser.add_argument(
+        "--runner-mode",
+        choices=["isolated_subprocess", "in_process"],
+        default="isolated_subprocess",
+        help=(
+            "How to execute eval cases. `isolated_subprocess` runs each case in its own guarded `teamai run` "
+            "process with a timeout; `in_process` keeps the older single-process behavior."
+        ),
+    )
+    eval_parser.add_argument(
+        "--per-case-timeout-seconds",
+        type=int,
+        default=180,
+        help="Timeout for each isolated eval case. Ignored in `in_process` mode.",
+    )
+    eval_parser.add_argument(
         "--output-format",
         choices=["full_json", "summary_markdown"],
         default="full_json",
@@ -233,6 +248,10 @@ def main() -> int:
             suite=suite,
             workspace_override=args.workspace,
             allow_write_cases=args.allow_write_cases,
+            runner_mode=args.runner_mode,
+            per_case_timeout_seconds=args.per_case_timeout_seconds,
+            project_root=Path.cwd().resolve(),
+            python_executable=Path(sys.executable).resolve(),
         )
         if args.output_format == "summary_markdown":
             rendered_output = render_eval_markdown(report)

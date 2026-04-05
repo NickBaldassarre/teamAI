@@ -710,6 +710,29 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual(planner.actions[0].args["path"], "README.md")
         self.assertEqual(planner.actions[0].args["content"], "# teamAI\nFinal reminder\n")
 
+    def test_heuristic_write_fallback_compiles_exact_append_line_from_task(self) -> None:
+        hidden_target = self.workspace / ".teamai" / "eval-fixtures" / "scratch.md"
+        hidden_target.parent.mkdir(parents=True, exist_ok=True)
+        hidden_target.write_text(
+            "Seed line.\n",
+            encoding="utf-8",
+        )
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([]))
+
+        planner = supervisor._heuristic_plan_from_context(  # noqa: SLF001
+            task="Append the exact line 'Eval harness scratch line.' to .teamai/eval-fixtures/scratch.md.",
+            raw_response="No valid planner JSON.",
+            user_prompt="Compile the requested patch.",
+            workspace=self.workspace,
+            previous_rounds=[],
+            max_actions=1,
+            execution_mode="workspace_write",
+        )
+
+        self.assertEqual(planner.actions[0].tool, "write_file")
+        self.assertEqual(planner.actions[0].args["path"], ".teamai/eval-fixtures/scratch.md")
+        self.assertEqual(planner.actions[0].args["content"], "Seed line.\nEval harness scratch line.\n")
+
     def test_heuristic_write_fallback_compiles_append_fenced_block_to_test_file(self) -> None:
         test_file = self.workspace / "tests" / "test_sample.py"
         test_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1036,54 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         approval_payload = approval_files[0].read_text(encoding="utf-8")
         self.assertIn(".teamai/compiler-demo.md", approval_payload)
         self.assertIn("Updated note from the deterministic compiler.", approval_payload)
+
+    def test_workspace_write_run_compiles_exact_append_line_for_smoke_fixture(self) -> None:
+        hidden_target = self.workspace / ".teamai" / "eval-fixtures" / "scratch.md"
+        hidden_target.parent.mkdir(parents=True, exist_ok=True)
+        hidden_target.write_text(
+            "Seed line.\n",
+            encoding="utf-8",
+        )
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=3,
+            max_actions_per_round=2,
+            max_tokens_per_turn=128,
+            temperature=0.3,
+            allow_shell=False,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=10_000,
+            max_command_output_chars=10_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+
+        result = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task="Append the exact line 'Eval harness scratch line.' to .teamai/eval-fixtures/scratch.md.",
+                workspace_path=".",
+                execution_mode="workspace_write",
+                max_rounds=3,
+                max_actions_per_round=2,
+                max_tokens_per_turn=128,
+            ),
+        )
+
+        self.assertEqual(result.task_route, "deterministic_patch")
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.stop_reason, "approval_required")
+        self.assertEqual(len(result.rounds), 1)
+        approval_files = sorted((self.workspace / ".teamai" / "approvals").glob("*.json"))
+        self.assertEqual(len(approval_files), 1)
+        approval_payload = approval_files[0].read_text(encoding="utf-8")
+        self.assertIn(".teamai/eval-fixtures/scratch.md", approval_payload)
+        self.assertIn("Eval harness scratch line.", approval_payload)
 
     def test_workspace_write_run_compiles_fenced_test_block_without_prior_read(self) -> None:
         test_file = self.workspace / "tests" / "test_sample.py"

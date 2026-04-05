@@ -1990,7 +1990,8 @@ class ClosedLoopSupervisor:
             return match.group(1).lower(), match.group("payload").strip()
 
         match = re.search(
-            r"(?:append|insert|add)\s+(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)",
+            r"(?:append|insert|add)\s+(?:the\s+)?(?:exact\s+|literal\s+|verbatim\s+)?"
+            r"(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)",
             task,
             flags=re.IGNORECASE,
         )
@@ -2105,7 +2106,7 @@ class ClosedLoopSupervisor:
                 return "block", fenced_block
 
         match = re.search(
-            r"append\s+(?:the\s+)?(?:(?P<kind>sentence|line|text)\s+)?"
+            r"append\s+(?:the\s+)?(?:exact\s+|literal\s+|verbatim\s+)?(?:(?P<kind>sentence|line|text)\s+)?"
             r"(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)\s+"
             r"(?:to|at\s+the\s+end\s+of)\b",
             task,

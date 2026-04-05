@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teamai"
+version = "0.1.0"
+description = "Local-first closed-loop orchestration for Apple Silicon using MLX."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.135,<1.0",
+  "uvicorn>=0.43,<1.0",
+  "pydantic>=2.11,<3.0",
+  "python-dotenv>=1.0,<2.0",
+  "mlx-vlm>=0.4.4",
+]
+
+[project.scripts]
+teamai = "teamai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["teamai*"]
+

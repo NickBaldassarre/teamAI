@@ -1,0 +1,70 @@
+{
+  "name": "teamai_smoke",
+  "description": "A lightweight smoke suite for the core local routing and approval flows.",
+  "cleanup_approvals": true,
+  "cases": [
+    {
+      "case_id": "inspection_repo_tasks",
+      "task": "Inspect this repository and identify the next engineering tasks.",
+      "execution_mode": "read_only",
+      "max_rounds": 4,
+      "max_actions_per_round": 3,
+      "max_tokens_per_turn": 192,
+      "expectations": {
+        "allowed_stop_reasons": [
+          "inspection_synthesized",
+          "planner_declared_complete",
+          "verifier_declared_complete"
+        ],
+        "local_completion": true,
+        "handoff": false,
+        "final_answer_contains": [
+          "Next engineering tasks"
+        ]
+      }
+    },
+    {
+      "case_id": "deterministic_patch_append",
+      "task": "Append the exact line 'Eval harness scratch line.' to .teamai/eval-fixtures/scratch.md.",
+      "execution_mode": "workspace_write",
+      "max_rounds": 3,
+      "max_actions_per_round": 2,
+      "max_tokens_per_turn": 128,
+      "setup_files": [
+        {
+          "path": ".teamai/eval-fixtures/scratch.md",
+          "content": "Seed line.\n"
+        }
+      ],
+      "expectations": {
+        "allowed_task_routes": [
+          "deterministic_patch"
+        ],
+        "allowed_stop_reasons": [
+          "approval_required"
+        ],
+        "approval_required": true,
+        "handoff": false
+      }
+    },
+    {
+      "case_id": "broad_streaming_handoff",
+      "task": "Improve streaming supervisor progress propagation across the CLI, API, and jobs layers while keeping the local model in a safe reconnaissance role.",
+      "execution_mode": "read_only",
+      "max_rounds": 2,
+      "max_actions_per_round": 2,
+      "max_tokens_per_turn": 128,
+      "expectations": {
+        "allowed_task_routes": [
+          "codex_handoff"
+        ],
+        "allowed_stop_reasons": [
+          "codex_handoff_synthesized",
+          "local_drift_rerouted",
+          "max_rounds_reached"
+        ],
+        "handoff": true
+      }
+    }
+  ]
+}

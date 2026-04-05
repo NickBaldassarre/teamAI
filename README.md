@@ -1,0 +1,375 @@
+# teamAI
+
+Local-first closed-loop orchestration for Apple Silicon using MLX.
+
+This project is designed for a private workflow where:
+
+1. a local LLM council strategizes
+2. local tool agents inspect or execute
+3. a verifier judges whether progress is real
+4. the loop continues until completion or a safety limit is hit
+
+The implementation is tuned for:
+
+- Apple Silicon
+- MLX
+- local/private usage
+- a cautious closed loop with explicit write controls
+
+## Current Architecture
+
+- `teamai/model_backend.py`
+  - lazy MLX model loading through `mlx-vlm`
+  - default local model: `mlx-community/gemma-4-e4b-it-4bit`
+- `teamai/supervisor.py`
+  - multi-turn loop with four local personas:
+    - Strategist
+    - Critic
+    - Coder-Planner
+    - Verifier
+- `teamai/tools.py`
+  - local executable tools:
+    - file listing
+    - text search
+    - file reads
+    - allowed shell commands
+    - patch approval write tools
+- `teamai/api.py`
+  - FastAPI app with sync and background job endpoints
+- `teamai/cli.py`
+  - local CLI for direct runs or serving the API
+
+## Why MLX + Gemma 4 E4B
+
+For an M1 Pro MacBook Pro with 16GB unified memory, the most realistic Gemma 4 target is the smaller E4B instruction-tuned model in MLX format.
+
+Default:
+
+- `mlx-community/gemma-4-e4b-it-4bit`
+
+This keeps the project local-first while staying within the rough memory envelope of a 16GB machine.
+
+## Setup
+
+1. Create a virtual environment:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. Install the project:
+
+   ```bash
+   pip install .
+   ```
+
+   If you want editable installs during development, upgrade `pip` first and then use:
+
+   ```bash
+   python -m pip install --upgrade pip
+   pip install -e .
+   ```
+
+3. Create your local config:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+4. Adjust settings if needed. The default model and limits are already aimed at a 16GB Apple Silicon machine.
+
+   If you see a Hugging Face warning during the first model download, it is safe to continue. You can optionally set `HF_TOKEN` in your shell or `.env` for higher download rate limits.
+
+## Run As A CLI
+
+Read-only loop:
+
+```bash
+teamai run "Inspect this repository and identify the next engineering tasks."
+```
+
+Against a workspace:
+
+```bash
+teamai run "Review the current project state and suggest the next implementation step." --workspace .
+```
+
+Stream structured progress events as JSONL on stderr while the run is active:
+
+```bash
+teamai run "Inspect this repository and identify the next engineering tasks." \
+  --workspace . \
+  --stream-format jsonl
+```
+
+Persist the same structured event stream to a JSONL file:
+
+```bash
+teamai run "Inspect this repository and identify the next engineering tasks." \
+  --workspace . \
+  --stream-format jsonl \
+  --event-log-file .teamai/run-events.jsonl
+```
+
+Each event includes a sequence number, timestamp, kind, message, and any parsed round or stage metadata, which makes it easier to watch long runs or hand progress off to another tool.
+
+Generate a compact handoff packet for Codex or another higher-capability agent:
+
+```bash
+teamai run "Inspect this repository and identify the next engineering tasks." \
+  --workspace . \
+  --output-format handoff_markdown \
+  --output-file .teamai/codex-handoff.md
+```
+
+Or emit machine-readable handoff JSON:
+
+```bash
+teamai run "Inspect this repository and identify the next engineering tasks." \
+  --workspace . \
+  --output-format handoff_json \
+  --output-file .teamai/codex-handoff.json
+```
+
+The CLI now also persists lightweight local state in `.teamai/` inside the workspace:
+
+- `run-history.jsonl`
+- `memory.md`
+
+That state is fed back into future runs so the local loop can carry context across separate executions.
+
+The handoff packet is also optimized for Codex-style continuation, including:
+
+- a primary next task
+- key evidence gathered by the local run
+- open questions or unresolved verification focus
+
+Launch a local Terminal.app bridge run that writes the handoff artifact for Codex to consume later:
+
+```bash
+teamai bridge-launch "Inspect this repository and identify the next engineering tasks." \
+  --workspace . \
+  --max-rounds 5 \
+  --max-tokens 192
+```
+
+Check whether the bridge run has completed and whether the handoff artifact exists:
+
+```bash
+teamai bridge-status
+```
+
+The bridge is now memory-aware by default. Before launch, it applies lighter guardrails for riskier local runs:
+
+- repository inspection bridge runs get a lighter inspection profile
+- broad implementation or self-improvement bridge runs get a lighter reconnaissance profile
+- `workspace_write` bridge runs get a lighter write profile
+
+Those guardrails lower rounds, actions, tokens, and temperature automatically unless you already passed stricter limits yourself. Bridge status now also reports the applied `memory_profile` and any guardrail notes, and failed bridge runs flag local MLX memory pressure explicitly when the log shows a Metal out-of-memory error.
+
+If you request `--execution-mode workspace_write` through the bridge while `TEAMAI_ALLOW_WRITES=false`, `bridge-launch` now fails fast with a preflight error instead of silently launching a run that downgrades itself to `read_only`.
+
+For an explicitly approved write-capable bridge run, you can opt into a temporary write-enabled environment without changing `.env`:
+
+```bash
+teamai bridge-launch "Update README.md with a small approved patch." \
+  --workspace . \
+  --execution-mode workspace_write \
+  --inject-write-env
+```
+
+That override only applies to the spawned Terminal bridge run. It does not persistently change `TEAMAI_ALLOW_WRITES` in your shell or `.env`.
+
+By default the bridge uses Terminal.app on macOS and writes:
+
+- `.teamai/codex-handoff.json`
+- `.teamai/codex-bridge-status.json`
+- `.teamai/codex-bridge.log`
+- `.teamai/codex-bridge-launch.sh`
+
+Each new bridge launch now supersedes the previous one for those paths: it clears the prior handoff and log artifacts up front so `bridge-status` reflects the current run instead of stale files from an older launch.
+
+Enable write-capable mode only if you also set `TEAMAI_ALLOW_WRITES=true` in `.env`:
+
+```bash
+teamai run "Update the README after inspecting the codebase." --workspace . --execution-mode workspace_write
+```
+
+In `workspace_write` mode, write actions no longer mutate files immediately. They create pending patch approvals under `.teamai/approvals/`, stop the run with `approval_required`, and tell you how to review or apply the patch.
+
+Pending approvals may become stale if the target file changes before approval.
+
+For narrow explicit edit requests, the supervisor now tries to compile deterministic patch proposals before falling back to free-form model planning. The current compiler is strongest on:
+
+- exact single-string replacements
+- replace-all string updates
+- anchored insertions before or after a quoted line or block
+- appending a quoted line or fenced code block to an existing file
+- inserting a quoted Python import into an existing module
+- updating a simple assignment or `.env` setting by key
+- inserting a fenced test or method block into an existing Python class
+
+Broader implementation requests are now routed differently: if the task looks too open-ended for a safe local patch flow, the run stays in reconnaissance mode and produces a Codex-oriented handoff instead of trying to autonomously carry the full change.
+
+The supervisor also bails out earlier now when a local coding run starts drifting. In practice that means broader "improve/harden/optimize" tasks get routed to reconnaissance sooner, and explicit write loops that read the target but still fail to produce a concrete patch after repeated low-confidence rounds will stop early with a Codex-oriented handoff instead of spending the full round budget wandering.
+
+List pending approvals:
+
+```bash
+teamai approvals list --workspace .
+```
+
+Inspect one approval, including its diff:
+
+```bash
+teamai approvals show --workspace . <approval_id>
+```
+
+Apply a pending approval:
+
+```bash
+teamai approvals apply --workspace . <approval_id>
+```
+
+Apply a pending approval and immediately resume the originating task:
+
+```bash
+teamai approvals apply --workspace . <approval_id> --continue
+```
+
+If the original approved task was created in `workspace_write` mode, the resumed run temporarily preserves write-capable mode for that continuation process without changing `.env`.
+
+The continuation path now also starts with a scoped verification prelude. It rereads the changed file first and, for obvious Python targets with directly related unit tests, it queues the most specific `python -m unittest ...` command it can infer before the broader follow-up loop continues.
+
+Persistent workspace memory now also keeps a lightweight improvement ledger from recent runs. It records which task routes worked best, when approvals or Codex handoffs were the right move, and when issues like JSON repair or repeated actions slowed the loop down. Those notes are fed back into future prompt context and ranked by recurrence, recency, route fit, and the current task shape, so inspection runs, write continuations, and broader handoff-style runs see the most relevant lessons first. The ledger now also self-prunes: stale one-off lessons decay automatically when newer route-specific patterns keep proving better.
+
+Reject a pending approval without applying it:
+
+```bash
+teamai approvals reject --workspace . <approval_id> --reason "superseded by a newer patch"
+```
+
+Remove stale approval artifacts after the target file has changed:
+
+```bash
+teamai approvals prune-stale --workspace .
+```
+
+## Run As A Local Service
+
+```bash
+teamai serve
+```
+
+Then call:
+
+- `GET /healthz`
+- `POST /v1/run`
+- `POST /v1/run/stream`
+- `POST /v1/jobs`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/jobs/{job_id}/events`
+- `GET /v1/jobs/{job_id}/events/stream`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Inspect the workspace and propose the next implementation step.",
+    "workspace_path": ".",
+    "execution_mode": "read_only"
+  }'
+```
+
+Stream a run as server-sent events:
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/v1/run/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Inspect the workspace and propose the next implementation step.",
+    "workspace_path": ".",
+    "execution_mode": "read_only"
+  }'
+```
+
+Watch the stored event stream for a background job:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/jobs/<job_id>/events/stream
+```
+
+## Eval Harness
+
+Run an agentic evaluation suite against the current supervisor:
+
+```bash
+teamai eval --suite-file evals/teamai_smoke.json \
+  --output-format summary_markdown
+```
+
+Write the full JSON report to a file:
+
+```bash
+teamai eval --suite-file evals/teamai_smoke.json \
+  --output-file .teamai/evals/teamai-smoke-latest.json
+```
+
+The bundled smoke suite tracks practical operator metrics across multiple cases, including:
+
+- local completion rate
+- handoff rate and handoff completion rate
+- approval rate
+- verification attempt and success rate
+- average rounds, duration, and tool success
+
+Each case can also assert expectations such as:
+
+- allowed `task_route` values
+- allowed `stop_reason` values
+- whether a task should stay local, route to handoff, or stop at approval
+- expected phrases in the final answer or warnings
+- expected handoff `primary_task` or `key_paths`
+
+Eval cases can seed temporary fixture files through `setup_files`, and the harness restores those files afterward. If a case creates pending approval artifacts, the eval harness rejects those approvals automatically by default so repeated runs do not leave stale eval clutter behind.
+
+If your eval suite includes `workspace_write` cases while `TEAMAI_ALLOW_WRITES=false`, opt into a temporary write-capable override for the suite:
+
+```bash
+teamai eval --suite-file evals/teamai_smoke.json \
+  --allow-write-cases \
+  --output-format summary_markdown
+```
+
+## Safety Model
+
+- shell access is allowlisted and read-oriented
+- writes are disabled by default
+- patch-oriented write proposals require:
+  - `TEAMAI_ALLOW_WRITES=true`
+  - request mode `workspace_write`
+- proposed patches require explicit approval before they are applied
+- all file paths are sandboxed to the configured workspace root
+- the loop is bounded by:
+  - max rounds
+  - max actions per round
+  - max tokens per turn
+  - shell timeout
+
+## Test
+
+```bash
+python -m unittest discover -s tests
+```
+
+## Notes
+
+- In this Codex desktop environment, importing MLX itself triggers a Metal initialization crash, so full local inference could not be executed here.
+- The code is written to import MLX lazily at runtime on your Mac, where Metal is expected to be available.
+- If you later want a richer loop, the next upgrades are:
+  - broader deterministic edit coverage
+  - stronger post-approval continuation
+  - sharper routing and recovery for broad implementation tasks

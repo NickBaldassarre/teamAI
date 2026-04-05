@@ -251,7 +251,7 @@ def main() -> int:
             runner_mode=args.runner_mode,
             per_case_timeout_seconds=args.per_case_timeout_seconds,
             project_root=Path.cwd().resolve(),
-            python_executable=Path(sys.executable).resolve(),
+            python_executable=Path(sys.executable),
         )
         if args.output_format == "summary_markdown":
             rendered_output = render_eval_markdown(report)

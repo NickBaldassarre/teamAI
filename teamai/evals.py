@@ -188,7 +188,7 @@ def run_eval_suite(
     started_at = datetime.now(timezone.utc)
     reports: list[EvalCaseReport] = []
     effective_project_root = (project_root or Path.cwd()).resolve()
-    effective_python = (python_executable or Path(sys.executable)).resolve()
+    effective_python = (python_executable or Path(sys.executable)).expanduser()
     runtime_health = _run_runtime_health_preflight(
         settings=settings,
         runner_mode=runner_mode,

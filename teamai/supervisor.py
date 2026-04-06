@@ -142,6 +142,33 @@ class ClosedLoopSupervisor:
                     else:
                         emit_progress(f"Stopped: {stop_reason}")
 
+            if (
+                task_route == "repository_inspection"
+                and not final_answer
+                and self._can_bootstrap_repository_inspection(workspace)
+            ):
+                (
+                    inspection_rounds,
+                    final_answer,
+                    stop_reason,
+                    status,
+                ) = self._run_repository_inspection_route(
+                    task=request.task,
+                    workspace=workspace,
+                    max_rounds=max_rounds,
+                    max_actions=max_actions,
+                    warnings=warnings,
+                    emit_progress=emit_progress,
+                )
+                round_records.extend(inspection_rounds)
+                if final_answer:
+                    if status == "failed":
+                        emit_progress(f"Failed: {stop_reason}")
+                    elif status == "completed":
+                        emit_progress(f"Completed: {stop_reason}")
+                    else:
+                        emit_progress(f"Stopped: {stop_reason}")
+
             for round_number in range(1, max_rounds + 1):
                 if final_answer:
                     break
@@ -323,6 +350,11 @@ class ClosedLoopSupervisor:
                     task=request.task,
                     rounds=round_records,
                     workspace=workspace,
+                    allow_partial=self._should_allow_early_partial_repository_synthesis(
+                        task=request.task,
+                        rounds=round_records,
+                        max_rounds=max_rounds,
+                    ),
                 )
                 if synthesized_answer:
                     final_answer = synthesized_answer
@@ -965,6 +997,155 @@ class ClosedLoopSupervisor:
             "failed",
         )
 
+    def _run_repository_inspection_route(
+        self,
+        *,
+        task: str,
+        workspace: Path,
+        max_rounds: int,
+        max_actions: int,
+        warnings: list[str],
+        emit_progress: Callable[[str], None],
+    ) -> tuple[list[RoundRecord], str, str, RunResult["status"]]:
+        rounds: list[RoundRecord] = []
+
+        for round_number in range(1, max_rounds + 1):
+            emit_progress(f"Round {round_number}/{max_rounds}: building context")
+            emit_progress(f"Round {round_number}/{max_rounds}: strategist")
+            seed_action = self._next_repository_inspection_seed_action(
+                task=task,
+                workspace=workspace,
+                previous_rounds=rounds,
+            )
+            if seed_action is None:
+                break
+
+            emit_progress(f"Round {round_number}/{max_rounds}: critic")
+            actions = self._supplement_inspection_actions(
+                [seed_action],
+                task=task,
+                workspace=workspace,
+                previous_rounds=rounds,
+                max_actions=max_actions,
+                task_route="repository_inspection",
+            )[:max_actions]
+            emit_progress(f"Round {round_number}/{max_rounds}: planner")
+            emit_progress(f"Round {round_number}/{max_rounds}: executing {len(actions)} tool action(s)")
+            tool_results = self._tools.execute_actions(
+                actions,
+                workspace=workspace,
+                execution_mode="read_only",
+                approval_context={
+                    "task": task,
+                    "execution_mode": "read_only",
+                },
+            )
+            emit_progress(f"Round {round_number}/{max_rounds}: verifier")
+            verifier = VerifierVerdict(
+                done=False,
+                confidence=min(0.25 + 0.2 * round_number, 0.85),
+                summary="Deterministic inspection gathered repository context without spending a model turn.",
+                next_focus="Read the highest-signal runtime files and synthesize the next engineering tasks.",
+            )
+            rounds.append(
+                RoundRecord(
+                    round_number=round_number,
+                    strategist=(
+                        "Use deterministic repository reconnaissance to gather high-signal evidence before relying on the local model."
+                    ),
+                    critic=(
+                        "Prefer README and runtime-anchor files over lower-signal docs when inspection runs are tightly budgeted."
+                    ),
+                    planner=PlannerTurn(
+                        summary="Deterministic inspection bootstrap selected the next read-only repository actions.",
+                        should_stop=False,
+                        final_answer=None,
+                        actions=actions,
+                    ),
+                    tool_results=tool_results,
+                    verifier=verifier,
+                )
+            )
+
+            synthesized = self._maybe_synthesize_repository_answer(
+                task=task,
+                rounds=rounds,
+                workspace=workspace,
+                allow_partial=self._should_allow_early_partial_repository_synthesis(
+                    task=task,
+                    rounds=rounds,
+                    max_rounds=max_rounds,
+                ),
+            )
+            if synthesized:
+                return (rounds, synthesized, "inspection_synthesized", "completed")
+
+        strict_synthesized = self._maybe_synthesize_repository_answer(
+            task=task,
+            rounds=rounds,
+            workspace=workspace,
+        )
+        if strict_synthesized:
+            return (rounds, strict_synthesized, "inspection_synthesized", "completed")
+
+        partial_synthesized = self._maybe_synthesize_repository_answer(
+            task=task,
+            rounds=rounds,
+            workspace=workspace,
+            allow_partial=True,
+        )
+        if partial_synthesized:
+            warnings.append("Inspection run hit max rounds; used partial synthesis from gathered evidence.")
+            return (rounds, partial_synthesized, "inspection_synthesized", "completed")
+
+        return (rounds, self._build_fallback_answer(rounds, task), "max_rounds_reached", "stopped")
+
+    def _next_repository_inspection_seed_action(
+        self,
+        *,
+        task: str,
+        workspace: Path,
+        previous_rounds: list[RoundRecord],
+    ) -> ToolAction | None:
+        successful = self._successful_action_signatures(previous_rounds, workspace)
+        for candidate in [
+            "teamai/config.py",
+            "teamai/supervisor.py",
+            "teamai/cli.py",
+            "README.md",
+            "pyproject.toml",
+            "PROJECT_MEMORY.md",
+            "teamai",
+            "tests/test_supervisor.py",
+        ]:
+            action = self._candidate_to_action(candidate, task, workspace)
+            if action is None:
+                continue
+            if self._action_signature(action, workspace) in successful:
+                continue
+            return action
+
+        for candidate in self._priority_candidates(
+            previous_rounds,
+            workspace,
+            task=task,
+            task_route="repository_inspection",
+        ):
+            action = self._candidate_to_action(candidate, task, workspace)
+            if action is None:
+                continue
+            if self._action_signature(action, workspace) in successful:
+                continue
+            return action
+        return None
+
+    @staticmethod
+    def _can_bootstrap_repository_inspection(workspace: Path) -> bool:
+        return any(
+            (workspace / candidate).exists()
+            for candidate in ["README.md", "pyproject.toml", "PROJECT_MEMORY.md", "teamai"]
+        )
+
     @staticmethod
     def _render_transcript(
         rounds: list[RoundRecord],
@@ -1400,6 +1581,7 @@ class ClosedLoopSupervisor:
             workspace,
             task=task,
             task_route=task_route,
+            current_action_signatures=seen_signatures,
         ):
             action = self._candidate_to_action(candidate, task, workspace)
             if action is None:
@@ -1421,8 +1603,10 @@ class ClosedLoopSupervisor:
         *,
         task: str,
         task_route: str,
+        current_action_signatures: set[str] | None = None,
     ) -> list[str]:
         successful = self._successful_action_signatures(previous_rounds, workspace)
+        available_signatures = successful | (current_action_signatures or set())
         candidates: list[str] = []
 
         def add(candidate: str) -> None:
@@ -1432,23 +1616,31 @@ class ClosedLoopSupervisor:
                 return
             tool = "list_files" if resolved.is_dir() else "read_file"
             signature = f"{tool}:{normalized or '.'}"
-            if signature in successful:
+            if signature in available_signatures:
                 return
             if normalized not in candidates:
                 candidates.append(normalized)
 
-        config_read = "read_file:teamai/config.py" in successful
-        cli_read = "read_file:teamai/cli.py" in successful
-        supervisor_read = "read_file:teamai/supervisor.py" in successful
+        config_read = "read_file:teamai/config.py" in available_signatures
+        cli_read = "read_file:teamai/cli.py" in available_signatures
+        supervisor_read = "read_file:teamai/supervisor.py" in available_signatures
 
         if task_route == "codex_handoff":
             for candidate in self._task_relevant_candidates(task, workspace):
                 add(candidate)
 
-        for candidate in ["README.md", "pyproject.toml", "setup.py", "PROJECT_MEMORY.md"]:
-            add(candidate)
-
-        add("teamai")
+        if task_route == "repository_inspection":
+            add("README.md")
+            if config_read:
+                for candidate in ["teamai/cli.py", "teamai/supervisor.py", "teamai/api.py"]:
+                    add(candidate)
+            add("teamai")
+            for candidate in ["pyproject.toml", "PROJECT_MEMORY.md", "setup.py"]:
+                add(candidate)
+        else:
+            for candidate in ["README.md", "pyproject.toml", "setup.py", "PROJECT_MEMORY.md"]:
+                add(candidate)
+            add("teamai")
 
         if config_read:
             add("teamai/cli.py")
@@ -1476,6 +1668,19 @@ class ClosedLoopSupervisor:
             add(candidate)
 
         return candidates
+
+    def _should_allow_early_partial_repository_synthesis(
+        self,
+        *,
+        task: str,
+        rounds: list[RoundRecord],
+        max_rounds: int,
+    ) -> bool:
+        if not self._is_repository_inspection_task(task):
+            return False
+        if len(rounds) < 2:
+            return False
+        return len(rounds) >= max(2, max_rounds - 1)
 
     def _task_relevant_candidates(self, task: str, workspace: Path) -> list[str]:
         text = task.lower()
@@ -2428,7 +2633,13 @@ class ClosedLoopSupervisor:
         ]
         has_runtime_anchor = bool({"read_file:teamai/cli.py", "read_file:teamai/supervisor.py"} & set(core_reads))
         strict_ready = has_readme and has_package_listing and len(core_reads) >= 3 and has_runtime_anchor
-        partial_ready = has_readme and len(doc_reads) + len(core_reads) >= 3 and (has_runtime_anchor or len(core_reads) >= 1)
+        partial_ready = has_readme and (
+            (
+                len(doc_reads) + len(core_reads) >= 3
+                and (has_runtime_anchor or len(core_reads) >= 1)
+            )
+            or (has_package_listing and len(core_reads) >= 1)
+        )
         if not strict_ready:
             if not allow_partial or not partial_ready:
                 return None

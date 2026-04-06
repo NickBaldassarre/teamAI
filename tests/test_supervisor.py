@@ -351,6 +351,77 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertIn(("list_files", "teamai"), signatures)
         self.assertTrue(any("expanded plan" in warning.lower() for warning in warnings))
 
+    def test_repository_inspection_plan_prioritizes_runtime_anchor_after_planned_config_read(self) -> None:
+        (self.workspace / "README.md").write_text("# teamAI\n", encoding="utf-8")
+        (self.workspace / "pyproject.toml").write_text('[project]\nname = "teamai"\n', encoding="utf-8")
+        (self.workspace / "teamai").mkdir()
+        (self.workspace / "teamai" / "config.py").write_text("class Settings:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "cli.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "supervisor.py").write_text("class ClosedLoopSupervisor:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "api.py").write_text("def create_app() -> None:\n    pass\n", encoding="utf-8")
+
+        previous_rounds = [
+            RoundRecord(
+                round_number=1,
+                strategist="Map the repo.",
+                critic="Read the docs first.",
+                planner=PlannerTurn(
+                    summary="Inspect the root and README.",
+                    actions=[
+                        ToolAction(tool="list_files", args={"path": "."}),
+                        ToolAction(tool="read_file", args={"path": "README.md"}),
+                    ],
+                ),
+                tool_results=[
+                    ToolExecutionResult(tool="list_files", success=True, metadata={"path": "."}),
+                    ToolExecutionResult(
+                        tool="read_file",
+                        success=True,
+                        metadata={"path": "README.md"},
+                        output="# teamAI\n",
+                    ),
+                ],
+                verifier=VerifierVerdict(
+                    done=False,
+                    confidence=0.1,
+                    summary="Need the runtime entrypoints next.",
+                    next_focus="Read the config and runtime anchors.",
+                ),
+            )
+        ]
+        backend = FakeBackend(
+            [
+                (
+                    '{"summary":"Inspect the runtime config.","should_stop":false,"final_answer":null,"actions":['
+                    '{"tool":"read_file","reason":"Start with the runtime settings.","args":{"path":"teamai/config.py"}}]}'
+                ),
+            ]
+        )
+        supervisor = ClosedLoopSupervisor(self.settings, backend=backend)
+        warnings: list[str] = []
+
+        planner = supervisor._plan(  # noqa: SLF001
+            task="Inspect this repository and identify the next engineering tasks.",
+            user_prompt="Read the runtime settings and the most relevant entrypoint next.",
+            workspace=self.workspace,
+            previous_rounds=previous_rounds,
+            execution_mode="read_only",
+            max_actions=2,
+            max_tokens=128,
+            temperature=0.3,
+            warnings=warnings,
+        )
+
+        signatures = [(action.tool, action.args.get("path")) for action in planner.actions]
+        self.assertIn(("read_file", "teamai/config.py"), signatures)
+        self.assertNotIn(("read_file", "pyproject.toml"), signatures)
+        runtime_anchor_paths = {
+            path
+            for tool, path in signatures
+            if tool == "read_file" and path in {"teamai/cli.py", "teamai/supervisor.py", "teamai/api.py"}
+        }
+        self.assertTrue(runtime_anchor_paths)
+
     def test_repository_inspection_run_auto_completes_after_core_reads(self) -> None:
         (self.workspace / "README.md").write_text(
             "# teamAI\npersistent memory\naction approval checkpoints\npatch-oriented editing tools\nstreaming event output\n",
@@ -432,6 +503,70 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertIn("Next engineering tasks", result.final_answer)
         self.assertIn("streaming event output", result.final_answer.lower())
         self.assertTrue(any("partial synthesis" in warning.lower() for warning in result.warnings))
+
+    def test_repository_inspection_run_partially_synthesizes_on_penultimate_round(self) -> None:
+        (self.workspace / "README.md").write_text(
+            "# teamAI\nlocal-first closed-loop orchestration\nstreaming event output\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "teamai").mkdir()
+        (self.workspace / "teamai" / "config.py").write_text("class Settings:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "cli.py").write_text("def main():\n    pass\n", encoding="utf-8")
+
+        backend = FakeBackend(
+            [
+                "List the root first.",
+                "That anchors the repo shape.",
+                '{"summary":"Inspect the root.","should_stop":false,"final_answer":null,"actions":[{"tool":"list_files","reason":"Inspect the workspace root.","args":{"path":"."}}]}',
+                '{"done":false,"confidence":0.1,"summary":"Need one runtime file before summarizing.","next_focus":"Read the runtime config and a primary entrypoint."}',
+                "Read the runtime settings next.",
+                "That should be enough to summarize the next engineering tasks.",
+                '{"summary":"Inspect runtime settings.","should_stop":false,"final_answer":null,"actions":[{"tool":"read_file","reason":"Inspect runtime settings.","args":{"path":"teamai/config.py"}}]}',
+                '{"done":false,"confidence":0.2,"summary":"Enough context gathered for a partial repository summary.","next_focus":"Summarize the next engineering tasks."}',
+            ]
+        )
+        supervisor = ClosedLoopSupervisor(self.settings, backend=backend)
+
+        result = supervisor.run(
+            RunRequest(
+                task="Inspect this repository and identify the next engineering tasks.",
+                workspace_path=".",
+                max_rounds=3,
+                max_actions_per_round=2,
+            ),
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.stop_reason, "inspection_synthesized")
+        self.assertIn("Next engineering tasks", result.final_answer)
+        self.assertIn("Runtime settings are centralized", result.final_answer)
+
+    def test_repository_inspection_run_can_complete_without_model_calls(self) -> None:
+        (self.workspace / "README.md").write_text(
+            "# teamAI\nlocal-first closed-loop orchestration\nstreaming event output\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "pyproject.toml").write_text(
+            '[project]\nname = "teamai"\ndependencies = ["mlx-vlm>=0.4.4"]\n',
+            encoding="utf-8",
+        )
+        (self.workspace / "teamai").mkdir()
+        (self.workspace / "teamai" / "config.py").write_text("class Settings:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "cli.py").write_text("def main():\n    pass\n", encoding="utf-8")
+
+        result = ClosedLoopSupervisor(self.settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task="Inspect this repository and identify the next engineering tasks.",
+                workspace_path=".",
+                max_rounds=3,
+                max_actions_per_round=2,
+            ),
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.stop_reason, "inspection_synthesized")
+        self.assertIn("Next engineering tasks", result.final_answer)
+        self.assertIn("Runtime settings are centralized", result.final_answer)
 
     def test_workspace_write_run_stops_for_pending_patch_approval(self) -> None:
         (self.workspace / "README.md").write_text("# demo\n", encoding="utf-8")

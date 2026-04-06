@@ -1,5 +1,14 @@
 # PROJECT_MEMORY
 
+### Future Autonomous Grok Factory (tabling — April 2026)
+Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio with more RAM):
+- Grok-style supervisor (Gemma 4 via MLX) that plans, delegates, and reviews
+- Full handoff to local Codex (Aider) and Antigravity (CLI/MCP)
+- Zero user input after high-level goal
+- Sequential execution to stay within memory limits
+- Full reuse of existing teamAI supervisor loop, evals, deterministic patches, learned notes, MockBackend, handoff.py, etc.
+- All ideas from the recent conversation thread are retained here for future implementation.
+
 ## Purpose
 - Personal local-first project for a closed-loop AI system on Apple Silicon.
 - Goal: turn a small local model into a useful supervised coding coprocessor that can reduce reliance on higher-cost remote reasoning for coding tasks.

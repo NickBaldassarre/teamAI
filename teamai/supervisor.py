@@ -11,7 +11,9 @@ from typing import Callable
 from pydantic import ValidationError
 
 from .config import Settings
+from .distillation import generate_semantic_skeleton
 from .events import build_run_event
+from .handoff import build_handoff_packet
 from .json_utils import JsonExtractionError, extract_json_object
 from .model_backend import MLXModelBackend, ModelBackendError
 from .memory import WorkspaceMemorySnapshot, WorkspaceMemoryStore
@@ -26,6 +28,7 @@ from .prompts import (
     build_round_context,
 )
 from .schemas import (
+    CodexHandoffPayload,
     PlannerTurn,
     RoundRecord,
     RunRequest,
@@ -471,7 +474,7 @@ class ClosedLoopSupervisor:
 
         self._log_telemetry(round_records, task_route)
 
-        return RunResult(
+        provisional_result = RunResult(
             status=status,
             model_id=self._settings.model_id,
             workspace=str(workspace),
@@ -485,6 +488,24 @@ class ClosedLoopSupervisor:
             started_at=started_at,
             completed_at=completed_at,
         )
+        codex_payload = self._maybe_generate_codex_payload(
+            task=request.task,
+            result=provisional_result,
+            workspace=workspace,
+            rounds=round_records,
+            warnings=warnings,
+        )
+        if codex_payload is None:
+            if provisional_result.warnings != warnings:
+                return provisional_result.model_copy(update={"warnings": warnings})
+            return provisional_result
+
+        return provisional_result.model_copy(
+            update={
+                "warnings": warnings,
+                "codex_payload": codex_payload,
+            }
+        )
 
     @staticmethod
     def _emit_progress(
@@ -493,6 +514,53 @@ class ClosedLoopSupervisor:
     ) -> None:
         if callback is not None:
             callback(message)
+
+    def _maybe_generate_codex_payload(
+        self,
+        *,
+        task: str,
+        result: RunResult,
+        workspace: Path,
+        rounds: list[RoundRecord],
+        warnings: list[str],
+    ) -> CodexHandoffPayload | None:
+        if result.task_route != "codex_handoff":
+            return None
+        if result.status == "failed":
+            return None
+
+        handoff = build_handoff_packet(task=task, result=result)
+        prioritized_files = self._rank_codex_handoff_paths(
+            task=task,
+            paths=[
+                *handoff.key_paths,
+                *self._priority_candidates(
+                    rounds,
+                    workspace,
+                    task=task,
+                    task_route="codex_handoff",
+                ),
+            ],
+        )
+        if not prioritized_files:
+            return None
+
+        recommended_action = handoff.primary_task or next(
+            (candidate for candidate in handoff.next_tasks if candidate.strip()),
+            "",
+        )
+        try:
+            return generate_semantic_skeleton(
+                task=task,
+                workspace=workspace,
+                prioritized_files=prioritized_files,
+                backend=self._backend,
+                recommended_codex_action=recommended_action,
+                max_tokens=min(128, self._settings.max_tokens_per_turn),
+            )
+        except Exception as exc:
+            warnings.append(f"Semantic skeleton generation failed: {exc}")
+            return None
 
     def _ask_model(
         self,

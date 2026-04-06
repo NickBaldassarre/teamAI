@@ -72,6 +72,13 @@ class RunRequest(BaseModel):
     continuation_context: dict[str, Any] = Field(default_factory=dict)
 
 
+class CodexHandoffPayload(BaseModel):
+    original_task: str
+    core_dependencies: list[str] = Field(default_factory=list)
+    distilled_context: dict[str, str] = Field(default_factory=dict)
+    recommended_codex_action: str
+
+
 class RunResult(BaseModel):
     status: Literal["completed", "stopped", "failed"]
     model_id: str
@@ -83,6 +90,7 @@ class RunResult(BaseModel):
     transcript: str
     rounds: list[RoundRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    codex_payload: CodexHandoffPayload | None = None
     started_at: datetime
     completed_at: datetime
 

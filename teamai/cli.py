@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from .schemas import RunEvent
+from .schemas import RunEvent, RunResult
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -273,6 +273,13 @@ def main() -> int:
                 rendered_output = render_handoff_markdown(handoff)
 
         _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
+        payload_path = _write_codex_payload_artifact(result)
+        if payload_path is not None:
+            print(
+                f"[teamai] Wrote semantic skeleton to {payload_path}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         print(rendered_output)
         return 0
@@ -527,6 +534,18 @@ def _write_cli_output(*, rendered_output: str, output_file: str | None) -> None:
         output_path = Path.cwd() / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(rendered_output + ("\n" if not rendered_output.endswith("\n") else ""), encoding="utf-8")
+
+
+def _write_codex_payload_artifact(result: RunResult) -> Path | None:
+    if result.codex_payload is None:
+        return None
+
+    workspace = Path(result.workspace).expanduser()
+    payload_path = workspace / ".teamai" / "codex_payload.json"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(result.codex_payload.model_dump(mode="json"), indent=2)
+    payload_path.write_text(rendered + "\n", encoding="utf-8")
+    return payload_path
     print(f"[teamai] Wrote output to {output_path}", file=sys.stderr, flush=True)
 
 

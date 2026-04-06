@@ -62,6 +62,7 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
 - Added bridge-backed eval support so Terminal-side live runs can act as the authoritative smoke path
 - Made `workspace_write` fail fast when writes are disabled instead of silently downgrading the run
 - Improved Codex handoff shaping and expanded deterministic `.env` assignment coverage for narrow local edits
+- Added a semantic skeleton payload for Codex handoffs so the local scout can compress high-signal files into `.teamai/codex_payload.json`
 
 ## Current Maturity
 - The project is now a real supervised local coding coprocessor, not just scaffolding.
@@ -80,6 +81,7 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
     - repository inspection timing out under the inspection profile
 
 ## Current Build Targets
+- Keep improving semantic-skeleton distillation quality so Codex handoffs carry more useful context with fewer tokens.
 - Further harden structured output reliability and convergence on local planning turns.
 - Continue expanding deterministic compiler coverage for explicit narrow coding chores.
 - Use eval feedback to keep improving local-model routing and usefulness over time.

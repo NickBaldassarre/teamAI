@@ -1655,6 +1655,50 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertIn("teamai/cli.py", result.final_answer)
         self.assertIn("teamai/api.py", result.final_answer)
 
+    def test_codex_handoff_run_generates_semantic_skeleton_payload(self) -> None:
+        (self.workspace / "README.md").write_text("# teamAI\nStreaming output overview.\n", encoding="utf-8")
+        (self.workspace / "pyproject.toml").write_text('[project]\nname = "teamai"\n', encoding="utf-8")
+        (self.workspace / "teamai").mkdir()
+        (self.workspace / "teamai" / "cli.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "api.py").write_text("def create_app() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "jobs.py").write_text("def run_job() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "supervisor.py").write_text("class ClosedLoopSupervisor:\n    pass\n", encoding="utf-8")
+        backend = FakeBackend(
+            [
+                "Start with a quick workspace map.",
+                "Then inspect the implementation entrypoints.",
+                (
+                    '{"summary":"Map the workspace first.","should_stop":false,"final_answer":null,"actions":['
+                    '{"tool":"list_files","reason":"Inspect the root.","args":{"path":"."}}]}'
+                ),
+                '{"done":false,"confidence":0.3,"summary":"Enough context for a Codex handoff.","next_focus":"Inspect `teamai/cli.py` and `teamai/api.py` before implementing streaming output."}',
+                "cli.py is the CLI entrypoint and is part of the streaming handoff surface.",
+                "api.py wires the API surface and will need matching progress propagation changes.",
+                "README documents the local scout workflow and smoke expectations for this feature.",
+                "supervisor.py owns routing decisions and remains adjacent to the streaming change surface.",
+            ]
+        )
+
+        result = ClosedLoopSupervisor(self.settings, backend=backend).run(
+            RunRequest(
+                task="Improve streaming event output across the CLI and API.",
+                workspace_path=".",
+                max_rounds=1,
+                max_actions_per_round=2,
+            ),
+        )
+
+        self.assertEqual(result.task_route, "codex_handoff")
+        self.assertEqual(result.stop_reason, "codex_handoff_synthesized")
+        self.assertIsNotNone(result.codex_payload)
+        assert result.codex_payload is not None
+        self.assertEqual(result.codex_payload.original_task, "Improve streaming event output across the CLI and API.")
+        self.assertIn("teamai/cli.py", result.codex_payload.core_dependencies)
+        self.assertIn("teamai/api.py", result.codex_payload.core_dependencies)
+        self.assertIn("teamai/cli.py", result.codex_payload.distilled_context)
+        self.assertIn("teamai/api.py", result.codex_payload.distilled_context)
+        self.assertIn("Inspect", result.codex_payload.recommended_codex_action)
+
     def test_priority_candidates_prioritize_memory_files_for_self_improvement_handoff(self) -> None:
         (self.workspace / "README.md").write_text("# teamAI\n", encoding="utf-8")
         (self.workspace / "pyproject.toml").write_text('[project]\nname = "teamai"\n', encoding="utf-8")

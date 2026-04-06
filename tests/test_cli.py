@@ -5,11 +5,14 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
-from teamai.cli import _build_run_stream_handlers
-from teamai.schemas import RunEvent
+from teamai.cli import _build_run_stream_handlers, main
+from teamai.config import Settings
+from teamai.schemas import CodexHandoffPayload, RunEvent, RunResult
 
 
 class CLIStreamingTest(unittest.TestCase):
@@ -47,6 +50,67 @@ class CLIStreamingTest(unittest.TestCase):
             log_lines = (project_root / "events.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(log_lines), 1)
             self.assertEqual(json.loads(log_lines[0])["stage"], "planner")
+
+    def test_run_command_writes_codex_payload_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            settings = Settings(
+                model_id="dummy",
+                model_revision=None,
+                force_download=False,
+                trust_remote_code=False,
+                enable_thinking=False,
+                workspace_root=workspace,
+                max_rounds=2,
+                max_actions_per_round=2,
+                max_tokens_per_turn=64,
+                temperature=0.3,
+                allow_shell=False,
+                allow_writes=False,
+                command_timeout_seconds=5,
+                max_file_bytes=10_000,
+                max_command_output_chars=10_000,
+                host="127.0.0.1",
+                port=8000,
+            )
+            result = RunResult(
+                status="completed",
+                model_id="dummy",
+                workspace=str(workspace),
+                execution_mode="read_only",
+                task_route="codex_handoff",
+                stop_reason="codex_handoff_synthesized",
+                final_answer="Current state: Ready.\n\nNext engineering tasks:\n- Inspect teamai/cli.py.\n",
+                transcript="demo transcript",
+                warnings=[],
+                codex_payload=CodexHandoffPayload(
+                    original_task="Inspect repo.",
+                    core_dependencies=["teamai/cli.py", "teamai/api.py"],
+                    distilled_context={
+                        "teamai/cli.py": "CLI entrypoint summary.",
+                        "teamai/api.py": "API entrypoint summary.",
+                    },
+                    recommended_codex_action="Inspect teamai/cli.py and teamai/api.py before implementing the change.",
+                ),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch("teamai.config.Settings.from_env", return_value=settings), patch(
+                "teamai.supervisor.ClosedLoopSupervisor.run",
+                return_value=result,
+            ), patch("sys.argv", ["teamai", "run", "Inspect repo.", "--workspace", "."]), redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            payload_path = workspace / ".teamai" / "codex_payload.json"
+            self.assertTrue(payload_path.exists())
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["original_task"], "Inspect repo.")
+            self.assertEqual(payload["core_dependencies"], ["teamai/cli.py", "teamai/api.py"])
+            self.assertIn("semantic skeleton", stderr.getvalue().lower())
 
 
 if __name__ == "__main__":

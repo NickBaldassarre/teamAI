@@ -2836,6 +2836,8 @@ class ClosedLoopSupervisor:
             return False
         return True
     def _log_inspection_telemetry(self, record: RoundRecord) -> None:
+        if os.getenv("TEAMAI_TELEMETRY") != "1":
+            return
         log_dir = Path("LOGS")
         log_dir.mkdir(exist_ok=True)
         log_file = log_dir / "telemetry.jsonl"

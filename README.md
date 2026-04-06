@@ -81,6 +81,22 @@ This keeps the project local-first while staying within the rough memory envelop
 
    If you see a Hugging Face warning during the first model download, it is safe to continue. You can optionally set `HF_TOKEN` in your shell or `.env` for higher download rate limits.
 
+5. Probe the selected local runtime before relying on live Gemma runs:
+
+   ```bash
+   ./.venv/bin/python -m teamai doctor
+   ```
+
+   `teamai doctor` now performs a real runtime probe. In `generate` mode it attempts a tiny MLX-backed model warmup generation instead of only checking whether `mlx_vlm` imports.
+
+For the most reliable local-model work, prefer the project virtualenv explicitly:
+
+```bash
+./.venv/bin/python -m teamai ...
+```
+
+The eval harness and bridge launcher now also auto-select `TEAMAI_PYTHON_EXECUTABLE` when set, otherwise the project-local `.venv/bin/python` when available, before falling back to the active interpreter.
+
 ## Run As A CLI
 
 Read-only loop:
@@ -196,6 +212,8 @@ Enable write-capable mode only if you also set `TEAMAI_ALLOW_WRITES=true` in `.e
 teamai run "Update the README after inspecting the codebase." --workspace . --execution-mode workspace_write
 ```
 
+If you request `workspace_write` while writes are disabled, `teamai run` now fails fast with a preflight-style error instead of silently downgrading to `read_only`.
+
 In `workspace_write` mode, write actions no longer mutate files immediately. They create pending patch approvals under `.teamai/approvals/`, stop the run with `approval_required`, and tell you how to review or apply the patch.
 
 Pending approvals may become stale if the target file changes before approval.
@@ -208,6 +226,7 @@ For narrow explicit edit requests, the supervisor now tries to compile determini
 - appending a quoted line or fenced code block to an existing file
 - inserting a quoted Python import into an existing module
 - updating a simple assignment or `.env` setting by key
+- appending a missing `.env` key assignment when the requested setting is absent
 - inserting a fenced test or method block into an existing Python class
 
 Broader implementation requests are now routed differently: if the task looks too open-ended for a safe local patch flow, the run stays in reconnaissance mode and produces a Codex-oriented handoff instead of trying to autonomously carry the full change.
@@ -350,7 +369,18 @@ The bundled smoke suite tracks practical operator metrics across multiple cases,
 
 Every eval run now also writes a lightweight eval-feedback record into `.teamai/run-history.jsonl` and `.teamai/memory.md`. That feedback summarizes pass/fail rates, derives next tasks from failed cases, and turns the eval results into learned notes that can influence future ranking, pruning, and routing decisions.
 
-When you use the default isolated eval runner, the suite now also runs a lightweight MLX import preflight before scoring the cases. If the local runtime is unavailable, the report marks those cases as `infra_runtime` instead of treating them like clean agent-behavior regressions.
+When you use the default isolated eval runner, the suite now also runs a shared runtime doctor preflight before scoring the cases. By default that probe attempts a tiny model warmup generation instead of only checking imports. If the local runtime is unavailable, the report marks those cases as `infra_runtime` instead of treating them like clean agent-behavior regressions.
+
+For the most realistic live Gemma smoke test on macOS, you can also run each eval case through the Terminal bridge:
+
+```bash
+./.venv/bin/python -m teamai eval --suite-file evals/teamai_smoke.json \
+  --allow-write-cases \
+  --runner-mode terminal_bridge \
+  --output-format summary_markdown
+```
+
+That mode launches each case through the same bridge path used for real local handoff runs and treats the Terminal-side result artifact as the source of truth.
 
 Each case can also assert expectations such as:
 

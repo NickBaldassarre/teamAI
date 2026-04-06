@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -14,10 +15,22 @@ from typing import Callable, Literal
 from pydantic import BaseModel, Field
 
 from .approvals import PatchApprovalStore
-from .bridge import BridgeArtifacts, BridgeLaunchConfig, build_run_command, prepare_bridge_config
+from .bridge import (
+    BridgeArtifacts,
+    BridgeLaunchConfig,
+    BridgePreflightError,
+    build_run_command,
+    launch_bridge,
+    load_bridge_status,
+    prepare_bridge_config,
+)
 from .config import Settings
 from .handoff import build_handoff_packet
 from .memory import WorkspaceMemoryStore
+from .runtime import (
+    DEFAULT_RUNTIME_PROBE_TIMEOUT_SECONDS,
+    run_runtime_probe,
+)
 from .schemas import RunRequest, RunResult, ToolExecutionResult
 from .supervisor import ClosedLoopSupervisor
 
@@ -84,6 +97,8 @@ class EvalRuntimeHealth(BaseModel):
     reason: str = "not_checked"
     summary: str = "Runtime health was not checked."
     checked_at: datetime
+    probe_mode: str = "import"
+    python_executable: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -147,9 +162,9 @@ class EvalSuiteReport(BaseModel):
 
 EvalRunner = Callable[[RunRequest, Settings], RunResult]
 EvalSubprocessRunner = Callable[[list[str], dict[str, str], Path, float | None], subprocess.CompletedProcess[str]]
-EvalRunnerMode = Literal["in_process", "isolated_subprocess"]
+EvalRunnerMode = Literal["in_process", "isolated_subprocess", "terminal_bridge"]
 DEFAULT_ISOLATED_CASE_TIMEOUT_SECONDS = 180
-DEFAULT_RUNTIME_HEALTH_TIMEOUT_SECONDS = 20
+DEFAULT_BRIDGE_CASE_POLL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -183,6 +198,7 @@ def run_eval_suite(
     per_case_timeout_seconds: int | None = None,
     project_root: Path | None = None,
     python_executable: Path | None = None,
+    terminal_app: str = "Terminal",
     subprocess_runner: EvalSubprocessRunner | None = None,
 ) -> EvalSuiteReport:
     started_at = datetime.now(timezone.utc)
@@ -225,6 +241,7 @@ def run_eval_suite(
                 inject_write_env=inject_write_env,
                 project_root=effective_project_root,
                 python_executable=effective_python,
+                terminal_app=terminal_app,
                 per_case_timeout_seconds=per_case_timeout_seconds,
                 subprocess_runner=subprocess_runner,
             )
@@ -396,79 +413,32 @@ def _run_runtime_health_preflight(
 ) -> EvalRuntimeHealth:
     checked_at = datetime.now(timezone.utc)
     if runner_mode != "isolated_subprocess":
-        return EvalRuntimeHealth(
-            status="unknown",
-            reason="not_checked_in_process_mode",
-            summary="Skipped MLX runtime preflight because the eval suite is running in-process.",
-            checked_at=checked_at,
-        )
+        if runner_mode != "terminal_bridge":
+            return EvalRuntimeHealth(
+                status="unknown",
+                reason="not_checked_in_process_mode",
+                summary="Skipped MLX runtime preflight because the eval suite is running in-process.",
+                checked_at=checked_at,
+            )
 
-    env = dict(os.environ)
-    preflight_script = """
-import json
-
-payload = {"status": "healthy", "reason": "mlx_import_ok", "summary": "MLX import preflight passed."}
-try:
-    import mlx_vlm  # noqa: F401
-except Exception as exc:
-    payload = {
-        "status": "unavailable",
-        "reason": "mlx_import_failed",
-        "summary": f"MLX import preflight failed: {exc}",
-    }
-
-print(json.dumps(payload))
-""".strip()
-    command = [
-        str(python_executable),
-        "-c",
-        preflight_script,
-    ]
-    try:
-        completed = subprocess_runner(command, env, project_root, DEFAULT_RUNTIME_HEALTH_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        return EvalRuntimeHealth(
-            status="unknown",
-            reason="mlx_import_timeout",
-            summary="MLX import preflight timed out before the eval suite started.",
-            checked_at=checked_at,
-            warnings=["Runtime health preflight timed out; runtime-dependent failures may be environmental."],
-        )
-
-    stdout = completed.stdout.strip()
-    if completed.returncode != 0:
-        return EvalRuntimeHealth(
-            status="unknown",
-            reason="preflight_subprocess_failed",
-            summary="MLX runtime preflight could not complete cleanly.",
-            checked_at=checked_at,
-            warnings=[_tail_text(completed.stderr or completed.stdout or "Preflight subprocess failed.")],
-        )
-
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        return EvalRuntimeHealth(
-            status="unknown",
-            reason="preflight_invalid_payload",
-            summary="MLX runtime preflight returned an unreadable payload.",
-            checked_at=checked_at,
-            warnings=[_tail_text(stdout or completed.stderr or "Preflight payload was not valid JSON.")],
-        )
-
-    status = str(payload.get("status", "unknown")).strip() or "unknown"
-    reason = str(payload.get("reason", "unknown")).strip() or "unknown"
-    summary = str(payload.get("summary", "Runtime health preflight completed.")).strip() or "Runtime health preflight completed."
-    if status not in {"healthy", "unavailable", "unknown"}:
-        status = "unknown"
-    warnings: list[str] = []
-    if status != "healthy":
-        warnings.append(summary)
+    probe = run_runtime_probe(
+        settings=settings,
+        project_root=project_root,
+        python_executable=python_executable,
+        subprocess_runner=subprocess_runner,
+        timeout_seconds=DEFAULT_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        probe_mode="generate",
+    )
+    warnings = list(probe.warnings)
+    if probe.status != "healthy" and probe.summary not in warnings:
+        warnings.append(probe.summary)
     return EvalRuntimeHealth(
-        status=status,  # type: ignore[arg-type]
-        reason=reason,
-        summary=summary,
-        checked_at=checked_at,
+        status=probe.status,  # type: ignore[arg-type]
+        reason=probe.reason,
+        summary=probe.summary,
+        checked_at=probe.checked_at,
+        probe_mode=probe.probe_mode,
+        python_executable=probe.python_executable,
         warnings=warnings,
     )
 
@@ -482,6 +452,7 @@ def _execute_eval_case(
     inject_write_env: bool,
     project_root: Path,
     python_executable: Path,
+    terminal_app: str,
     per_case_timeout_seconds: int | None,
     subprocess_runner: EvalSubprocessRunner | None,
 ) -> EvalCaseExecution:
@@ -497,6 +468,20 @@ def _execute_eval_case(
             python_executable=python_executable,
             timeout_seconds=timeout_seconds,
             subprocess_runner=subprocess_runner or _default_subprocess_runner,
+        )
+
+    if runner_mode == "terminal_bridge":
+        if runner is not None:
+            raise ValueError("Custom eval runners are only supported with `runner_mode='in_process'`.")
+        timeout_seconds = per_case_timeout_seconds or DEFAULT_ISOLATED_CASE_TIMEOUT_SECONDS
+        return _run_case_via_terminal_bridge(
+            request=request,
+            settings=settings,
+            inject_write_env=inject_write_env,
+            project_root=project_root,
+            python_executable=python_executable,
+            timeout_seconds=timeout_seconds,
+            terminal_app=terminal_app,
         )
 
     case_runner = runner or _default_runner
@@ -609,6 +594,132 @@ def _run_case_in_subprocess(
             guardrail_notes=bridge_config.guardrail_notes,
             timeout_seconds=timeout_seconds,
             error="Case subprocess failed in isolated mode: " + "; ".join(error_lines) + ".",
+        )
+
+
+def _run_case_via_terminal_bridge(
+    *,
+    request: RunRequest,
+    settings: Settings,
+    inject_write_env: bool,
+    project_root: Path,
+    python_executable: Path,
+    timeout_seconds: int,
+    terminal_app: str,
+) -> EvalCaseExecution:
+    case_id_slug = _slugify_case_id(request.task)
+    with tempfile.TemporaryDirectory(prefix=f"teamai-bridge-eval-{case_id_slug}-") as temp_dir:
+        temp_path = Path(temp_dir)
+        result_file = temp_path / "run-result.json"
+        artifacts = BridgeArtifacts(
+            handoff_file=result_file,
+            status_file=temp_path / "status.json",
+            log_file=temp_path / "run.log",
+            script_file=temp_path / "launch.sh",
+        )
+        bridge_config = prepare_bridge_config(
+            BridgeLaunchConfig(
+                task=request.task,
+                project_root=project_root,
+                python_executable=python_executable,
+                workspace=request.workspace_path,
+                max_rounds=request.max_rounds,
+                max_actions=request.max_actions_per_round,
+                max_tokens=request.max_tokens_per_turn,
+                temperature=request.temperature,
+                execution_mode=request.execution_mode,
+                inject_write_env=inject_write_env,
+                terminal_app=terminal_app,
+                artifacts=artifacts,
+                output_format="full_json",
+                output_file=result_file,
+            )
+        )
+
+        try:
+            launch_bridge(bridge_config, dry_run=False)
+        except BridgePreflightError as exc:
+            return EvalCaseExecution(
+                result=None,
+                runner_mode="terminal_bridge",
+                memory_profile=bridge_config.memory_profile,
+                guardrail_notes=bridge_config.guardrail_notes,
+                timeout_seconds=timeout_seconds,
+                error=f"Bridge case preflight failed: {exc}",
+            )
+        except RuntimeError as exc:
+            return EvalCaseExecution(
+                result=None,
+                runner_mode="terminal_bridge",
+                memory_profile=bridge_config.memory_profile,
+                guardrail_notes=bridge_config.guardrail_notes,
+                timeout_seconds=timeout_seconds,
+                error=f"Bridge case launch failed: {exc}",
+            )
+
+        deadline = time.monotonic() + timeout_seconds
+        latest_status: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            latest_status = load_bridge_status(artifacts)
+            if str(latest_status.get("state", "")).strip() in {
+                "completed",
+                "failed",
+                "launch_failed",
+                "preflight_failed",
+                "invalid",
+            }:
+                break
+            time.sleep(DEFAULT_BRIDGE_CASE_POLL_SECONDS)
+        else:
+            return EvalCaseExecution(
+                result=None,
+                runner_mode="terminal_bridge",
+                memory_profile=bridge_config.memory_profile,
+                guardrail_notes=bridge_config.guardrail_notes,
+                timeout_seconds=timeout_seconds,
+                error=(
+                    "Bridge-backed eval case timed out before the Terminal run produced a final status. "
+                    f"Latest state was `{latest_status.get('state', 'unknown')}`."
+                ),
+                stop_reason="case_timeout",
+            )
+
+        if result_file.exists():
+            try:
+                result = RunResult.model_validate_json(result_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return EvalCaseExecution(
+                    result=None,
+                    runner_mode="terminal_bridge",
+                    memory_profile=bridge_config.memory_profile,
+                    guardrail_notes=bridge_config.guardrail_notes,
+                    timeout_seconds=timeout_seconds,
+                    error=(
+                        "Bridge-backed eval wrote an unreadable result payload: "
+                        f"{exc}. status: {_tail_text(json.dumps(latest_status, default=str))}"
+                    ),
+                )
+            return EvalCaseExecution(
+                result=result,
+                runner_mode="terminal_bridge",
+                memory_profile=bridge_config.memory_profile,
+                guardrail_notes=bridge_config.guardrail_notes,
+                timeout_seconds=timeout_seconds,
+                result_status=result.status,
+                task_route=result.task_route,
+                stop_reason=result.stop_reason,
+            )
+
+        error = str(latest_status.get("error", "")).strip()
+        if not error:
+            error = "Bridge-backed eval case did not produce a result file."
+        return EvalCaseExecution(
+            result=None,
+            runner_mode="terminal_bridge",
+            memory_profile=bridge_config.memory_profile,
+            guardrail_notes=bridge_config.guardrail_notes,
+            timeout_seconds=timeout_seconds,
+            error=f"Bridge-backed eval case failed: {error}",
         )
 
 

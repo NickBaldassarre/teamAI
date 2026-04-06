@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from .schemas import HandoffPacket, RunResult, ToolExecutionResult
 
@@ -8,7 +9,7 @@ from .schemas import HandoffPacket, RunResult, ToolExecutionResult
 def build_handoff_packet(*, task: str, result: RunResult) -> HandoffPacket:
     summary, next_tasks = _extract_summary_and_tasks(result.final_answer)
     key_paths = _collect_key_paths(task=task, result=result)
-    primary_task = next_tasks[0] if next_tasks else None
+    primary_task = _select_primary_task(next_tasks)
     evidence = _collect_evidence(result)
     open_questions = _collect_open_questions(
         result,
@@ -109,6 +110,31 @@ def _collect_key_paths(*, task: str, result: RunResult) -> list[str]:
             seen.add(normalized)
             ordered.append(normalized)
     return _rank_key_paths_for_task(task=task, paths=ordered)[:12]
+
+
+def _select_primary_task(next_tasks: list[str]) -> str | None:
+    if not next_tasks:
+        return None
+    return max(
+        next_tasks,
+        key=lambda task: (_score_next_task(task), -next_tasks.index(task)),
+    )
+
+
+def _score_next_task(task: str) -> int:
+    lowered = task.lower()
+    score = 0
+    if lowered.startswith(("implement ", "fix ", "update ", "debug ", "replace ", "add ")):
+        score += 6
+    if lowered.startswith(("inspect ", "read ", "review ", "trace ", "verify ", "map ")):
+        score += 5
+    if "inspect the most relevant paths first:" in lowered:
+        score -= 1
+    if "implement the requested change in codex" in lowered:
+        score -= 3
+    if re.search(r"\b[\w./-]+\.\w+\b", task):
+        score += 2
+    return score
 
 
 def _rank_key_paths_for_task(*, task: str, paths: list[str]) -> list[str]:
@@ -375,7 +401,11 @@ def _summarize_tool_result(tool_result: ToolExecutionResult, *, workspace: Path)
         if path:
             return f"Searched {path}."
     if tool_result.tool == "run_command":
-        command = str(tool_result.metadata.get("command", "")).strip()
+        command_value = tool_result.metadata.get("command", "")
+        if isinstance(command_value, list):
+            command = " ".join(str(part) for part in command_value).strip()
+        else:
+            command = str(command_value).strip()
         if command:
             return f"Ran safe command: {command}."
     return ""

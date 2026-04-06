@@ -70,11 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_parser.add_argument(
         "--runner-mode",
-        choices=["isolated_subprocess", "in_process"],
+        choices=["isolated_subprocess", "in_process", "terminal_bridge"],
         default="isolated_subprocess",
         help=(
             "How to execute eval cases. `isolated_subprocess` runs each case in its own guarded `teamai run` "
-            "process with a timeout; `in_process` keeps the older single-process behavior."
+            "process with a timeout; `terminal_bridge` launches each case through the macOS Terminal bridge; "
+            "`in_process` keeps the older single-process behavior."
         ),
     )
     eval_parser.add_argument(
@@ -82,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=180,
         help="Timeout for each isolated eval case. Ignored in `in_process` mode.",
+    )
+    eval_parser.add_argument(
+        "--terminal-app",
+        default="Terminal",
+        help="Terminal app name used when `--runner-mode terminal_bridge` is selected.",
     )
     eval_parser.add_argument(
         "--output-format",
@@ -138,6 +144,40 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_status_parser.add_argument("--status-file", default=".teamai/codex-bridge-status.json")
     bridge_status_parser.add_argument("--log-file", default=".teamai/codex-bridge.log")
     bridge_status_parser.add_argument("--script-file", default=".teamai/codex-bridge-launch.sh")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Probe the selected local MLX/Gemma runtime and print the supported launch path.",
+    )
+    doctor_parser.add_argument(
+        "--probe-mode",
+        choices=["import", "generate"],
+        default="generate",
+        help="`generate` performs a real model warmup generation; `import` only checks MLX imports.",
+    )
+    doctor_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=180,
+        help="Timeout for the runtime probe subprocess.",
+    )
+    doctor_parser.add_argument(
+        "--max-probe-tokens",
+        type=int,
+        default=12,
+        help="Max tokens used for the model warmup generation probe.",
+    )
+    doctor_parser.add_argument(
+        "--output-format",
+        choices=["full_json", "summary_markdown"],
+        default="summary_markdown",
+        help="How to render the doctor report.",
+    )
+    doctor_parser.add_argument(
+        "--output-file",
+        default=None,
+        help="Optional path to also write the rendered doctor report.",
+    )
 
     approvals_parser = subparsers.add_parser(
         "approvals",
@@ -240,9 +280,18 @@ def main() -> int:
     if args.command == "eval":
         from .config import Settings
         from .evals import load_eval_suite, render_eval_markdown, run_eval_suite
+        from .runtime import select_runtime_python
 
         settings = Settings.from_env()
-        suite = load_eval_suite(_resolve_cli_path(Path.cwd().resolve(), args.suite_file))
+        project_root = Path.cwd().resolve()
+        selection = select_runtime_python(project_root, current_python=Path(sys.executable))
+        if not selection.using_selected_python:
+            print(
+                f"[teamai] Selected local runtime {selection.selected_python} ({selection.source})",
+                file=sys.stderr,
+                flush=True,
+            )
+        suite = load_eval_suite(_resolve_cli_path(project_root, args.suite_file))
         report = run_eval_suite(
             settings=settings,
             suite=suite,
@@ -250,8 +299,9 @@ def main() -> int:
             allow_write_cases=args.allow_write_cases,
             runner_mode=args.runner_mode,
             per_case_timeout_seconds=args.per_case_timeout_seconds,
-            project_root=Path.cwd().resolve(),
-            python_executable=Path(sys.executable),
+            project_root=project_root,
+            python_executable=Path(selection.selected_python),
+            terminal_app=args.terminal_app,
         )
         if args.output_format == "summary_markdown":
             rendered_output = render_eval_markdown(report)
@@ -278,8 +328,16 @@ def main() -> int:
 
     if args.command == "bridge-launch":
         from .bridge import BridgeArtifacts, BridgeLaunchConfig, BridgePreflightError, launch_bridge
+        from .runtime import select_runtime_python
 
         project_root = Path.cwd().resolve()
+        selection = select_runtime_python(project_root, current_python=Path(sys.executable))
+        if not selection.using_selected_python:
+            print(
+                f"[teamai] Selected local runtime {selection.selected_python} ({selection.source})",
+                file=sys.stderr,
+                flush=True,
+            )
         artifacts = BridgeArtifacts(
             handoff_file=_resolve_cli_path(project_root, args.handoff_file),
             status_file=_resolve_cli_path(project_root, args.status_file),
@@ -289,7 +347,7 @@ def main() -> int:
         config = BridgeLaunchConfig(
             task=args.task,
             project_root=project_root,
-            python_executable=Path(sys.executable),
+            python_executable=Path(selection.selected_python),
             workspace=args.workspace,
             max_rounds=args.max_rounds,
             max_actions=args.max_actions,
@@ -324,6 +382,33 @@ def main() -> int:
         )
         print(json.dumps(load_bridge_status(artifacts), indent=2))
         return 0
+
+    if args.command == "doctor":
+        from .config import Settings
+        from .runtime import (
+            default_runtime_subprocess_runner,
+            render_runtime_doctor_markdown,
+            run_runtime_doctor,
+        )
+
+        project_root = Path.cwd().resolve()
+        settings = Settings.from_env()
+        report = run_runtime_doctor(
+            settings=settings,
+            project_root=project_root,
+            current_python=Path(sys.executable),
+            subprocess_runner=default_runtime_subprocess_runner,
+            probe_mode=args.probe_mode,
+            timeout_seconds=args.timeout_seconds,
+            max_tokens=args.max_probe_tokens,
+        )
+        if args.output_format == "summary_markdown":
+            rendered_output = render_runtime_doctor_markdown(report)
+        else:
+            rendered_output = json.dumps(report.model_dump(mode="json"), indent=2)
+        _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
+        print(rendered_output)
+        return 0 if report.probe.status == "healthy" else 1
 
     if args.command == "approvals":
         from .approvals import PatchApprovalStore

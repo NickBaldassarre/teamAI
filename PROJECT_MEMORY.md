@@ -58,10 +58,17 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
 - Added runtime-health-aware eval scoring so infra failures are not misread as agent failures
 - Fixed eval subprocess interpreter selection on macOS so live local evals use the real venv runtime
 - Hardened the deterministic append smoke path so the narrow write smoke case now reaches `approval_required`
+- Added shared runtime selection plus a real `teamai doctor` warmup probe for local MLX/Gemma health
+- Added bridge-backed eval support so Terminal-side live runs can act as the authoritative smoke path
+- Made `workspace_write` fail fast when writes are disabled instead of silently downgrading the run
+- Improved Codex handoff shaping and expanded deterministic `.env` assignment coverage for narrow local edits
 
 ## Current Maturity
 - The project is now a real supervised local coding coprocessor, not just scaffolding.
 - Broad autonomous coding is still intentionally limited; broader tasks should route to reconnaissance plus handoff.
+- The local runtime story is more explicit now:
+  - bridge and eval child runs prefer `TEAMAI_PYTHON_EXECUTABLE`, then the project `.venv`, before falling back to the active interpreter
+  - `teamai doctor` can distinguish "imports succeed" from "a tiny real Gemma warmup succeeds"
 - Latest live smoke eval on the real local runtime is meaningful:
   - runtime health: `healthy (mlx_import_ok)`
   - pass rate: `2/3`
@@ -73,6 +80,7 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
     - repository inspection timing out under the inspection profile
 
 ## Current Build Targets
+- Re-baseline the live smoke workflow around `teamai doctor` plus the new `terminal_bridge` eval mode.
 - Reduce inspection timeout and drift for repo-inspection tasks.
 - Improve inspection/recon retrieval, ranking, and early-stop behavior.
 - Further harden structured output reliability and convergence on local planning turns.

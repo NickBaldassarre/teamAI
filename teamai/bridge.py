@@ -96,6 +96,8 @@ class BridgeLaunchConfig:
     inject_write_env: bool
     terminal_app: str
     artifacts: BridgeArtifacts
+    output_format: str = "handoff_json"
+    output_file: Path | None = None
     memory_profile: str = "default"
     guardrail_notes: tuple[str, ...] = ()
     bridge_run_id: str = field(default_factory=lambda: uuid4().hex[:12])
@@ -121,7 +123,7 @@ def launch_bridge(config: BridgeLaunchConfig, *, dry_run: bool = False) -> dict[
     config = prepare_bridge_config(config)
     config.project_root.mkdir(parents=True, exist_ok=True)
     config.artifacts.state_dir.mkdir(parents=True, exist_ok=True)
-    _clear_previous_bridge_outputs(config.artifacts)
+    _clear_previous_bridge_outputs(config)
     _preflight_bridge_launch(config)
     script_text = render_bridge_script(config)
     config.artifacts.script_file.write_text(script_text, encoding="utf-8")
@@ -183,8 +185,9 @@ def launch_bridge(config: BridgeLaunchConfig, *, dry_run: bool = False) -> dict[
     return launched_status
 
 
-def _clear_previous_bridge_outputs(artifacts: BridgeArtifacts) -> None:
-    for path in (artifacts.handoff_file, artifacts.log_file):
+def _clear_previous_bridge_outputs(config: BridgeLaunchConfig) -> None:
+    output_file = config.output_file or config.artifacts.handoff_file
+    for path in {config.artifacts.handoff_file, config.artifacts.log_file, output_file}:
         try:
             if path.exists() or path.is_symlink():
                 path.unlink()
@@ -358,6 +361,8 @@ def render_bridge_script(config: BridgeLaunchConfig) -> str:
         "workspace": config.workspace,
         "execution_mode": config.execution_mode,
         "inject_write_env": config.inject_write_env,
+        "output_format": config.output_format,
+        "output_file": str(config.output_file or config.artifacts.handoff_file),
         "memory_profile": config.memory_profile,
         "guardrail_notes": list(config.guardrail_notes),
         "retry_on_memory_pressure": retry_config is not None,
@@ -461,8 +466,8 @@ retry_attempted = os.environ.get("TEAMAI_BRIDGE_RETRY_ATTEMPTED", "0") == "1"
 retry_recovered = os.environ.get("TEAMAI_BRIDGE_RETRY_RECOVERED", "0") == "1"
 retry_profile = os.environ.get("TEAMAI_BRIDGE_RETRY_PROFILE") or None
 memory_pressure = os.environ.get("TEAMAI_BRIDGE_MEMORY_PRESSURE", "0") == "1"
-handoff_exists = Path(metadata["handoff_file"]).exists()
-state = "completed" if exit_code == 0 and handoff_exists else "failed"
+output_exists = Path(metadata["output_file"]).exists()
+state = "completed" if exit_code == 0 and output_exists else "failed"
 status = metadata | {{
     "state": state,
     "event_at": datetime.now(timezone.utc).isoformat(),
@@ -481,7 +486,8 @@ status = metadata | {{
             else "Bridge run failed; inspect the log file."
         )
     ),
-    "handoff_exists": handoff_exists,
+    "handoff_exists": output_exists,
+    "output_exists": output_exists,
     "memory_pressure": memory_pressure,
     "retry_attempted": retry_attempted,
     "retry_recovered": retry_recovered,
@@ -501,9 +507,11 @@ def load_bridge_status(artifacts: BridgeArtifacts) -> dict[str, object]:
             "bridge_run_id": None,
             "status_file": str(artifacts.status_file),
             "handoff_file": str(artifacts.handoff_file),
+            "output_file": str(artifacts.handoff_file),
             "log_file": str(artifacts.log_file),
             "script_file": str(artifacts.script_file),
             "handoff_exists": artifacts.handoff_file.exists(),
+            "output_exists": artifacts.handoff_file.exists(),
             "log_exists": artifacts.log_file.exists(),
         }
 
@@ -524,9 +532,14 @@ def load_bridge_status(artifacts: BridgeArtifacts) -> dict[str, object]:
     payload.setdefault("status_file", str(artifacts.status_file))
     payload.setdefault("bridge_run_id", None)
     payload.setdefault("handoff_file", str(artifacts.handoff_file))
+    payload.setdefault("output_file", str(payload.get("handoff_file", artifacts.handoff_file)))
     payload.setdefault("log_file", str(artifacts.log_file))
     payload.setdefault("script_file", str(artifacts.script_file))
     payload["handoff_exists"] = artifacts.handoff_file.exists()
+    try:
+        payload["output_exists"] = Path(str(payload["output_file"])).exists()
+    except Exception:
+        payload["output_exists"] = payload["handoff_exists"]
     payload["log_exists"] = artifacts.log_file.exists()
     return payload
 
@@ -538,9 +551,11 @@ def _build_run_command(config: BridgeLaunchConfig) -> list[str]:
 def build_run_command(
     config: BridgeLaunchConfig,
     *,
-    output_format: str = "handoff_json",
+    output_format: str | None = None,
     output_file: Path | None = None,
 ) -> list[str]:
+    effective_output_format = output_format or config.output_format
+    effective_output_file = output_file or config.output_file or config.artifacts.handoff_file
     command = [
         str(config.python_executable),
         "-u",
@@ -549,9 +564,9 @@ def build_run_command(
         "run",
         config.task,
         "--output-format",
-        output_format,
+        effective_output_format,
         "--output-file",
-        str(output_file or config.artifacts.handoff_file),
+        str(effective_output_file),
         "--execution-mode",
         config.execution_mode,
     ]
@@ -593,6 +608,8 @@ def _status_payload(
         "workspace": config.workspace,
         "execution_mode": config.execution_mode,
         "inject_write_env": config.inject_write_env,
+        "output_format": config.output_format,
+        "output_file": str(config.output_file or config.artifacts.handoff_file),
         "memory_profile": config.memory_profile,
         "guardrail_notes": list(config.guardrail_notes),
         "retry_on_memory_pressure": _build_memory_retry_config(config) is not None,

@@ -615,6 +615,22 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual((self.workspace / "README.md").read_text(encoding="utf-8"), "# demo\n")
         self.assertEqual(result.rounds[0].verifier.summary, "Patch approval is required before the proposed file changes can be applied.")
 
+    def test_workspace_write_run_fails_fast_when_writes_are_disabled(self) -> None:
+        result = ClosedLoopSupervisor(self.settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task="Update README.md with a one-line patch.",
+                workspace_path=".",
+                execution_mode="workspace_write",
+            ),
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.stop_reason, "write_disabled_preflight")
+        self.assertEqual(result.task_route, "write_disabled_preflight")
+        self.assertEqual(result.execution_mode, "workspace_write")
+        self.assertIn("Run refused", result.final_answer)
+        self.assertEqual(result.rounds, [])
+
     def test_synthesis_suppresses_implemented_memory_feature(self) -> None:
         (self.workspace / "README.md").write_text(
             "# teamAI\npersistent memory\npatch-oriented editing tools\nstreaming event output\n",
@@ -944,6 +960,31 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual(planner.actions[0].args["path"], ".env")
         self.assertIn("TEAMAI_ALLOW_WRITES=true", planner.actions[0].args["content"])
 
+    def test_heuristic_write_fallback_compiles_missing_env_assignment_append(self) -> None:
+        env_file = self.workspace / ".env"
+        env_file.write_text(
+            "TEAMAI_MAX_ROUNDS=4\n",
+            encoding="utf-8",
+        )
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([]))
+
+        planner = supervisor._heuristic_plan_from_context(  # noqa: SLF001
+            task="Use workspace_write mode. Set TEAMAI_ALLOW_WRITES to true in .env.",
+            raw_response="No valid planner JSON.",
+            user_prompt="Compile the requested patch.",
+            workspace=self.workspace,
+            previous_rounds=[],
+            max_actions=1,
+            execution_mode="workspace_write",
+        )
+
+        self.assertEqual(planner.actions[0].tool, "write_file")
+        self.assertEqual(planner.actions[0].args["path"], ".env")
+        self.assertEqual(
+            planner.actions[0].args["content"],
+            "TEAMAI_MAX_ROUNDS=4\nTEAMAI_ALLOW_WRITES=true\n",
+        )
+
     def test_heuristic_write_fallback_compiles_test_method_insertion_into_class(self) -> None:
         test_file = self.workspace / "tests" / "test_sample.py"
         test_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1016,9 +1057,47 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual(result.task_route, "deterministic_patch")
         self.assertEqual(result.status, "stopped")
         self.assertEqual(result.stop_reason, "approval_required")
+
+    def test_workspace_write_run_compiles_missing_env_assignment_without_prior_read(self) -> None:
+        env_file = self.workspace / ".env"
+        env_file.write_text(
+            "TEAMAI_MAX_ROUNDS=4\n",
+            encoding="utf-8",
+        )
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=1,
+            max_actions_per_round=2,
+            max_tokens_per_turn=64,
+            temperature=0.3,
+            allow_shell=False,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=10_000,
+            max_command_output_chars=10_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+
+        result = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task="Use workspace_write mode. Set TEAMAI_ALLOW_WRITES to true in .env.",
+                workspace_path=".",
+                execution_mode="workspace_write",
+            ),
+        )
+
+        self.assertEqual(result.task_route, "deterministic_patch")
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.stop_reason, "approval_required")
         approval_files = sorted((self.workspace / ".teamai" / "approvals").glob("*.json"))
         self.assertEqual(len(approval_files), 1)
-        self.assertIn("import threading", approval_files[0].read_text(encoding="utf-8"))
+        self.assertIn("TEAMAI_ALLOW_WRITES=true", approval_files[0].read_text(encoding="utf-8"))
 
     def test_workspace_write_run_compiles_exact_replace_without_prior_read(self) -> None:
         (self.workspace / "README.md").write_text(
@@ -1537,6 +1616,39 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 workspace_path=".",
                 max_rounds=1,
                 max_actions_per_round=3,
+            ),
+        )
+
+        self.assertEqual(result.task_route, "codex_handoff")
+        self.assertEqual(result.stop_reason, "codex_handoff_synthesized")
+        self.assertIn("teamai/cli.py", result.final_answer)
+        self.assertIn("teamai/api.py", result.final_answer)
+
+    def test_codex_handoff_falls_back_to_task_relevant_paths_when_next_focus_is_weak(self) -> None:
+        (self.workspace / "README.md").write_text("# teamAI\n", encoding="utf-8")
+        (self.workspace / "pyproject.toml").write_text('[project]\nname = "teamai"\n', encoding="utf-8")
+        (self.workspace / "teamai").mkdir()
+        (self.workspace / "teamai" / "cli.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "api.py").write_text("def create_app() -> None:\n    pass\n", encoding="utf-8")
+        (self.workspace / "teamai" / "jobs.py").write_text("def run_job() -> None:\n    pass\n", encoding="utf-8")
+        backend = FakeBackend(
+            [
+                "Map the workspace first.",
+                "Keep the handoff narrow.",
+                (
+                    '{"summary":"Map the workspace first.","should_stop":false,"final_answer":null,"actions":['
+                    '{"tool":"list_files","reason":"Inspect the root.","args":{"path":"."}}]}'
+                ),
+                '{"done":false,"confidence":0.2,"summary":"Enough context for a handoff.","next_focus":"Need more context."}',
+            ]
+        )
+
+        result = ClosedLoopSupervisor(self.settings, backend=backend).run(
+            RunRequest(
+                task="Improve streaming event output across the CLI and API.",
+                workspace_path=".",
+                max_rounds=1,
+                max_actions_per_round=2,
             ),
         )
 

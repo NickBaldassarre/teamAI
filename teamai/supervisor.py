@@ -65,11 +65,67 @@ class ClosedLoopSupervisor:
         continuation_context = request.continuation_context or {}
 
         warnings: list[str] = []
+        round_records: list[RoundRecord] = []
+        final_answer = ""
+        stop_reason = "max_rounds_reached"
+        status: RunResult["status"] = "stopped"
+        event_sequence = 0
+
+        def emit_progress(message: str) -> None:
+            nonlocal event_sequence
+            self._emit_progress(progress_callback, message)
+            if event_callback is None:
+                return
+            event_sequence += 1
+            event_callback(build_run_event(sequence=event_sequence, message=message))
+
         if execution_mode == "workspace_write" and not self._settings.allow_writes:
-            warnings.append(
-                "Requested `workspace_write`, but writes are disabled in configuration. Downgrading to `read_only`."
+            task_route = "write_disabled_preflight"
+            stop_reason = "write_disabled_preflight"
+            status = "failed"
+            final_answer = (
+                "Run refused: `workspace_write` was requested, but `TEAMAI_ALLOW_WRITES` is false in local "
+                "configuration. Enable writes first, rerun in `read_only`, or use `bridge-launch --inject-write-env` "
+                "for an explicitly approved bridge run."
             )
-            execution_mode = "read_only"
+            warnings.append(final_answer)
+            emit_progress(
+                f"Starting run in {workspace} "
+                f"(mode={execution_mode}, max_rounds={max_rounds}, max_actions={max_actions})"
+            )
+            emit_progress(f"Task route: {task_route}")
+            emit_progress(f"Failed: {stop_reason}")
+            completed_at = datetime.now(timezone.utc)
+            try:
+                self._memory.persist_run(
+                    workspace=workspace,
+                    task=request.task,
+                    status=status,
+                    stop_reason=stop_reason,
+                    final_answer=final_answer,
+                    warnings=warnings,
+                    completed_at=completed_at,
+                    model_id=self._settings.model_id,
+                    task_route=task_route,
+                    execution_mode=execution_mode,
+                    rounds=round_records,
+                )
+            except Exception as exc:
+                warnings.append(f"Failed to persist workspace memory: {exc}")
+            return RunResult(
+                status=status,
+                model_id=self._settings.model_id,
+                workspace=str(workspace),
+                execution_mode=execution_mode,
+                task_route=task_route,
+                stop_reason=stop_reason,
+                final_answer=final_answer,
+                transcript=self._render_transcript(round_records, request.task, workspace, warnings),
+                rounds=round_records,
+                warnings=warnings,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
 
         task_route = self._classify_task_route(
             task=request.task,
@@ -86,20 +142,6 @@ class ClosedLoopSupervisor:
                     "Requested `workspace_write` for a broad coding task; using `read_only` reconnaissance instead."
                 )
                 execution_mode = "read_only"
-
-        round_records: list[RoundRecord] = []
-        final_answer = ""
-        stop_reason = "max_rounds_reached"
-        status: RunResult["status"] = "stopped"
-        event_sequence = 0
-
-        def emit_progress(message: str) -> None:
-            nonlocal event_sequence
-            self._emit_progress(progress_callback, message)
-            if event_callback is None:
-                return
-            event_sequence += 1
-            event_callback(build_run_event(sequence=event_sequence, message=message))
 
         emit_progress(
             f"Starting run in {workspace} "
@@ -2450,7 +2492,8 @@ class ClosedLoopSupervisor:
         raw_value: str,
     ) -> str | None:
         suffix = Path(target_path).suffix.lower()
-        if target_path.startswith(".env") or suffix == ".env":
+        is_env_style = target_path.startswith(".env") or suffix == ".env"
+        if is_env_style:
             separators = ["="]
         elif suffix in {".yaml", ".yml"}:
             separators = [":"]
@@ -2479,6 +2522,21 @@ class ClosedLoopSupervisor:
                 new_lines = lines[:]
                 new_lines[index] = f"{updated_line}{newline}"
                 return "".join(new_lines)
+
+        if is_env_style:
+            replacement_value = ClosedLoopSupervisor._normalize_assignment_value(
+                raw_value=raw_value,
+                existing_value="",
+                separator="=",
+                target_path=target_path,
+            )
+            appended_line = f"{key}={replacement_value}"
+            existing_lines = {line.strip() for line in file_text.splitlines()}
+            if appended_line in existing_lines:
+                return None
+            separator = "" if not file_text or file_text.endswith("\n") else "\n"
+            updated_text = f"{file_text}{separator}{appended_line}"
+            return updated_text if updated_text.endswith("\n") else f"{updated_text}\n"
         return None
 
     @staticmethod
@@ -2767,9 +2825,38 @@ class ClosedLoopSupervisor:
                 seen_focuses.add(next_focus)
                 next_focuses.append(next_focus.rstrip("."))
 
-        key_paths = self._rank_codex_handoff_paths(task=task, paths=raw_key_paths)
+        if len(raw_key_paths) < 2:
+            fallback_paths = self._rank_codex_handoff_paths(
+                task=task,
+                paths=self._task_relevant_candidates(task, workspace),
+            )
+            for candidate in fallback_paths:
+                if candidate in seen_paths:
+                    continue
+                seen_paths.add(candidate)
+                raw_key_paths.append(candidate)
+                if len(raw_key_paths) >= 8:
+                    break
 
-        if evidence_count < 2 and not (key_paths and next_focuses):
+        key_paths = self._rank_codex_handoff_paths(task=task, paths=raw_key_paths)
+        if len(key_paths) < 2:
+            for candidate in self._rank_codex_handoff_paths(
+                task=task,
+                paths=self._task_relevant_candidates(task, workspace),
+            ):
+                if candidate in key_paths:
+                    continue
+                key_paths.append(candidate)
+                if len(key_paths) >= 4:
+                    break
+        lead_task = None
+        for focus in next_focuses:
+            normalized_focus = self._normalize_codex_handoff_focus(focus, workspace=workspace)
+            if normalized_focus:
+                lead_task = normalized_focus
+                break
+
+        if evidence_count < 2 and not (key_paths or lead_task):
             return None
 
         lines = [
@@ -2777,12 +2864,63 @@ class ClosedLoopSupervisor:
             "",
             "Next engineering tasks:",
         ]
-        if next_focuses:
-            lines.append(f"- {next_focuses[0]}.")
-        if key_paths:
+        if lead_task:
+            lines.append(f"- {self._ensure_sentence(lead_task)}")
+        if key_paths and not self._lead_task_covers_paths(lead_task, key_paths[:2]):
             lines.append(f"- Inspect the most relevant paths first: {', '.join(key_paths[:4])}.")
         lines.append(f"- Implement the requested change in Codex after verifying the scoped plan for: {task}")
         return "\n".join(lines)
+
+    def _normalize_codex_handoff_focus(
+        self,
+        focus: str,
+        *,
+        workspace: Path,
+    ) -> str | None:
+        compact = " ".join(focus.split()).strip().rstrip(".")
+        if not compact:
+            return None
+
+        lowered = compact.lower()
+        normalized_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for candidate in self._extract_candidate_paths(compact):
+            normalized = self._normalize_path_arg(candidate, workspace)
+            resolved = (workspace / normalized).resolve()
+            if not resolved.exists() or normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+            normalized_paths.append(normalized)
+
+        if normalized_paths:
+            if len(normalized_paths) == 1:
+                return f"Inspect {normalized_paths[0]} before implementing the requested change"
+            if len(normalized_paths) == 2:
+                return (
+                    f"Inspect {normalized_paths[0]} and {normalized_paths[1]} "
+                    "before implementing the requested change"
+                )
+            return f"Inspect the most relevant paths first: {', '.join(normalized_paths[:4])}"
+
+        if lowered.startswith(("inspect ", "review ", "read ", "trace ", "verify ", "map ", "compare ", "reproduce ")):
+            return compact
+        if lowered.startswith(("implement ", "fix ", "debug ", "update ")):
+            return compact
+        return None
+
+    @staticmethod
+    def _ensure_sentence(text: str) -> str:
+        stripped = text.strip()
+        if stripped.endswith((".", "!", "?")):
+            return stripped
+        return f"{stripped}."
+
+    @staticmethod
+    def _lead_task_covers_paths(lead_task: str | None, paths: list[str]) -> bool:
+        if not lead_task:
+            return False
+        lowered = lead_task.lower()
+        return all(path.lower() in lowered for path in paths if path)
 
     def _rank_codex_handoff_paths(self, *, task: str, paths: list[str]) -> list[str]:
         task_lower = task.lower()

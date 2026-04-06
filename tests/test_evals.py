@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from teamai.config import Settings
 from teamai.evals import EvalSuite, load_eval_suite, run_eval_suite
@@ -395,6 +396,108 @@ class EvalHarnessTest(unittest.TestCase):
 
         self.assertEqual(report.metrics.passed_cases, 1)
         self.assertEqual(captured_env.get("TEAMAI_ALLOW_WRITES"), "true")
+
+    def test_run_eval_suite_terminal_bridge_uses_full_json_bridge_runs(self) -> None:
+        def subprocess_runner(
+            command: list[str],
+            env: dict[str, str],
+            cwd: Path,
+            timeout_seconds: float | None,
+        ) -> subprocess.CompletedProcess[str]:
+            del env, cwd, timeout_seconds
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "status": "healthy",
+                        "reason": "mlx_generate_ok",
+                        "summary": "MLX model warmup generation succeeded.",
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "probe_mode": "generate",
+                        "python_executable": "/tmp/fake-python",
+                        "model_id": self.settings.model_id,
+                        "model_revision": self.settings.model_revision,
+                        "warnings": [],
+                        "details": {"default_device": "Device(gpu, 0)"},
+                    }
+                ),
+                stderr="",
+            )
+
+        captured: dict[str, object] = {}
+
+        def fake_launch_bridge(config, dry_run: bool = False):  # type: ignore[no-untyped-def]
+            captured["config"] = config
+            captured["dry_run"] = dry_run
+            result = _build_result(
+                workspace=self.workspace,
+                task_route="codex_handoff",
+                stop_reason="codex_handoff_synthesized",
+                final_answer="Inspect teamai/cli.py and teamai/api.py.",
+            )
+            output_file = config.output_file or config.artifacts.handoff_file
+            output_file.write_text(json.dumps(result.model_dump(mode="json"), indent=2), encoding="utf-8")
+            config.artifacts.status_file.write_text(
+                json.dumps(
+                    {
+                        "state": "completed",
+                        "output_file": str(output_file),
+                        "handoff_file": str(config.artifacts.handoff_file),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {"state": "launched"}
+
+        def fake_load_bridge_status(artifacts):  # type: ignore[no-untyped-def]
+            return {
+                "state": "completed",
+                "output_file": str(artifacts.handoff_file),
+                "handoff_file": str(artifacts.handoff_file),
+            }
+
+        suite = EvalSuite.model_validate(
+            {
+                "name": "terminal-bridge",
+                "cases": [
+                    {
+                        "case_id": "broad",
+                        "task": "Improve streaming event output across the CLI and API.",
+                        "expectations": {
+                            "allowed_task_routes": ["codex_handoff"],
+                            "handoff": True,
+                            "handoff_completed": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        with patch("teamai.evals.launch_bridge", side_effect=fake_launch_bridge), patch(
+            "teamai.evals.load_bridge_status",
+            side_effect=fake_load_bridge_status,
+        ):
+            report = run_eval_suite(
+                settings=self.settings,
+                suite=suite,
+                runner_mode="terminal_bridge",
+                per_case_timeout_seconds=30,
+                project_root=self.workspace,
+                python_executable=Path("/tmp/fake-python"),
+                subprocess_runner=subprocess_runner,
+            )
+
+        self.assertEqual(report.metrics.total_cases, 1)
+        self.assertEqual(report.metrics.passed_cases, 1)
+        self.assertEqual(report.runtime_health.status, "healthy")
+        self.assertEqual(report.cases[0].runner_mode, "terminal_bridge")
+        self.assertEqual(report.cases[0].memory_profile, "light_recon")
+        self.assertEqual(report.cases[0].failure_classification, "passed")
+        config = captured["config"]
+        self.assertEqual(config.output_format, "full_json")
+        self.assertEqual(config.output_file, config.artifacts.handoff_file)
+        self.assertFalse(captured["dry_run"])
 
     def test_run_eval_suite_classifies_model_backend_errors_as_infra_runtime_failures(self) -> None:
         def runner(request: RunRequest, settings: Settings) -> RunResult:

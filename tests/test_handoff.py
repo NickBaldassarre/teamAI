@@ -342,6 +342,38 @@ class HandoffPacketTest(unittest.TestCase):
         self.assertEqual(packet.key_paths[:2], ["teamai/memory.py", "tests/test_memory.py"])
         self.assertNotIn(".", packet.key_paths)
 
+    def test_build_handoff_packet_selects_best_primary_task_not_just_first_bullet(self) -> None:
+        result = RunResult(
+            status="completed",
+            model_id="dummy-model",
+            workspace="/tmp/demo-workspace",
+            execution_mode="read_only",
+            task_route="codex_handoff",
+            stop_reason="codex_handoff_synthesized",
+            final_answer=(
+                "Current state: The local run gathered reconnaissance.\n\n"
+                "Next engineering tasks:\n"
+                "- Inspect the most relevant paths first: teamai/cli.py, teamai/api.py.\n"
+                "- Inspect teamai/api.py before implementing streaming output.\n"
+                "- Implement the requested change in Codex after verifying the scoped plan for: Improve streaming output.\n"
+            ),
+            transcript="demo transcript",
+            rounds=[],
+            warnings=[],
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        packet = build_handoff_packet(
+            task="Improve streaming output across the CLI and API.",
+            result=result,
+        )
+
+        self.assertEqual(
+            packet.primary_task,
+            "Inspect teamai/api.py before implementing streaming output.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1151,14 +1151,11 @@ class ClosedLoopSupervisor:
     ) -> ToolAction | None:
         successful = self._successful_action_signatures(previous_rounds, workspace)
         for candidate in [
+            "README.md",
             "teamai/config.py",
             "teamai/supervisor.py",
             "teamai/cli.py",
-            "README.md",
-            "pyproject.toml",
-            "PROJECT_MEMORY.md",
             "teamai",
-            "tests/test_supervisor.py",
         ]:
             action = self._candidate_to_action(candidate, task, workspace)
             if action is None:
@@ -1673,12 +1670,10 @@ class ClosedLoopSupervisor:
 
         if task_route == "repository_inspection":
             add("README.md")
-            if config_read:
-                for candidate in ["teamai/cli.py", "teamai/supervisor.py", "teamai/api.py"]:
-                    add(candidate)
+            add("teamai/config.py")
+            add("teamai/supervisor.py")
+            add("teamai/cli.py")
             add("teamai")
-            for candidate in ["pyproject.toml", "PROJECT_MEMORY.md", "setup.py"]:
-                add(candidate)
         else:
             for candidate in ["README.md", "pyproject.toml", "setup.py", "PROJECT_MEMORY.md"]:
                 add(candidate)
@@ -1722,7 +1717,7 @@ class ClosedLoopSupervisor:
             return False
         if len(rounds) < 2:
             return False
-        return len(rounds) >= max(2, max_rounds - 1)
+        return True
 
     def _task_relevant_candidates(self, task: str, workspace: Path) -> list[str]:
         text = task.lower()
@@ -1770,13 +1765,14 @@ class ClosedLoopSupervisor:
             ]:
                 add(candidate)
 
-        if any(marker in text for marker in ["approval", "patch", "write path", "coarse write", "workspace_write"]):
+        if any(marker in text for marker in ["approval", "patch", "write path", "coarse write", "workspace_write", "deterministic"]):
             for candidate in [
                 "teamai/tools.py",
                 "teamai/approvals.py",
                 "teamai/supervisor.py",
                 "tests/test_tools.py",
                 "tests/test_approvals.py",
+                "tests/test_supervisor.py",
             ]:
                 add(candidate)
 
@@ -2665,39 +2661,11 @@ class ClosedLoopSupervisor:
         successful = self._successful_action_signatures(rounds, workspace)
         has_readme = "read_file:README.md" in successful
         has_package_listing = "list_files:teamai" in successful
-        doc_reads = [
-            signature
-            for signature in successful
-            if signature
-            in {
-                "read_file:README.md",
-                "read_file:pyproject.toml",
-                "read_file:PROJECT_MEMORY.md",
-                "read_file:setup.py",
-            }
-        ]
-        core_reads = [
-            signature
-            for signature in successful
-            if signature
-            in {
-                "read_file:teamai/config.py",
-                "read_file:teamai/cli.py",
-                "read_file:teamai/supervisor.py",
-                "read_file:teamai/model_backend.py",
-                "read_file:teamai/tools.py",
-                "read_file:teamai/api.py",
-            }
-        ]
-        has_runtime_anchor = bool({"read_file:teamai/cli.py", "read_file:teamai/supervisor.py"} & set(core_reads))
-        strict_ready = has_readme and has_package_listing and len(core_reads) >= 3 and has_runtime_anchor
-        partial_ready = has_readme and (
-            (
-                len(doc_reads) + len(core_reads) >= 3
-                and (has_runtime_anchor or len(core_reads) >= 1)
-            )
-            or (has_package_listing and len(core_reads) >= 1)
-        )
+        has_config = "read_file:teamai/config.py" in successful
+        has_runtime_anchor = "read_file:teamai/cli.py" in successful or "read_file:teamai/supervisor.py" in successful
+
+        strict_ready = has_readme and has_package_listing and has_config and has_runtime_anchor
+        partial_ready = has_readme and has_runtime_anchor and (has_package_listing or has_config)
         if not strict_ready:
             if not allow_partial or not partial_ready:
                 return None
@@ -2946,6 +2914,13 @@ class ClosedLoopSupervisor:
     def _score_handoff_path(*, task_lower: str, path: str) -> int:
         path_lower = path.lower()
         score = 0
+        if any(marker in task_lower for marker in ["inspect", "explore", "identify", "next tasks", "broad"]):
+            if path_lower == "readme.md":
+                score += 10
+            elif path_lower == "teamai/config.py":
+                score += 8
+            elif path_lower == "project_memory.md":
+                score += 6
         if any(marker in task_lower for marker in ["bridge", "handoff", "terminal"]) and any(
             marker in path_lower for marker in ["bridge.py", "handoff.py", "test_bridge.py", "test_handoff.py"]
         ):
@@ -2982,8 +2957,8 @@ class ClosedLoopSupervisor:
             marker in path_lower for marker in ["cli.py", "api.py", "jobs.py", "schemas.py", "supervisor.py"]
         ):
             score += 6
-        if any(marker in task_lower for marker in ["approval", "patch", "write path", "workspace_write"]) and any(
-            marker in path_lower for marker in ["tools.py", "approvals.py", "supervisor.py", "test_tools.py", "test_approvals.py"]
+        if any(marker in task_lower for marker in ["approval", "patch", "write path", "workspace_write", "deterministic"]) and any(
+            marker in path_lower for marker in ["tools.py", "approvals.py", "supervisor.py", "test_tools.py", "test_approvals.py", "test_supervisor.py"]
         ):
             score += 6
         if any(marker in task_lower for marker in ["json", "planner", "verifier", "prompt", "structured output"]) and any(

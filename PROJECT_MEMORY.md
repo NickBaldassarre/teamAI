@@ -26,7 +26,7 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
 
 ## Direction
 - Prefer local models over hosted APIs to minimize ongoing token spend.
-- Current default model target: `mlx-community/gemma-4-e4b-it-4bit`
+- Current default model target and standard local scout: `mlx-community/gemma-4-2b-it-4bit`
 - Current architecture:
   - MLX model backend via `mlx-vlm`
   - local strategist / critic / coder-planner / verifier loop
@@ -80,9 +80,6 @@ Vision preserved for when we have a purpose-built machine (Mac mini / Mac Studio
     - repository inspection timing out under the inspection profile
 
 ## Current Build Targets
-- Re-baseline the live smoke workflow around `teamai doctor` plus the new `terminal_bridge` eval mode.
-- Reduce inspection timeout and drift for repo-inspection tasks.
-- Improve inspection/recon retrieval, ranking, and early-stop behavior.
 - Further harden structured output reliability and convergence on local planning turns.
 - Continue expanding deterministic compiler coverage for explicit narrow coding chores.
 - Use eval feedback to keep improving local-model routing and usefulness over time.

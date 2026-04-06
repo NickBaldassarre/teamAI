@@ -6,7 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-DEFAULT_MODEL_ID = "mlx-community/gemma-4-e4b-it-4bit"
+DEFAULT_MODEL_ID = "mlx-community/gemma-4-2b-it-4bit"
 DEFAULT_MAX_ROUNDS = 4
 DEFAULT_MAX_ACTIONS_PER_ROUND = 3
 DEFAULT_MAX_TOKENS_PER_TURN = 320

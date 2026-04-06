@@ -256,7 +256,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         )
 
         self.assertEqual(planner.actions[0].tool, "read_file")
-        self.assertEqual(planner.actions[0].args["path"], "teamai/cli.py")
+        self.assertEqual(planner.actions[0].args["path"], "teamai/supervisor.py")
         self.assertTrue(any("invalid action target" in warning.lower() for warning in warnings))
 
     def test_missing_required_search_pattern_falls_back_to_real_action(self) -> None:
@@ -314,8 +314,10 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
             warnings=warnings,
         )
 
-        self.assertEqual(planner.actions[0].tool, "list_files")
-        self.assertEqual(planner.actions[0].args["path"], "teamai")
+        self.assertEqual(planner.actions[0].tool, "read_file")
+        self.assertEqual(planner.actions[0].args["path"], "teamai/config.py")
+        self.assertEqual(planner.actions[1].tool, "list_files")
+        self.assertEqual(planner.actions[1].args["path"], "teamai")
         self.assertTrue(any("incompatible action target" in warning.lower() for warning in warnings))
 
     def test_repository_inspection_plan_batches_additional_reads(self) -> None:
@@ -346,12 +348,12 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         )
 
         signatures = [(action.tool, action.args.get("path")) for action in planner.actions]
-        self.assertIn(("list_files", "."), signatures)
+        self.assertEqual(signatures[0], ("list_files", "."))
         self.assertIn(("read_file", "README.md"), signatures)
-        self.assertIn(("list_files", "teamai"), signatures)
+        self.assertIn(("read_file", "teamai/config.py"), signatures)
         self.assertTrue(any("expanded plan" in warning.lower() for warning in warnings))
 
-    def test_repository_inspection_plan_prioritizes_runtime_anchor_after_planned_config_read(self) -> None:
+    def test_repository_inspection_plan_prioritizes_package_listing_after_planned_config_read(self) -> None:
         (self.workspace / "README.md").write_text("# teamAI\n", encoding="utf-8")
         (self.workspace / "pyproject.toml").write_text('[project]\nname = "teamai"\n', encoding="utf-8")
         (self.workspace / "teamai").mkdir()
@@ -415,12 +417,8 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         signatures = [(action.tool, action.args.get("path")) for action in planner.actions]
         self.assertIn(("read_file", "teamai/config.py"), signatures)
         self.assertNotIn(("read_file", "pyproject.toml"), signatures)
-        runtime_anchor_paths = {
-            path
-            for tool, path in signatures
-            if tool == "read_file" and path in {"teamai/cli.py", "teamai/supervisor.py", "teamai/api.py"}
-        }
-        self.assertTrue(runtime_anchor_paths)
+        
+        self.assertIn(("read_file", "teamai/supervisor.py"), signatures)
 
     def test_repository_inspection_run_auto_completes_after_core_reads(self) -> None:
         (self.workspace / "README.md").write_text(

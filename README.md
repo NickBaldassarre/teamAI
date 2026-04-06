@@ -20,7 +20,7 @@ The implementation is tuned for:
 
 - `teamai/model_backend.py`
   - lazy MLX model loading through `mlx-vlm`
-  - default local model: `mlx-community/gemma-4-e4b-it-4bit`
+  - default local model: `mlx-community/gemma-4-2b-it-4bit`
 - `teamai/supervisor.py`
   - multi-turn loop with four local personas:
     - Strategist
@@ -39,13 +39,13 @@ The implementation is tuned for:
 - `teamai/cli.py`
   - local CLI for direct runs or serving the API
 
-## Why MLX + Gemma 4 E4B
+## Why MLX + Gemma 4 2B
 
-For an M1 Pro MacBook Pro with 16GB unified memory, the most realistic Gemma 4 target is the smaller E4B instruction-tuned model in MLX format.
+For an M1 Pro MacBook Pro with 16GB unified memory, the standard local scout is the Gemma 4 2B instruction-tuned model in MLX format.
 
 Default:
 
-- `mlx-community/gemma-4-e4b-it-4bit`
+- `mlx-community/gemma-4-2b-it-4bit`
 
 This keeps the project local-first while staying within the rough memory envelope of a 16GB machine.
 
@@ -371,14 +371,13 @@ Every eval run now also writes a lightweight eval-feedback record into `.teamai/
 
 When you use the default isolated eval runner, the suite now also runs a shared runtime doctor preflight before scoring the cases. By default that probe attempts a tiny model warmup generation instead of only checking imports. If the local runtime is unavailable, the report marks those cases as `infra_runtime` instead of treating them like clean agent-behavior regressions.
 
-For the most realistic live Gemma smoke test on macOS, you can also run each eval case through the Terminal bridge:
+For the most realistic live Gemma smoke test on macOS, use the tracked `run-smoke.sh` workflow. It pins the standard local scout model, runs a `doctor` preflight probe, and then executes the eval suite through the `terminal_bridge` runner:
 
 ```bash
-./.venv/bin/python -m teamai eval --suite-file evals/teamai_smoke.json \
-  --allow-write-cases \
-  --runner-mode terminal_bridge \
-  --output-format summary_markdown
+./run-smoke.sh
 ```
+
+That script launches each case through the same bridge path used for real local handoff runs, asserts that the local MLX runtime is healthy before starting, and writes the authoritative JSON report to `.teamai/evals/live-smoke-report.json`.
 
 That mode launches each case through the same bridge path used for real local handoff runs and treats the Terminal-side result artifact as the source of truth.
 

@@ -261,6 +261,9 @@ class ClosedLoopSupervisor:
                     )
                 )
 
+                if task_route == "repository_inspection":
+                    self._log_inspection_telemetry(round_records[-1])
+
                 if (
                     execution_mode == "workspace_write"
                     and self._is_explicit_write_task(request.task)
@@ -2832,3 +2835,31 @@ class ClosedLoopSupervisor:
         if ": " in candidate:
             return False
         return True
+    def _log_inspection_telemetry(self, record: RoundRecord) -> None:
+        log_dir = Path("LOGS")
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / "telemetry.jsonl"
+
+        tools_used = [res.tool for res in record.tool_results]
+        total = len(tools_used)
+        if total == 0:
+            mix = {"search_text": 0.0, "read_file": 0.0, "list_files": 0.0}
+        else:
+            mix = {
+                "search_text": round(tools_used.count("search_text") / total * 100, 1),
+                "read_file": round(tools_used.count("read_file") / total * 100, 1),
+                "list_files": round(tools_used.count("list_files") / total * 100, 1),
+            }
+
+        unique_files = len({res.metadata.get("path") for res in record.tool_results if "path" in res.metadata})
+
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "round": record.round_number,
+            "tool_mix": mix,
+            "unique_files_touched": unique_files,
+            "synthesis_confidence": getattr(record.verifier, "confidence", 0.0),
+        }
+
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")

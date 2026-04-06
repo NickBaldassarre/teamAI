@@ -112,6 +112,31 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertEqual(payload["core_dependencies"], ["teamai/cli.py", "teamai/api.py"])
             self.assertIn("semantic skeleton", stderr.getvalue().lower())
 
+    def test_execute_handoff_command_prints_patch_review_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            patch_path = project_root / ".teamai" / "codex_solution.patch"
+
+            class _Result:
+                model = "gpt-5.4"
+                patch_file = patch_path
+
+            stdout = io.StringIO()
+            with patch(
+                "teamai.integrations.codex_bridge.execute_codex_handoff",
+                return_value=_Result(),
+            ), patch(
+                "sys.argv",
+                ["teamai", "execute-handoff", "--patch-file", str(patch_path)],
+            ), redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                stdout.getvalue().strip(),
+                f"Generated Codex patch at {patch_path} using model gpt-5.4. Review the patch before applying it.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

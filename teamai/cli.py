@@ -179,6 +179,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to also write the rendered doctor report.",
     )
 
+    execute_handoff_parser = subparsers.add_parser(
+        "execute-handoff",
+        help="Send the local semantic skeleton to the cloud Codex model and save the returned patch for review.",
+    )
+    execute_handoff_parser.add_argument(
+        "--payload-file",
+        default=".teamai/codex_payload.json",
+        help="Path to the local semantic skeleton payload JSON.",
+    )
+    execute_handoff_parser.add_argument(
+        "--patch-file",
+        default=".teamai/codex_solution.patch",
+        help="Path where the returned patch should be written.",
+    )
+    execute_handoff_parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional cloud model override. Defaults to TEAMAI_CODEX_MODEL or gpt-5.4.",
+    )
+
     approvals_parser = subparsers.add_parser(
         "approvals",
         help="List, inspect, apply, reject, or prune patch approvals.",
@@ -417,6 +437,27 @@ def main() -> int:
         print(rendered_output)
         return 0 if report.probe.status == "healthy" else 1
 
+    if args.command == "execute-handoff":
+        from .integrations.codex_bridge import execute_codex_handoff
+
+        project_root = Path.cwd().resolve()
+        try:
+            result = execute_codex_handoff(
+                project_root=project_root,
+                payload_file=args.payload_file,
+                patch_file=args.patch_file,
+                model=args.model,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, indent=2))
+            return 1
+
+        print(
+            f"Generated Codex patch at {result.patch_file} using model {result.model}. "
+            "Review the patch before applying it."
+        )
+        return 0
+
     if args.command == "approvals":
         from .approvals import PatchApprovalStore
         from .config import ConfigError, Settings
@@ -546,7 +587,6 @@ def _write_codex_payload_artifact(result: RunResult) -> Path | None:
     rendered = json.dumps(result.codex_payload.model_dump(mode="json"), indent=2)
     payload_path.write_text(rendered + "\n", encoding="utf-8")
     return payload_path
-    print(f"[teamai] Wrote output to {output_path}", file=sys.stderr, flush=True)
 
 
 def _build_run_stream_handlers(

@@ -194,6 +194,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path where the returned patch should be written.",
     )
     execute_handoff_parser.add_argument(
+        "--engine",
+        choices=["codex", "gemini"],
+        default="codex",
+        help="Which cloud execution engine to use for the handoff.",
+    )
+    execute_handoff_parser.add_argument(
         "--model",
         default=None,
         help="Optional cloud model override. Defaults to TEAMAI_CODEX_MODEL or gpt-5.4.",
@@ -438,25 +444,46 @@ def main() -> int:
         return 0 if report.probe.status == "healthy" else 1
 
     if args.command == "execute-handoff":
-        from .integrations.codex_bridge import execute_verified_codex_handoff
+        from .verification import Sandbox, verify_patch
 
         project_root = Path.cwd().resolve()
-        try:
-            result = execute_verified_codex_handoff(
-                project_root=project_root,
-                payload_file=args.payload_file,
-                patch_file=args.patch_file,
-                model=args.model,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            print(json.dumps({"error": str(exc)}, indent=2))
-            return 1
+        
+        if args.engine == "gemini":
+            from .integrations.gemini_bridge import execute_gemini_handoff
+            try:
+                execute_gemini_handoff(
+                    project_root=project_root,
+                    payload_file=args.payload_file,
+                    patch_file=args.patch_file,
+                    model=args.model or "gemini-2.5-pro",
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(json.dumps({"error": str(exc)}, indent=2))
+                return 1
+        else:
+            from .integrations.codex_bridge import execute_codex_handoff
+            try:
+                execute_codex_handoff(
+                    project_root=project_root,
+                    payload_file=args.payload_file,
+                    patch_file=args.patch_file,
+                    model=args.model or "gpt-5.4",
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(json.dumps({"error": str(exc)}, indent=2))
+                return 1
 
-        if result.verification.success:
+        with Sandbox(project_root) as sandbox:
+            verification_result = verify_patch(Path(args.patch_file), sandbox)
+
+        if verification_result.success:
             print("Patch verified successfully in sandbox. Ready for human review.")
             return 0
 
         print("Sandbox verification failed.")
+        log_path = project_root / ".teamai" / "failure_context.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(verification_result.log_output, encoding="utf-8")
         return 1
 
     if args.command == "approvals":

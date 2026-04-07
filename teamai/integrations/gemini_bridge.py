@@ -4,8 +4,13 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-def execute_gemini_handoff(payload_path: Path, patch_path: Path, model_name: str = "gemini-2.5-pro", **kwargs):
+def execute_gemini_handoff(payload_file=None, patch_file=None, **kwargs):
     """Reads the local scout's payload, fires it to Gemini, and writes the resulting patch."""
+    # Flexibly handle whatever variable names the CLI used
+    payload_path = Path(kwargs.get("payload_path") or payload_file)
+    patch_path = Path(kwargs.get("patch_path") or patch_file)
+    model_name = kwargs.get("model") or kwargs.get("model_name") or "gemini-2.5-pro"
+
     if not os.environ.get("GEMINI_API_KEY"):
         print('{"error": "GEMINI_API_KEY is not set. Export it before running."}')
         return

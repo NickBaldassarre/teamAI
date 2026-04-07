@@ -44,9 +44,11 @@ def execute_codex_handoff(
             {"role": "user", "content": prompt},
         ],
     )
-raw_text = _extract_response_text(response)
+
+    raw_text = _extract_response_text(response)
     print(f"\n--- RAW CLOUD RESPONSE ---\n{raw_text}\n--------------------------\n")
     patch_text = _sanitize_patch_output(raw_text)
+    
     patch_path.parent.mkdir(parents=True, exist_ok=True)
     patch_path.write_text(patch_text + ("\n" if not patch_text.endswith("\n") else ""), encoding="utf-8")
 

@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     execute_handoff_parser = subparsers.add_parser(
         "execute-handoff",
-        help="Send the local semantic skeleton to the cloud Codex model and save the returned patch for review.",
+        help="Send the local semantic skeleton to the cloud Codex model, verify the returned patch in a sandbox, and save the patch for review.",
     )
     execute_handoff_parser.add_argument(
         "--payload-file",
@@ -438,11 +438,11 @@ def main() -> int:
         return 0 if report.probe.status == "healthy" else 1
 
     if args.command == "execute-handoff":
-        from .integrations.codex_bridge import execute_codex_handoff
+        from .integrations.codex_bridge import execute_verified_codex_handoff
 
         project_root = Path.cwd().resolve()
         try:
-            result = execute_codex_handoff(
+            result = execute_verified_codex_handoff(
                 project_root=project_root,
                 payload_file=args.payload_file,
                 patch_file=args.patch_file,
@@ -452,11 +452,12 @@ def main() -> int:
             print(json.dumps({"error": str(exc)}, indent=2))
             return 1
 
-        print(
-            f"Generated Codex patch at {result.patch_file} using model {result.model}. "
-            "Review the patch before applying it."
-        )
-        return 0
+        if result.verification.success:
+            print("Patch verified successfully in sandbox. Ready for human review.")
+            return 0
+
+        print("Sandbox verification failed.")
+        return 1
 
     if args.command == "approvals":
         from .approvals import PatchApprovalStore

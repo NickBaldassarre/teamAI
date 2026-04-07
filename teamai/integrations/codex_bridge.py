@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import Any
 
 from ..codex_prompts import build_codex_handoff_prompt
+from ..sandbox import Sandbox
 from ..schemas import CodexHandoffPayload
+from ..verification import VerificationResult, verify_patch
 
 
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_PAYLOAD_FILE = ".teamai/codex_payload.json"
 DEFAULT_CODEX_PATCH_FILE = ".teamai/codex_solution.patch"
+DEFAULT_CODEX_FAILURE_CONTEXT_FILE = ".teamai/failure_context.log"
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,13 @@ class CodexHandoffExecutionResult:
     patch_file: Path
     prompt: str
     patch_text: str
+
+
+@dataclass(frozen=True)
+class VerifiedCodexHandoffExecutionResult:
+    execution: CodexHandoffExecutionResult
+    verification: VerificationResult
+    failure_context_file: Path
 
 
 def execute_codex_handoff(
@@ -46,11 +56,10 @@ def execute_codex_handoff(
     )
 
     raw_text = _extract_response_text(response)
-    print(f"\n--- RAW CLOUD RESPONSE ---\n{raw_text}\n--------------------------\n")
     patch_text = _sanitize_patch_output(raw_text)
-    
+
     patch_path.parent.mkdir(parents=True, exist_ok=True)
-    patch_path.write_text(patch_text + ("\n" if not patch_text.endswith("\n") else ""), encoding="utf-8")
+    patch_path.write_text(_ensure_trailing_newline(patch_text), encoding="utf-8")
 
     return CodexHandoffExecutionResult(
         model=model_name,
@@ -58,6 +67,40 @@ def execute_codex_handoff(
         patch_file=patch_path,
         prompt=prompt,
         patch_text=patch_text,
+    )
+
+
+def execute_verified_codex_handoff(
+    *,
+    project_root: Path,
+    payload_file: str | Path = DEFAULT_CODEX_PAYLOAD_FILE,
+    patch_file: str | Path = DEFAULT_CODEX_PATCH_FILE,
+    failure_context_file: str | Path = DEFAULT_CODEX_FAILURE_CONTEXT_FILE,
+    model: str | None = None,
+) -> VerifiedCodexHandoffExecutionResult:
+    project_root = project_root.resolve()
+    execution = execute_codex_handoff(
+        project_root=project_root,
+        payload_file=payload_file,
+        patch_file=patch_file,
+        model=model,
+    )
+    failure_context_path = _resolve_project_path(project_root, failure_context_file)
+
+    with Sandbox(project_root) as sandbox:
+        verification = verify_patch(execution.patch_file, sandbox)
+
+    if verification.success:
+        if failure_context_path.exists():
+            failure_context_path.unlink()
+    else:
+        failure_context_path.parent.mkdir(parents=True, exist_ok=True)
+        failure_context_path.write_text(_ensure_trailing_newline(verification.log_output), encoding="utf-8")
+
+    return VerifiedCodexHandoffExecutionResult(
+        execution=execution,
+        verification=verification,
+        failure_context_file=failure_context_path,
     )
 
 
@@ -116,3 +159,7 @@ def _sanitize_patch_output(text: str) -> str:
     if not any(marker in stripped for marker in ("diff --git", "--- ", "+++ ")):
         raise RuntimeError("Codex response did not look like a unified diff patch.")
     return stripped
+
+
+def _ensure_trailing_newline(text: str) -> str:
+    return text if text.endswith("\n") else f"{text}\n"

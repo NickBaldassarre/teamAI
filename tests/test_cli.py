@@ -8,6 +8,7 @@ from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from teamai.cli import _build_run_stream_handlers, main
@@ -112,30 +113,36 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertEqual(payload["core_dependencies"], ["teamai/cli.py", "teamai/api.py"])
             self.assertIn("semantic skeleton", stderr.getvalue().lower())
 
-    def test_execute_handoff_command_prints_patch_review_message(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            patch_path = project_root / ".teamai" / "codex_solution.patch"
+    def test_execute_handoff_command_reports_verified_patch(self) -> None:
+        stdout = io.StringIO()
+        with patch(
+            "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
+            return_value=SimpleNamespace(verification=SimpleNamespace(success=True)),
+        ), patch(
+            "sys.argv",
+            ["teamai", "execute-handoff"],
+        ), redirect_stdout(stdout):
+            exit_code = main()
 
-            class _Result:
-                model = "gpt-5.4"
-                patch_file = patch_path
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            stdout.getvalue().strip(),
+            "Patch verified successfully in sandbox. Ready for human review.",
+        )
 
-            stdout = io.StringIO()
-            with patch(
-                "teamai.integrations.codex_bridge.execute_codex_handoff",
-                return_value=_Result(),
-            ), patch(
-                "sys.argv",
-                ["teamai", "execute-handoff", "--patch-file", str(patch_path)],
-            ), redirect_stdout(stdout):
-                exit_code = main()
+    def test_execute_handoff_command_reports_failed_verification(self) -> None:
+        stdout = io.StringIO()
+        with patch(
+            "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
+            return_value=SimpleNamespace(verification=SimpleNamespace(success=False)),
+        ), patch(
+            "sys.argv",
+            ["teamai", "execute-handoff"],
+        ), redirect_stdout(stdout):
+            exit_code = main()
 
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(
-                stdout.getvalue().strip(),
-                f"Generated Codex patch at {patch_path} using model gpt-5.4. Review the patch before applying it.",
-            )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue().strip(), "Sandbox verification failed.")
 
 
 if __name__ == "__main__":

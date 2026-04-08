@@ -113,6 +113,35 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertEqual(Path(captured["command"][0]).resolve(), selected_python.resolve())
         self.assertEqual(Path(captured["cwd"]).resolve(), self.project_root.resolve())
 
+    def test_run_runtime_doctor_classifies_runtime_probe_crashes_as_unavailable(self) -> None:
+        selected_python = self.project_root / ".venv" / "bin" / "python"
+        selected_python.parent.mkdir(parents=True, exist_ok=True)
+        selected_python.write_text("", encoding="utf-8")
+
+        def subprocess_runner(
+            command: list[str],
+            env: dict[str, str],
+            cwd: Path,
+            timeout_seconds: float | None,
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                command,
+                134,
+                stdout="",
+                stderr="libc++abi: terminating due to uncaught exception of type NSException",
+            )
+
+        report = run_runtime_doctor(
+            settings=self.settings,
+            project_root=self.project_root,
+            current_python=Path("/usr/bin/python3"),
+            subprocess_runner=subprocess_runner,
+        )
+
+        self.assertEqual(report.probe.status, "unavailable")
+        self.assertEqual(report.probe.reason, "runtime_probe_subprocess_crash")
+        self.assertIn("Terminal bridge", report.probe.summary)
+
 
 if __name__ == "__main__":
     unittest.main()

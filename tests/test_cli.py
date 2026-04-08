@@ -114,35 +114,91 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertIn("semantic skeleton", stderr.getvalue().lower())
 
     def test_execute_handoff_command_reports_verified_patch(self) -> None:
-        stdout = io.StringIO()
-        with patch(
-            "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
-            return_value=SimpleNamespace(verification=SimpleNamespace(success=True)),
-        ), patch(
-            "sys.argv",
-            ["teamai", "execute-handoff"],
-        ), redirect_stdout(stdout):
-            exit_code = main()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            failure_log = project_root / ".teamai" / "failure_context.log"
+            failure_log.parent.mkdir(parents=True, exist_ok=True)
+            failure_log.write_text("stale failure log\n", encoding="utf-8")
 
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            stdout.getvalue().strip(),
-            "Patch verified successfully in sandbox. Ready for human review.",
-        )
+            stdout = io.StringIO()
+            with patch(
+                "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
+                return_value=SimpleNamespace(
+                    execution=SimpleNamespace(
+                        model="gpt-5.4",
+                        payload_file=project_root / ".teamai" / "codex_payload.json",
+                        patch_file=project_root / ".teamai" / "codex_solution.patch",
+                        patch_text=(
+                            "diff --git a/demo.txt b/demo.txt\n"
+                            "--- a/demo.txt\n"
+                            "+++ b/demo.txt\n"
+                            "@@ -0,0 +1 @@\n"
+                            "+patched\n"
+                        ),
+                    ),
+                    verification=SimpleNamespace(success=True, patch_returncode=0, test_returncode=0),
+                    failure_context_file=failure_log,
+                ),
+            ), patch("sys.argv", ["teamai", "execute-handoff"]), patch("pathlib.Path.cwd", return_value=project_root), redirect_stdout(stdout):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue().strip()
+            self.assertIn("Handoff execution summary", rendered)
+            self.assertIn("- Engine: codex", rendered)
+            self.assertIn("- Model: gpt-5.4", rendered)
+            self.assertIn(f"- Payload: {project_root / '.teamai' / 'codex_payload.json'}", rendered)
+            self.assertIn(f"- Patch: {project_root / '.teamai' / 'codex_solution.patch'}", rendered)
+            self.assertIn("- Patch files: 1", rendered)
+            self.assertIn("- Patch lines: 5", rendered)
+            self.assertIn("- Sandbox verification: passed", rendered)
+            self.assertIn("- Verification detail: patch applied and sandbox tests passed", rendered)
+            self.assertIn("- Test exit code: 0", rendered)
+            self.assertIn("Ready for human review", rendered)
+            self.assertFalse(failure_log.exists())
 
     def test_execute_handoff_command_reports_failed_verification(self) -> None:
-        stdout = io.StringIO()
-        with patch(
-            "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
-            return_value=SimpleNamespace(verification=SimpleNamespace(success=False)),
-        ), patch(
-            "sys.argv",
-            ["teamai", "execute-handoff"],
-        ), redirect_stdout(stdout):
-            exit_code = main()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            failure_log = project_root / ".teamai" / "failure_context.log"
+            stdout = io.StringIO()
+            with patch(
+                "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
+                return_value=SimpleNamespace(
+                    execution=SimpleNamespace(
+                        model="gpt-5.4",
+                        payload_file=project_root / ".teamai" / "codex_payload.json",
+                        patch_file=project_root / ".teamai" / "codex_solution.patch",
+                        patch_text=(
+                            "diff --git a/demo.txt b/demo.txt\n"
+                            "--- a/demo.txt\n"
+                            "+++ b/demo.txt\n"
+                            "@@ -0,0 +1 @@\n"
+                            "+patched\n"
+                        ),
+                    ),
+                    verification=SimpleNamespace(
+                        success=False,
+                        patch_returncode=0,
+                        test_returncode=1,
+                        log_output="tests failed\n",
+                    ),
+                    failure_context_file=failure_log,
+                ),
+            ), patch("sys.argv", ["teamai", "execute-handoff"]), patch("pathlib.Path.cwd", return_value=project_root), redirect_stdout(stdout):
+                exit_code = main()
 
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(stdout.getvalue().strip(), "Sandbox verification failed.")
+            self.assertEqual(exit_code, 1)
+            rendered = stdout.getvalue().strip()
+            self.assertIn("Handoff execution summary", rendered)
+            self.assertIn("- Patch files: 1", rendered)
+            self.assertIn("- Sandbox verification: failed", rendered)
+            self.assertIn("- Verification detail: patch applied, but sandbox tests failed", rendered)
+            self.assertIn("- Test exit code: 1", rendered)
+            self.assertIn(f"- Failure log: {failure_log}", rendered)
+            self.assertIn("sandbox test failures before retrying", rendered)
+            self.assertTrue(failure_log.exists())
+            self.assertEqual(failure_log.read_text(encoding="utf-8"), "tests failed\n")
 
 
 if __name__ == "__main__":

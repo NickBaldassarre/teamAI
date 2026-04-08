@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -447,11 +448,14 @@ def main() -> int:
         from .verification import Sandbox, verify_patch
 
         project_root = Path.cwd().resolve()
-        
+        payload_path = _resolve_cli_path(project_root, args.payload_file)
+        patch_path = _resolve_cli_path(project_root, args.patch_file)
+        failure_context_path = project_root / ".teamai" / "failure_context.log"
+
         if args.engine == "gemini":
             from .integrations.gemini_bridge import execute_gemini_handoff
             try:
-                execute_gemini_handoff(
+                execution_result = execute_gemini_handoff(
                     project_root=project_root,
                     payload_file=args.payload_file,
                     patch_file=args.patch_file,
@@ -460,10 +464,16 @@ def main() -> int:
             except (OSError, RuntimeError, ValueError) as exc:
                 print(json.dumps({"error": str(exc)}, indent=2))
                 return 1
+            payload_path = execution_result.payload_file
+            patch_path = execution_result.patch_file
+            model_name = execution_result.model
+            patch_text = execution_result.patch_text
+            with Sandbox(project_root) as sandbox:
+                verification_result = verify_patch(patch_path, sandbox)
         else:
-            from .integrations.codex_bridge import execute_codex_handoff
+            from .integrations.codex_bridge import execute_verified_codex_handoff
             try:
-                execute_codex_handoff(
+                verified_result = execute_verified_codex_handoff(
                     project_root=project_root,
                     payload_file=args.payload_file,
                     patch_file=args.patch_file,
@@ -472,19 +482,28 @@ def main() -> int:
             except (OSError, RuntimeError, ValueError) as exc:
                 print(json.dumps({"error": str(exc)}, indent=2))
                 return 1
+            payload_path = verified_result.execution.payload_file
+            patch_path = verified_result.execution.patch_file
+            model_name = verified_result.execution.model
+            patch_text = verified_result.execution.patch_text
+            verification_result = verified_result.verification
+            failure_context_path = verified_result.failure_context_file
+        failure_context_path = _sync_failure_context_log(
+            verification_result=verification_result,
+            failure_context_path=failure_context_path,
+        )
 
-        with Sandbox(project_root) as sandbox:
-            verification_result = verify_patch(Path(args.patch_file), sandbox)
-
-        if verification_result.success:
-            print("Patch verified successfully in sandbox. Ready for human review.")
-            return 0
-
-        print("Sandbox verification failed.")
-        log_path = project_root / ".teamai" / "failure_context.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(verification_result.log_output, encoding="utf-8")
-        return 1
+        rendered_output = _render_execute_handoff_summary(
+            engine=args.engine,
+            model=model_name,
+            payload_path=payload_path,
+            patch_path=patch_path,
+            patch_text=patch_text,
+            verification_result=verification_result,
+            failure_context_path=failure_context_path,
+        )
+        print(rendered_output)
+        return 0 if verification_result.success else 1
 
     if args.command == "approvals":
         from .approvals import PatchApprovalStore
@@ -603,6 +622,109 @@ def _write_cli_output(*, rendered_output: str, output_file: str | None) -> None:
         output_path = Path.cwd() / output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(rendered_output + ("\n" if not rendered_output.endswith("\n") else ""), encoding="utf-8")
+
+
+def _render_execute_handoff_summary(
+    *,
+    engine: str,
+    model: str,
+    payload_path: Path,
+    patch_path: Path,
+    patch_text: str,
+    verification_result: object,
+    failure_context_path: Path | None,
+) -> str:
+    success = bool(getattr(verification_result, "success", False))
+    patch_returncode = getattr(verification_result, "patch_returncode", None)
+    test_returncode = getattr(verification_result, "test_returncode", None)
+    patch_lines = len(patch_text.splitlines()) if patch_text.strip() else 0
+    patch_files = _count_patch_files(patch_text)
+
+    lines = [
+        "Handoff execution summary",
+        f"- Engine: {engine}",
+        f"- Model: {model}",
+        f"- Payload: {payload_path}",
+        f"- Patch: {patch_path}",
+        f"- Patch files: {patch_files}",
+        f"- Patch lines: {patch_lines}",
+        f"- Sandbox verification: {'passed' if success else 'failed'}",
+        f"- Verification detail: {_describe_verification_outcome(patch_returncode=patch_returncode, test_returncode=test_returncode)}",
+    ]
+    if patch_returncode is not None:
+        lines.append(f"- Patch apply exit code: {patch_returncode}")
+    if test_returncode is None:
+        lines.append("- Test run: not executed")
+    else:
+        lines.append(f"- Test exit code: {test_returncode}")
+
+    if failure_context_path is not None:
+        lines.append(f"- Failure log: {failure_context_path}")
+    lines.append(
+        f"- Next step: {_render_execute_handoff_next_step(success=success, patch_returncode=patch_returncode, test_returncode=test_returncode)}"
+    )
+    return "\n".join(lines)
+
+
+def _sync_failure_context_log(*, verification_result: object, failure_context_path: Path) -> Path | None:
+    success = bool(getattr(verification_result, "success", False))
+    log_output = str(getattr(verification_result, "log_output", "") or "").strip()
+
+    if success:
+        if failure_context_path.exists():
+            failure_context_path.unlink()
+        return None
+
+    failure_context_path.parent.mkdir(parents=True, exist_ok=True)
+    rendered_log = log_output or _render_missing_verification_log(
+        patch_returncode=getattr(verification_result, "patch_returncode", None),
+        test_returncode=getattr(verification_result, "test_returncode", None),
+    )
+    failure_context_path.write_text(rendered_log + ("\n" if not rendered_log.endswith("\n") else ""), encoding="utf-8")
+    return failure_context_path
+
+
+def _render_missing_verification_log(*, patch_returncode: int | None, test_returncode: int | None) -> str:
+    lines = [
+        "Verification failed without captured sandbox output.",
+        f"patch_returncode={patch_returncode}",
+        f"test_returncode={test_returncode}",
+    ]
+    return "\n".join(lines)
+
+
+def _count_patch_files(patch_text: str) -> int:
+    diff_headers = re.findall(r"^diff --git a/(.+?) b/", patch_text, flags=re.MULTILINE)
+    if diff_headers:
+        return len(dict.fromkeys(diff_headers))
+
+    file_headers = re.findall(r"^\+\+\+ b/(.+)$", patch_text, flags=re.MULTILINE)
+    return len(dict.fromkeys(file_headers))
+
+
+def _describe_verification_outcome(*, patch_returncode: int | None, test_returncode: int | None) -> str:
+    if patch_returncode not in (None, 0):
+        return "patch apply failed before tests ran"
+    if test_returncode is None:
+        return "patch applied, but no sandbox test run was recorded"
+    if test_returncode == 0:
+        return "patch applied and sandbox tests passed"
+    return "patch applied, but sandbox tests failed"
+
+
+def _render_execute_handoff_next_step(
+    *,
+    success: bool,
+    patch_returncode: int | None,
+    test_returncode: int | None,
+) -> str:
+    if success:
+        return "patch verified successfully in sandbox. Ready for human review."
+    if patch_returncode not in (None, 0):
+        return "inspect the returned diff and patch-apply errors before retrying."
+    if test_returncode not in (None, 0):
+        return "inspect the returned diff and sandbox test failures before retrying."
+    return "inspect the patch and failure log before retrying."
 
 
 def _write_codex_payload_artifact(result: RunResult) -> Path | None:

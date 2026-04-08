@@ -557,6 +557,7 @@ class ClosedLoopSupervisor:
                 backend=self._backend,
                 recommended_codex_action=recommended_action,
                 max_tokens=min(128, self._settings.max_tokens_per_turn),
+                warnings=warnings,
             )
         except Exception as exc:
             warnings.append(f"Semantic skeleton generation failed: {exc}")
@@ -1221,6 +1222,7 @@ class ClosedLoopSupervisor:
         for candidate in [
             "README.md",
             "teamai/config.py",
+            "pyproject.toml",
             "teamai/supervisor.py",
             "teamai/cli.py",
             "teamai",

@@ -254,6 +254,24 @@ def run_runtime_probe(
             warnings=["Runtime probe timed out; local MLX health remains unresolved."],
         )
 
+    if completed.returncode != 0:
+        failure_output = completed.stderr or completed.stdout or "Runtime probe subprocess failed."
+        if _looks_like_runtime_probe_crash(failure_output, returncode=completed.returncode):
+            return RuntimeProbeReport(
+                status="unavailable",
+                reason="runtime_probe_subprocess_crash",
+                summary=(
+                    "The selected runtime crashed while starting the local MLX probe. "
+                    "Prefer the Terminal bridge or another Python/runtime context on this machine."
+                ),
+                checked_at=checked_at,
+                probe_mode=probe_mode,
+                python_executable=str(python_executable),
+                model_id=settings.model_id,
+                model_revision=settings.model_revision,
+                warnings=[_tail_text(failure_output)],
+            )
+
     stdout = completed.stdout.strip()
     if completed.returncode != 0:
         return RuntimeProbeReport(
@@ -408,3 +426,20 @@ def _tail_text(text: str, *, max_chars: int = 240) -> str:
     if len(compact) <= max_chars:
         return compact
     return "..." + compact[-max_chars:]
+
+
+def _looks_like_runtime_probe_crash(text: str, *, returncode: int) -> bool:
+    lowered = text.lower()
+    if returncode < 0 or returncode in {132, 134, 139}:
+        return True
+    crash_markers = (
+        "nsexception",
+        "libc++abi",
+        "abort trap",
+        "segmentation fault",
+        "trace/bpt trap",
+        "metal",
+        "kioGPUcommandbuffercallbackerroroutofmemory".lower(),
+        "uncaught exception",
+    )
+    return any(marker in lowered for marker in crash_markers)

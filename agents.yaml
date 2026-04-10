@@ -1,0 +1,122 @@
+# teamAI Agent Registry
+#
+# Each entry describes an agent that can be used for task execution.
+# The orchestrator uses capability profiles to pick the best agent for a task.
+#
+# Fields:
+#   id          - unique identifier used in routing decisions
+#   name        - human-readable label
+#   type        - local_mlx | openai | google | anthropic | custom
+#   model_id    - model string passed to the backend
+#   capabilities - list of task routes this agent handles well
+#   max_context_tokens - approximate usable context window
+#   cost        - free | cheap | moderate | expensive (relative cost per run)
+#   latency     - low | medium | high (expected wall-clock latency)
+#   requires_env - list of env vars that must be set for this agent to work
+#   notes       - freeform description
+
+agents:
+
+  - id: local_gemma
+    name: "Gemma 4 2B 4-bit (Local MLX)"
+    type: local_mlx
+    model_id: "mlx-community/gemma-4-2b-it-4bit"
+    capabilities:
+      - repository_inspection
+      - deterministic_patch
+      - multi_agent_loop
+    max_context_tokens: 2048
+    cost: free
+    latency: low
+    requires_env: []
+    notes: >
+      Default local agent. Runs fully offline on Apple Silicon via MLX.
+      Best for read-only reconnaissance, narrow patch compilation, and
+      short multi-agent loops. Hands off broad coding tasks to cloud agents.
+
+  - id: local_gemma_large
+    name: "Gemma 4 12B 4-bit (Local MLX)"
+    type: local_mlx
+    model_id: "mlx-community/gemma-4-12b-it-4bit"
+    capabilities:
+      - repository_inspection
+      - deterministic_patch
+      - explicit_write_loop
+      - multi_agent_loop
+    max_context_tokens: 4096
+    cost: free
+    latency: medium
+    requires_env: []
+    notes: >
+      Larger local model for machines with 32GB+ unified memory.
+      Can handle explicit write loops that the 2B model struggles with.
+
+  - id: codex
+    name: "GPT-5.4 / Codex (OpenAI)"
+    type: openai
+    model_id: "gpt-5.4"
+    capabilities:
+      - codex_handoff
+      - explicit_write_loop
+      - multi_agent_loop
+      - repository_inspection
+    max_context_tokens: 128000
+    cost: expensive
+    latency: medium
+    requires_env:
+      - OPENAI_API_KEY
+    notes: >
+      Primary cloud agent for complex multi-file coding tasks. Receives
+      a semantic skeleton from the local model and returns a unified diff patch.
+      Used via `teamai execute-handoff --engine codex`.
+
+  - id: gemini_pro
+    name: "Gemini 2.5 Pro (Google)"
+    type: google
+    model_id: "gemini-2.5-pro"
+    capabilities:
+      - codex_handoff
+      - explicit_write_loop
+      - repository_inspection
+    max_context_tokens: 1000000
+    cost: expensive
+    latency: medium
+    requires_env:
+      - GOOGLE_API_KEY
+    notes: >
+      Alternative cloud agent with very large context window. Useful for
+      whole-repository tasks where the full codebase needs to fit in context.
+      Used via `teamai execute-handoff --engine gemini`.
+
+  - id: claude_sonnet
+    name: "Claude Sonnet (Anthropic)"
+    type: anthropic
+    model_id: "claude-sonnet-4-6"
+    capabilities:
+      - codex_handoff
+      - explicit_write_loop
+      - multi_agent_loop
+      - repository_inspection
+    max_context_tokens: 200000
+    cost: moderate
+    latency: low
+    requires_env:
+      - ANTHROPIC_API_KEY
+    notes: >
+      High-quality cloud agent with strong reasoning and coding ability.
+      Well-suited for orchestration tasks, code review, and complex refactors.
+      Can be wired into the execute-handoff pipeline with a custom bridge.
+
+routing:
+  # Default local agent used when no cloud agent is specified
+  default_local: local_gemma
+
+  # Cloud agent used for codex_handoff route by default
+  default_cloud: codex
+
+  # Minimum capability match required to use an agent
+  # (agent must list ALL requested capabilities)
+  require_all_capabilities: false
+
+  # If true, prefer cheaper agents when multiple match
+  prefer_lower_cost: true

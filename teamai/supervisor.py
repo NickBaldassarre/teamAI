@@ -22,6 +22,7 @@ from .prompts import (
     JSON_REPAIR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT_TEMPLATE,
     PLANNER_JSON_SCHEMA,
+    ROUTE_CLASSIFIER_PROMPT,
     STRATEGIST_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
     VERIFIER_JSON_SCHEMA,
@@ -41,12 +42,22 @@ from .schemas import (
 from .tools import WorkspaceTools
 
 
+_VALID_ROUTES: frozenset[str] = frozenset({
+    "repository_inspection",
+    "deterministic_patch",
+    "explicit_write_loop",
+    "codex_handoff",
+    "multi_agent_loop",
+})
+
+
 class ClosedLoopSupervisor:
     def __init__(self, settings: Settings, backend: MLXModelBackend | None = None) -> None:
         self._settings = settings
         self._backend = backend or MLXModelBackend(settings)
         self._memory = WorkspaceMemoryStore()
         self._tools = WorkspaceTools(settings)
+        self._route_cache: dict[str, str] = {}
 
     @property
     def model_loaded(self) -> bool:
@@ -824,6 +835,7 @@ class ClosedLoopSupervisor:
             persistent_memory=memory_snapshot.memory_text,
             persisted_runs=memory_snapshot.recent_runs_text,
             improvement_notes=memory_snapshot.improvement_notes_text,
+            global_memory=memory_snapshot.global_memory_text,
             previous_rounds=previous_rounds_text,
             latest_observations=latest_observations,
             recent_actions=recent_actions,
@@ -1633,6 +1645,7 @@ class ClosedLoopSupervisor:
         workspace: Path,
         continuation_context: dict[str, object] | None = None,
     ) -> str:
+        # Fast deterministic paths that don't need a model call
         if continuation_context:
             if execution_mode == "workspace_write":
                 compiled = self._compile_small_write_action_from_task(task=task, workspace=workspace)
@@ -1645,11 +1658,44 @@ class ClosedLoopSupervisor:
                 return "deterministic_patch"
             if self._is_explicit_write_task(task):
                 return "explicit_write_loop"
+
+        # Model-based classification (opt-in via TEAMAI_MODEL_ROUTER=true)
+        if self._settings.model_router:
+            model_route = self._classify_task_route_via_model(task)
+            if model_route:
+                return model_route
+
+        # Heuristic fallback (always active)
         if self._is_repository_inspection_task(task):
             return "repository_inspection"
         if self._is_broad_coding_task(task):
             return "codex_handoff"
         return "multi_agent_loop"
+
+    def _classify_task_route_via_model(self, task: str) -> str | None:
+        """Ask the local model to classify the task route. Returns None on failure."""
+        cache_key = task.strip().lower()
+        if cache_key in self._route_cache:
+            return self._route_cache[cache_key]
+        try:
+            raw = self._backend.generate_messages(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": ROUTE_CLASSIFIER_PROMPT.format(task=task),
+                    }
+                ],
+                max_tokens=12,
+                temperature=0.0,
+                enable_thinking=False,
+            ).text
+            label = re.sub(r"[^\w_]", "", raw.strip().split()[0]) if raw.strip() else ""
+            if label in _VALID_ROUTES:
+                self._route_cache[cache_key] = label
+                return label
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _is_explicit_write_task(task: str) -> bool:

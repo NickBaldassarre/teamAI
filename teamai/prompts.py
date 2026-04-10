@@ -138,6 +138,21 @@ VERIFIER_JSON_SCHEMA = """{
 }"""
 
 
+ROUTE_CLASSIFIER_PROMPT = """\
+Classify this engineering task into exactly ONE route label. Reply with ONLY the label — no punctuation, no explanation.
+
+Routes:
+- repository_inspection  (read/analyze/review a codebase, identify next tasks, understand structure)
+- deterministic_patch    (narrow targeted file edit: append a line, update a key, insert a block)
+- explicit_write_loop    (multi-step file modification: implement, fix, add a feature, update code)
+- codex_handoff          (broad complex coding task needing extended context: refactor, architect, build)
+- multi_agent_loop       (everything else: questions, general analysis without a clear write target)
+
+Task: {task}
+
+Route label:"""
+
+
 def build_round_context(
     *,
     task: str,
@@ -147,11 +162,13 @@ def build_round_context(
     persistent_memory: str,
     persisted_runs: str,
     improvement_notes: str,
+    global_memory: str,
     previous_rounds: str,
     latest_observations: str,
     recent_actions: str,
     suggested_paths: str,
 ) -> str:
+    global_section = f"\nGlobal cross-workspace lessons:\n{global_memory}\n" if global_memory else ""
     return f"""Task:
 {task}
 
@@ -171,8 +188,7 @@ Recent persisted runs:
 {persisted_runs}
 
 Local improvement notes:
-{improvement_notes}
-
+{improvement_notes}{global_section}
 Previous rounds:
 {previous_rounds}
 

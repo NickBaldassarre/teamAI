@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,12 +25,23 @@ SPECIALIZED_NOTE_STALE_AGE = 2
 LOW_SIGNAL_SINGLETON_STALE_AGE = 2
 MAX_EVAL_FAILURE_CASES = 4
 
+# Global memory constants
+GLOBAL_STATE_DIR = Path("~/.teamai")
+GLOBAL_MEMORY_FILE_NAME = "global-memory.md"
+MAX_GLOBAL_MEMORY_NOTES = 20
+MAX_GLOBAL_MEMORY_CHARS = 4_000
+# Pattern to detect project-specific file references that make a note non-generalizable
+_SPECIFIC_FILE_RE = re.compile(
+    r"\b[\w./-]+/[\w.-]+\b|\b\w+\.(py|js|ts|md|yaml|json|txt|sh|toml|cfg|lock)\b"
+)
+
 
 @dataclass(frozen=True)
 class WorkspaceMemorySnapshot:
     memory_text: str
     recent_runs_text: str
     improvement_notes_text: str
+    global_memory_text: str = field(default="")
 
 
 class WorkspaceMemoryStore:
@@ -56,10 +68,12 @@ class WorkspaceMemoryStore:
             task_route=task_route,
             continuation_context=continuation_context or {},
         )
+        global_memory_text = GlobalMemoryStore().load()
         return WorkspaceMemorySnapshot(
             memory_text=memory_text,
             recent_runs_text=recent_runs_text,
             improvement_notes_text=improvement_notes_text,
+            global_memory_text=global_memory_text,
         )
 
     def persist_run(
@@ -122,6 +136,8 @@ class WorkspaceMemoryStore:
 
         memory_path = state_dir / MEMORY_FILE_NAME
         memory_path.write_text(self._render_memory_markdown(records), encoding="utf-8")
+
+        GlobalMemoryStore().update(improvement_notes)
 
     def persist_eval_feedback(
         self,
@@ -896,3 +912,61 @@ class WorkspaceMemoryStore:
             seen.add(note)
             deduped.append(note)
         return deduped[:MAX_IMPROVEMENT_NOTES]
+
+
+class GlobalMemoryStore:
+    """Cross-workspace persistent memory stored at ~/.teamai/global-memory.md.
+
+    Collects generalizable lessons (ones that don't reference specific file paths
+    or project-specific terms) from every workspace run and makes them available
+    to all future runs regardless of workspace.
+    """
+
+    def __init__(self) -> None:
+        self._state_dir: Path = GLOBAL_STATE_DIR.expanduser()
+        self._memory_path: Path = self._state_dir / GLOBAL_MEMORY_FILE_NAME
+
+    def load(self) -> str:
+        if not self._memory_path.exists():
+            return ""
+        text = self._memory_path.read_text(encoding="utf-8").strip()
+        return text[:MAX_GLOBAL_MEMORY_CHARS]
+
+    def update(self, improvement_notes: list[str]) -> None:
+        generalizable = [note for note in improvement_notes if self._is_generalizable(note)]
+        if not generalizable:
+            return
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        existing = self._load_notes()
+        added = 0
+        for note in generalizable:
+            if note not in existing:
+                existing.append(note)
+                added += 1
+        if not added:
+            return
+        trimmed = existing[-MAX_GLOBAL_MEMORY_NOTES:]
+        self._memory_path.write_text(self._render(trimmed), encoding="utf-8")
+
+    def _load_notes(self) -> list[str]:
+        if not self._memory_path.exists():
+            return []
+        notes: list[str] = []
+        for line in self._memory_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                notes.append(stripped[2:].strip())
+        return notes
+
+    @staticmethod
+    def _render(notes: list[str]) -> str:
+        lines = ["# Global teamAI Lessons", ""]
+        lines.extend(f"- {note}" for note in notes)
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _is_generalizable(note: str) -> bool:
+        """Return True if the note doesn't reference project-specific file paths."""
+        if len(note.strip()) < 30:
+            return False
+        return not bool(_SPECIFIC_FILE_RE.search(note.lower()))

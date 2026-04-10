@@ -70,6 +70,7 @@ class Settings:
     max_command_output_chars: int
     host: str
     port: int
+    model_router: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -118,6 +119,7 @@ class Settings:
             ),
             host=os.getenv("TEAMAI_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST,
             port=_env_int("TEAMAI_PORT", DEFAULT_PORT, minimum=1),
+            model_router=_env_bool("TEAMAI_MODEL_ROUTER", False),
         )
 
     def resolve_workspace(self, requested_path: str | None) -> Path:

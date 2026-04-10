@@ -1,0 +1,30 @@
+wing: teamai
+rooms:
+- name: evals
+  description: Files from evals/
+  keywords:
+  - evals
+  - evals
+- name: testing
+  description: Files from tests/
+  keywords:
+  - testing
+  - tests
+- name: teamai
+  description: Files from teamai/
+  keywords:
+  - teamai
+  - teamai
+- name: logs
+  description: Files from LOGS/
+  keywords:
+  - logs
+  - logs
+- name: teamai.egg_info
+  description: Files from teamai.egg-info/
+  keywords:
+  - teamai.egg_info
+  - teamai.egg-info
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

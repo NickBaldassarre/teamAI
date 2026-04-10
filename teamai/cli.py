@@ -49,6 +49,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to also write structured progress events as JSONL.",
     )
+    run_parser.add_argument(
+        "--follow-up",
+        action="store_true",
+        help=(
+            "After a completed run, automatically run the next tasks extracted from the final answer. "
+            "Chains runs until no next tasks remain or --follow-up-depth is exhausted."
+        ),
+    )
+    run_parser.add_argument(
+        "--follow-up-depth",
+        type=int,
+        default=1,
+        help="Maximum number of follow-up tasks to chain automatically (default: 1).",
+    )
 
     eval_parser = subparsers.add_parser(
         "eval",
@@ -253,6 +267,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path inside TEAMAI_WORKSPACE_ROOT.",
     )
 
+    # ------------------------------------------------------------------ next
+    next_parser = subparsers.add_parser(
+        "next",
+        help="Run the next queued task from the most recent run's next_tasks list.",
+    )
+    next_parser.add_argument("--workspace", default=None, help="Workspace path inside TEAMAI_WORKSPACE_ROOT.")
+    next_parser.add_argument("--max-rounds", type=int, default=None)
+    next_parser.add_argument("--max-actions", type=int, default=None)
+    next_parser.add_argument("--max-tokens", type=int, default=None)
+    next_parser.add_argument("--temperature", type=float, default=None)
+    next_parser.add_argument(
+        "--execution-mode",
+        choices=["read_only", "workspace_write"],
+        default="read_only",
+    )
+    next_parser.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        help="How many next_tasks to chain in sequence (default: 1).",
+    )
+    next_parser.add_argument(
+        "--output-format",
+        choices=["full_json", "handoff_json", "handoff_markdown"],
+        default="full_json",
+    )
+
+    # ------------------------------------------------------------------ daemon
+    daemon_parser = subparsers.add_parser(
+        "daemon",
+        help="Manage the persistent teamAI background service.",
+    )
+    daemon_subparsers = daemon_parser.add_subparsers(dest="daemon_command", required=True)
+
+    daemon_start = daemon_subparsers.add_parser("start", help="Start the daemon.")
+    daemon_start.add_argument("--port", type=int, default=8000)
+    daemon_start.add_argument("--workspace", default=None, help="Workspace root for the daemon.")
+    daemon_start.add_argument("--host", default="127.0.0.1")
+
+    daemon_subparsers.add_parser("stop", help="Stop the running daemon.")
+
+    daemon_status_p = daemon_subparsers.add_parser("status", help="Show daemon status.")
+    daemon_status_p.add_argument("--port", type=int, default=8000)
+
+    daemon_submit = daemon_subparsers.add_parser("submit", help="Submit a task to the running daemon.")
+    daemon_submit.add_argument("task", help="Task description.")
+    daemon_submit.add_argument("--workspace", default=None)
+    daemon_submit.add_argument("--port", type=int, default=8000)
+    daemon_submit.add_argument("--execution-mode", choices=["read_only", "workspace_write"], default="read_only")
+    daemon_submit.add_argument("--max-rounds", type=int, default=None)
+
+    daemon_job = daemon_subparsers.add_parser("job", help="Fetch a submitted job's status and result.")
+    daemon_job.add_argument("job_id", help="Job ID returned by `daemon submit`.")
+    daemon_job.add_argument("--port", type=int, default=8000)
+
+    # ------------------------------------------------------------------ agents
+    agents_parser = subparsers.add_parser(
+        "agents",
+        help="Inspect the agent registry (agents.yaml).",
+    )
+    agents_subparsers = agents_parser.add_subparsers(dest="agents_command", required=True)
+
+    agents_list = agents_subparsers.add_parser("list", help="List all registered agents.")
+    agents_list.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format.",
+    )
+
+    agents_pick = agents_subparsers.add_parser("pick", help="Pick the best agent for a capability.")
+    agents_pick.add_argument("capability", help="Task route capability (e.g. codex_handoff, multi_agent_loop).")
+    agents_pick.add_argument("--prefer-local", action="store_true")
+    agents_pick.add_argument("--no-env-check", action="store_true", help="Skip env var availability check.")
+
     return parser
 
 
@@ -309,6 +398,49 @@ def main() -> int:
             )
 
         print(rendered_output)
+
+        # --follow-up: chain through next_tasks from the completed run
+        if getattr(args, "follow_up", False) and result.status == "completed":
+            from .memory import WorkspaceMemoryStore
+            depth = getattr(args, "follow_up_depth", 1)
+            _, next_tasks = WorkspaceMemoryStore._extract_summary_and_tasks(result.final_answer)
+            chained = 0
+            for follow_task in next_tasks:
+                if chained >= depth:
+                    break
+                print(
+                    f"[teamai] follow-up {chained + 1}/{depth}: {follow_task!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                follow_request = RunRequest(
+                    task=follow_task,
+                    workspace_path=args.workspace,
+                    max_rounds=args.max_rounds,
+                    max_actions_per_round=args.max_actions,
+                    max_tokens_per_turn=args.max_tokens,
+                    temperature=args.temperature,
+                    execution_mode=args.execution_mode,
+                )
+                follow_progress, follow_events, follow_close = _build_run_stream_handlers(
+                    project_root=Path.cwd().resolve(),
+                    stream_format=args.stream_format,
+                    event_log_file=args.event_log_file,
+                )
+                try:
+                    follow_result = ClosedLoopSupervisor(settings).run(
+                        follow_request,
+                        progress_callback=follow_progress,
+                        event_callback=follow_events,
+                    )
+                finally:
+                    follow_close()
+                follow_output = json.dumps(follow_result.model_dump(mode="json"), indent=2)
+                print(follow_output)
+                chained += 1
+                if follow_result.status != "completed":
+                    break
+
         return 0
 
     if args.command == "eval":
@@ -603,6 +735,149 @@ def main() -> int:
         except (KeyError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, indent=2))
             return 1
+
+    if args.command == "next":
+        from .config import Settings
+        from .memory import WorkspaceMemoryStore
+        from .schemas import RunRequest
+        from .supervisor import ClosedLoopSupervisor
+
+        settings = Settings.from_env()
+        project_root = Path.cwd().resolve()
+        try:
+            workspace = settings.resolve_workspace(args.workspace)
+        except Exception as exc:
+            print(json.dumps({"error": str(exc)}, indent=2))
+            return 1
+
+        records = WorkspaceMemoryStore()._load_history_records(workspace)
+        # Find the most recent run with next_tasks
+        next_tasks: list[str] = []
+        for record in reversed(records):
+            raw = record.get("next_tasks", [])
+            if isinstance(raw, list) and raw:
+                next_tasks = [str(t) for t in raw if str(t).strip()]
+                break
+
+        if not next_tasks:
+            print(json.dumps({"status": "nothing_queued", "message": "No next_tasks found in recent run history."}))
+            return 0
+
+        depth = getattr(args, "depth", 1)
+        ran = 0
+        for task in next_tasks:
+            if ran >= depth:
+                break
+            print(f"[teamai] next task {ran + 1}/{depth}: {task!r}", file=sys.stderr, flush=True)
+            request = RunRequest(
+                task=task,
+                workspace_path=args.workspace,
+                max_rounds=args.max_rounds,
+                max_actions_per_round=args.max_actions,
+                max_tokens_per_turn=args.max_tokens,
+                temperature=args.temperature,
+                execution_mode=args.execution_mode,
+            )
+            result = ClosedLoopSupervisor(settings).run(
+                request,
+                progress_callback=lambda msg: print(f"[teamai] {msg}", file=sys.stderr, flush=True),
+            )
+            print(json.dumps(result.model_dump(mode="json"), indent=2))
+            ran += 1
+            if result.status != "completed":
+                break
+        return 0
+
+    if args.command == "daemon":
+        from .daemon import (
+            daemon_status,
+            get_daemon_job,
+            start_daemon,
+            stop_daemon,
+            submit_task_to_daemon,
+        )
+        from .runtime import select_runtime_python
+
+        if args.daemon_command == "start":
+            project_root = Path.cwd().resolve()
+            selection = select_runtime_python(project_root, current_python=Path(sys.executable))
+            result_payload = start_daemon(
+                host=getattr(args, "host", "127.0.0.1"),
+                port=getattr(args, "port", 8000),
+                workspace=getattr(args, "workspace", None),
+                python_executable=selection.selected_python,
+            )
+            print(json.dumps(result_payload, indent=2))
+            return 0 if result_payload.get("status") in ("started", "already_running", "starting") else 1
+
+        if args.daemon_command == "stop":
+            print(json.dumps(stop_daemon(), indent=2))
+            return 0
+
+        if args.daemon_command == "status":
+            print(json.dumps(daemon_status(port=getattr(args, "port", 8000)), indent=2))
+            return 0
+
+        if args.daemon_command == "submit":
+            result_payload = submit_task_to_daemon(
+                args.task,
+                workspace=getattr(args, "workspace", None),
+                port=getattr(args, "port", 8000),
+                execution_mode=getattr(args, "execution_mode", "read_only"),
+                max_rounds=getattr(args, "max_rounds", None),
+            )
+            print(json.dumps(result_payload, indent=2))
+            return 0 if result_payload.get("status") != "error" else 1
+
+        if args.daemon_command == "job":
+            print(json.dumps(get_daemon_job(args.job_id, port=getattr(args, "port", 8000)), indent=2))
+            return 0
+
+    if args.command == "agents":
+        from .agent_registry import AgentRegistry
+
+        registry = AgentRegistry.load()
+
+        if args.agents_command == "list":
+            if getattr(args, "format", "table") == "json":
+                payload = [
+                    {
+                        "id": a.id,
+                        "name": a.name,
+                        "type": a.type,
+                        "model_id": a.model_id,
+                        "capabilities": a.capabilities,
+                        "cost": a.cost,
+                        "latency": a.latency,
+                        "env_satisfied": a.env_satisfied(),
+                        "requires_env": a.requires_env,
+                        "notes": a.notes,
+                    }
+                    for a in registry.agents
+                ]
+                print(json.dumps(payload, indent=2))
+            else:
+                print(registry.render_table())
+            return 0
+
+        if args.agents_command == "pick":
+            agent = registry.pick_best(
+                args.capability,
+                prefer_local=getattr(args, "prefer_local", False),
+                env_check=not getattr(args, "no_env_check", False),
+            )
+            if agent is None:
+                print(json.dumps({"error": f"No agent found for capability: {args.capability!r}"}))
+                return 1
+            print(json.dumps({
+                "id": agent.id,
+                "name": agent.name,
+                "type": agent.type,
+                "model_id": agent.model_id,
+                "cost": agent.cost,
+                "latency": agent.latency,
+            }, indent=2))
+            return 0
 
     parser.error("Unknown command")
     return 2

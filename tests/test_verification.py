@@ -23,7 +23,11 @@ class VerificationTest(unittest.TestCase):
             self.assertEqual(result.test_returncode, 0)
             self.assertIn("== Patch Apply ==", result.log_output)
             self.assertIn("== Test Run ==", result.log_output)
+            self.assertIn("== Additional Verification ==", result.log_output)
             self.assertIn("exit_code: 0", result.log_output)
+            self.assertEqual(len(result.commands_run), 2)
+            self.assertTrue(result.commands_run[0].endswith("-m unittest tests.test_calc"))
+            self.assertTrue(result.commands_run[1].endswith("-m unittest discover -s tests"))
 
     def test_verify_patch_returns_failure_when_tests_fail_after_patch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -38,6 +42,38 @@ class VerificationTest(unittest.TestCase):
             self.assertNotEqual(result.test_returncode, 0)
             self.assertIn("FAILED", result.log_output)
             self.assertIn("exit_code:", result.log_output)
+
+    def test_verify_patch_falls_back_to_py_compile_when_repo_has_no_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir) / "repo"
+            project_root.mkdir(parents=True, exist_ok=True)
+            (project_root / "calc.py").write_text("def answer():\n    return 1\n", encoding="utf-8")
+            venv_bin = project_root / ".venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            (venv_bin / "python").symlink_to(Path(sys.executable))
+            patch_file = project_root / "change.patch"
+            patch_file.write_text(
+                "\n".join(
+                    [
+                        "diff --git a/calc.py b/calc.py",
+                        "--- a/calc.py",
+                        "+++ b/calc.py",
+                        "@@ -1,2 +1,2 @@",
+                        " def answer():",
+                        "-    return 1",
+                        "+    return 42",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with Sandbox(project_root) as sandbox:
+                result = verify_patch(patch_file, sandbox)
+
+            self.assertTrue(result.success)
+            self.assertEqual(len(result.commands_run), 1)
+            self.assertTrue(result.commands_run[0].endswith("-m py_compile calc.py"))
 
     def _create_repo_fixture(self, project_root: Path, *, replacement: str) -> Path:
         project_root.mkdir(parents=True, exist_ok=True)

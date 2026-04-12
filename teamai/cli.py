@@ -6,7 +6,7 @@ import re
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .schemas import RunEvent, RunResult
 
@@ -62,6 +62,39 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Maximum number of follow-up tasks to chain automatically (default: 1).",
+    )
+    run_parser.add_argument(
+        "--auto-execute-handoff",
+        action="store_true",
+        help=(
+            "If the run produces a Codex payload for a broad task, immediately execute the cloud handoff, "
+            "verify the returned patch in a sandbox, and create a pending approval."
+        ),
+    )
+    run_parser.add_argument(
+        "--handoff-engine",
+        choices=["codex", "gemini"],
+        default="codex",
+        help="Cloud execution engine used with `--auto-execute-handoff`.",
+    )
+    run_parser.add_argument(
+        "--handoff-model",
+        default=None,
+        help="Optional model override used with `--auto-execute-handoff`.",
+    )
+    run_parser.add_argument(
+        "--handoff-patch-file",
+        default=".teamai/codex_solution.patch",
+        help="Patch output path used with `--auto-execute-handoff`.",
+    )
+    run_parser.add_argument(
+        "--autopilot-cycles",
+        type=int,
+        default=0,
+        help=(
+            "Run a bounded autonomous loop for broad tasks: execute a verified cloud handoff, "
+            "auto-apply the verified approval, and continue the task for up to this many cycles."
+        ),
     )
 
     eval_parser = subparsers.add_parser(
@@ -379,16 +412,9 @@ def main() -> int:
             )
         finally:
             close_event_stream()
-        if args.output_format == "full_json":
-            rendered_output = json.dumps(result.model_dump(mode="json"), indent=2)
-        else:
-            handoff = build_handoff_packet(task=args.task, result=result)
-            if args.output_format == "handoff_json":
-                rendered_output = json.dumps(handoff.model_dump(mode="json"), indent=2)
-            else:
-                rendered_output = render_handoff_markdown(handoff)
-
-        _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
+        handoff_packet = None
+        if args.output_format != "full_json":
+            handoff_packet = build_handoff_packet(task=args.task, result=result)
         payload_path = _write_codex_payload_artifact(result)
         if payload_path is not None:
             print(
@@ -397,10 +423,145 @@ def main() -> int:
                 flush=True,
             )
 
+        auto_handoff: dict[str, Any] | None = None
+        autopilot: dict[str, Any] | None = None
+        auto_handoff_executed = False
+        exit_code = 0
+        autopilot_cycles = max(int(getattr(args, "autopilot_cycles", 0) or 0), 0)
+        if autopilot_cycles > 0:
+            print(
+                f"[teamai] Autopilot enabled for up to {autopilot_cycles} cycle(s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            autopilot = _run_autopilot_workflow(
+                project_root=Path.cwd().resolve(),
+                settings=settings,
+                initial_result=result,
+                initial_payload_path=payload_path,
+                workspace_path=args.workspace,
+                max_rounds=args.max_rounds,
+                max_actions=args.max_actions,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                handoff_engine=args.handoff_engine,
+                handoff_model=args.handoff_model,
+                handoff_patch_file=args.handoff_patch_file,
+                max_cycles=autopilot_cycles,
+            )
+            exit_code = 0 if bool(autopilot.get("success", False)) else 1
+        elif getattr(args, "auto_execute_handoff", False):
+            if payload_path is None:
+                print(
+                    "[teamai] Auto handoff requested, but this run did not produce a Codex payload.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[teamai] Auto handoff: executing verified {args.handoff_engine} handoff",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    auto_handoff = _execute_verified_handoff_workflow(
+                        project_root=Path.cwd().resolve(),
+                        engine=args.handoff_engine,
+                        payload_file=payload_path,
+                        patch_file=args.handoff_patch_file,
+                        model=args.handoff_model,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    auto_handoff = {
+                        "engine": args.handoff_engine,
+                        "model": args.handoff_model,
+                        "payload_path": str(payload_path),
+                        "patch_path": str(_resolve_cli_path(Path.cwd().resolve(), args.handoff_patch_file)),
+                        "verification": {
+                            "success": False,
+                            "patch_returncode": None,
+                            "test_returncode": None,
+                            "commands_run": [],
+                        },
+                        "approval": None,
+                        "approval_error": None,
+                        "failure_context_path": None,
+                        "summary": f"Auto handoff failed: {exc}",
+                        "success": False,
+                        "error": str(exc),
+                    }
+                auto_handoff_executed = True
+                exit_code = 0 if bool(auto_handoff.get("success", False)) else 1
+
+        if args.output_format == "full_json":
+            if autopilot is not None:
+                rendered_output = json.dumps(
+                    {
+                        "run": result.model_dump(mode="json"),
+                        "autopilot": autopilot,
+                    },
+                    indent=2,
+                )
+            elif auto_handoff is None:
+                rendered_output = json.dumps(result.model_dump(mode="json"), indent=2)
+            else:
+                rendered_output = json.dumps(
+                    {
+                        "run": result.model_dump(mode="json"),
+                        "auto_handoff": auto_handoff,
+                    },
+                    indent=2,
+                )
+        elif args.output_format == "handoff_json":
+            assert handoff_packet is not None
+            if autopilot is not None:
+                rendered_output = json.dumps(
+                    {
+                        "handoff_packet": handoff_packet.model_dump(mode="json"),
+                        "autopilot": autopilot,
+                    },
+                    indent=2,
+                )
+            elif auto_handoff is None:
+                rendered_output = json.dumps(handoff_packet.model_dump(mode="json"), indent=2)
+            else:
+                rendered_output = json.dumps(
+                    {
+                        "handoff_packet": handoff_packet.model_dump(mode="json"),
+                        "auto_handoff": auto_handoff,
+                    },
+                    indent=2,
+                )
+        else:
+            assert handoff_packet is not None
+            rendered_output = render_handoff_markdown(handoff_packet)
+            if autopilot is not None:
+                rendered_output = (
+                    f"{rendered_output}\n\n## Autopilot\n{autopilot['summary']}"
+                )
+            elif auto_handoff is not None:
+                rendered_output = (
+                    f"{rendered_output}\n\n## Verified Handoff Execution\n{auto_handoff['summary']}"
+                )
+
+        _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
+
         print(rendered_output)
 
         # --follow-up: chain through next_tasks from the completed run
-        if getattr(args, "follow_up", False) and result.status == "completed":
+        if getattr(args, "follow_up", False) and autopilot is not None:
+            print(
+                "[teamai] Skipping --follow-up because autopilot already continued the task.",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif getattr(args, "follow_up", False) and auto_handoff_executed:
+            print(
+                "[teamai] Skipping --follow-up because the run already continued into verified cloud handoff.",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif getattr(args, "follow_up", False) and result.status == "completed":
             from .memory import WorkspaceMemoryStore
             depth = getattr(args, "follow_up_depth", 1)
             _, next_tasks = WorkspaceMemoryStore._extract_summary_and_tasks(result.final_answer)
@@ -441,7 +602,7 @@ def main() -> int:
                 if follow_result.status != "completed":
                     break
 
-        return 0
+        return exit_code
 
     if args.command == "eval":
         from .config import Settings
@@ -577,65 +738,21 @@ def main() -> int:
         return 0 if report.probe.status == "healthy" else 1
 
     if args.command == "execute-handoff":
-        from .verification import Sandbox, verify_patch
-
         project_root = Path.cwd().resolve()
-        payload_path = _resolve_cli_path(project_root, args.payload_file)
-        patch_path = _resolve_cli_path(project_root, args.patch_file)
-        failure_context_path = project_root / ".teamai" / "failure_context.log"
+        try:
+            execution = _execute_verified_handoff_workflow(
+                project_root=project_root,
+                engine=args.engine,
+                payload_file=args.payload_file,
+                patch_file=args.patch_file,
+                model=args.model,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, indent=2))
+            return 1
 
-        if args.engine == "gemini":
-            from .integrations.gemini_bridge import execute_gemini_handoff
-            try:
-                execution_result = execute_gemini_handoff(
-                    project_root=project_root,
-                    payload_file=args.payload_file,
-                    patch_file=args.patch_file,
-                    model=args.model or "gemini-2.5-pro",
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                print(json.dumps({"error": str(exc)}, indent=2))
-                return 1
-            payload_path = execution_result.payload_file
-            patch_path = execution_result.patch_file
-            model_name = execution_result.model
-            patch_text = execution_result.patch_text
-            with Sandbox(project_root) as sandbox:
-                verification_result = verify_patch(patch_path, sandbox)
-        else:
-            from .integrations.codex_bridge import execute_verified_codex_handoff
-            try:
-                verified_result = execute_verified_codex_handoff(
-                    project_root=project_root,
-                    payload_file=args.payload_file,
-                    patch_file=args.patch_file,
-                    model=args.model or "gpt-5.4",
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                print(json.dumps({"error": str(exc)}, indent=2))
-                return 1
-            payload_path = verified_result.execution.payload_file
-            patch_path = verified_result.execution.patch_file
-            model_name = verified_result.execution.model
-            patch_text = verified_result.execution.patch_text
-            verification_result = verified_result.verification
-            failure_context_path = verified_result.failure_context_file
-        failure_context_path = _sync_failure_context_log(
-            verification_result=verification_result,
-            failure_context_path=failure_context_path,
-        )
-
-        rendered_output = _render_execute_handoff_summary(
-            engine=args.engine,
-            model=model_name,
-            payload_path=payload_path,
-            patch_path=patch_path,
-            patch_text=patch_text,
-            verification_result=verification_result,
-            failure_context_path=failure_context_path,
-        )
-        print(rendered_output)
-        return 0 if verification_result.success else 1
+        print(str(execution["summary"]))
+        return 0 if bool(execution["success"]) else 1
 
     if args.command == "approvals":
         from .approvals import PatchApprovalStore
@@ -667,45 +784,30 @@ def main() -> int:
                 return 0
 
             if args.approvals_command == "apply":
-                applied = store.apply(workspace=workspace, approval_id=args.approval_id)
-                payload = store.summarize(applied, include_diff=True)
                 if not args.continue_run:
+                    applied = store.apply(workspace=workspace, approval_id=args.approval_id)
+                    payload = store.summarize(applied, include_diff=True)
                     print(json.dumps(payload, indent=2))
                     return 0
 
-                from .schemas import RunRequest
-                from .supervisor import ClosedLoopSupervisor
-
-                continuation_context = store.build_continuation_context(applied, workspace=workspace)
-                continuation_task = store.build_continuation_task(
-                    applied,
-                    continuation_context=continuation_context,
-                )
-                continuation_mode = store.continuation_execution_mode(applied)
-                continuation_settings = settings
-                if continuation_mode == "workspace_write" and not continuation_settings.allow_writes:
-                    continuation_settings = replace(continuation_settings, allow_writes=True)
-
-                continuation_result = ClosedLoopSupervisor(continuation_settings).run(
-                    RunRequest(
-                        task=continuation_task,
-                        workspace_path=args.workspace,
-                        max_rounds=args.max_rounds,
-                        max_actions_per_round=args.max_actions,
-                        max_tokens_per_turn=args.max_tokens,
-                        temperature=args.temperature,
-                        execution_mode=continuation_mode,
-                        continuation_context=continuation_context,
-                    ),
+                continued = _apply_approval_and_continue(
+                    settings=settings,
+                    workspace=workspace,
+                    workspace_path=args.workspace,
+                    approval_id=args.approval_id,
+                    max_rounds=args.max_rounds,
+                    max_actions=args.max_actions,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
                     progress_callback=lambda message: print(f"[teamai] {message}", file=sys.stderr, flush=True),
                 )
                 print(
                     json.dumps(
                         {
-                            "approval": payload,
-                            "continuation_task": continuation_task,
-                            "continuation_context": continuation_context,
-                            "continuation": continuation_result.model_dump(mode="json"),
+                            "approval": continued["approval_summary"],
+                            "continuation_task": continued["continuation_task"],
+                            "continuation_context": continued["continuation_context"],
+                            "continuation": continued["continuation_result"].model_dump(mode="json"),
                         },
                         indent=2,
                     )
@@ -899,6 +1001,375 @@ def _write_cli_output(*, rendered_output: str, output_file: str | None) -> None:
     output_path.write_text(rendered_output + ("\n" if not rendered_output.endswith("\n") else ""), encoding="utf-8")
 
 
+def _apply_approval_and_continue(
+    *,
+    settings: Any,
+    workspace: Path,
+    workspace_path: str | None,
+    approval_id: str,
+    max_rounds: int | None,
+    max_actions: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    from .approvals import PatchApprovalStore
+    from .schemas import RunRequest
+    from .supervisor import ClosedLoopSupervisor
+
+    store = PatchApprovalStore()
+    applied = store.apply(workspace=workspace, approval_id=approval_id)
+    approval_summary = store.summarize(applied, include_diff=True)
+    continuation_context = store.build_continuation_context(applied, workspace=workspace)
+    continuation_task = store.build_continuation_task(
+        applied,
+        continuation_context=continuation_context,
+    )
+    continuation_mode = store.continuation_execution_mode(applied)
+    continuation_settings = settings
+    if continuation_mode == "workspace_write" and not continuation_settings.allow_writes:
+        continuation_settings = replace(continuation_settings, allow_writes=True)
+
+    continuation_result = ClosedLoopSupervisor(continuation_settings).run(
+        RunRequest(
+            task=continuation_task,
+            workspace_path=workspace_path,
+            max_rounds=max_rounds,
+            max_actions_per_round=max_actions,
+            max_tokens_per_turn=max_tokens,
+            temperature=temperature,
+            execution_mode=continuation_mode,
+            continuation_context=continuation_context,
+        ),
+        progress_callback=progress_callback,
+    )
+    return {
+        "approval": applied,
+        "approval_summary": approval_summary,
+        "continuation_task": continuation_task,
+        "continuation_context": continuation_context,
+        "continuation_result": continuation_result,
+    }
+
+
+def _execute_verified_handoff_workflow(
+    *,
+    project_root: Path,
+    engine: str,
+    payload_file: str | Path,
+    patch_file: str | Path,
+    model: str | None = None,
+) -> dict[str, Any]:
+    project_root = project_root.resolve()
+    payload_path = _resolve_cli_path(project_root, str(payload_file))
+    patch_path = _resolve_cli_path(project_root, str(patch_file))
+    failure_context_path = project_root / ".teamai" / "failure_context.log"
+    approval_payload = None
+    approval_error = None
+
+    if engine == "gemini":
+        from .approvals import PatchApprovalStore
+        from .integrations.gemini_bridge import execute_gemini_handoff
+        from .schemas import CodexHandoffPayload
+        from .verification import Sandbox, verify_patch
+
+        execution_result = execute_gemini_handoff(
+            project_root=project_root,
+            payload_file=payload_file,
+            patch_file=patch_file,
+            model=model or "gemini-2.5-pro",
+        )
+        payload_path = execution_result.payload_file
+        patch_path = execution_result.patch_file
+        model_name = execution_result.model
+        patch_text = execution_result.patch_text
+        with Sandbox(project_root) as sandbox:
+            verification_result = verify_patch(patch_path, sandbox)
+            if verification_result.success:
+                try:
+                    payload = CodexHandoffPayload.model_validate_json(
+                        payload_path.read_text(encoding="utf-8")
+                    )
+                    approval_payload = PatchApprovalStore().create_bundle_from_patch(
+                        workspace=project_root,
+                        sandbox_root=sandbox.path,
+                        patch_text=patch_text,
+                        reason=f"Verified Gemini handoff patch for: {payload.original_task}",
+                        source_tool="verified_codex_handoff",
+                        continuation={
+                            "original_task": payload.original_task,
+                            "requested_execution_mode": "workspace_write",
+                        },
+                    )
+                except Exception as exc:  # pragma: no cover - defensive surface
+                    approval_error = str(exc)
+    else:
+        from .integrations.codex_bridge import execute_verified_codex_handoff
+
+        verified_result = execute_verified_codex_handoff(
+            project_root=project_root,
+            payload_file=payload_file,
+            patch_file=patch_file,
+            model=model or "gpt-5.4",
+        )
+        payload_path = verified_result.execution.payload_file
+        patch_path = verified_result.execution.patch_file
+        model_name = verified_result.execution.model
+        patch_text = verified_result.execution.patch_text
+        verification_result = verified_result.verification
+        failure_context_path = verified_result.failure_context_file
+        approval_payload = getattr(verified_result, "approval", None)
+        approval_error = getattr(verified_result, "approval_error", None)
+
+    failure_context_path = _sync_failure_context_log(
+        verification_result=verification_result,
+        failure_context_path=failure_context_path,
+    )
+    rendered_summary = _render_execute_handoff_summary(
+        engine=engine,
+        model=model_name,
+        payload_path=payload_path,
+        patch_path=patch_path,
+        patch_text=patch_text,
+        verification_result=verification_result,
+        failure_context_path=failure_context_path,
+        approval_payload=approval_payload,
+        approval_error=approval_error,
+    )
+    return {
+        "engine": engine,
+        "model": model_name,
+        "payload_path": str(payload_path),
+        "patch_path": str(patch_path),
+        "verification": {
+            "success": bool(getattr(verification_result, "success", False)),
+            "patch_returncode": getattr(verification_result, "patch_returncode", None),
+            "test_returncode": getattr(verification_result, "test_returncode", None),
+            "commands_run": list(getattr(verification_result, "commands_run", ()) or ()),
+        },
+        "approval": approval_payload,
+        "approval_error": approval_error,
+        "failure_context_path": None if failure_context_path is None else str(failure_context_path),
+        "summary": rendered_summary,
+        "success": bool(getattr(verification_result, "success", False)),
+    }
+
+
+def _run_autopilot_workflow(
+    *,
+    project_root: Path,
+    settings: Any,
+    initial_result: RunResult,
+    initial_payload_path: Path | None,
+    workspace_path: str | None,
+    max_rounds: int | None,
+    max_actions: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    handoff_engine: str,
+    handoff_model: str | None,
+    handoff_patch_file: str | Path,
+    max_cycles: int,
+) -> dict[str, Any]:
+    cycles: list[dict[str, Any]] = []
+    current_result = initial_result
+    payload_path = initial_payload_path
+
+    if current_result.status == "failed":
+        autopilot = {
+            "requested_cycles": max_cycles,
+            "completed_cycles": 0,
+            "status": "failed",
+            "stop_reason": "initial_run_failed",
+            "cycles": cycles,
+            "final_result": current_result.model_dump(mode="json"),
+            "success": False,
+        }
+        autopilot["summary"] = _render_autopilot_summary(autopilot)
+        return autopilot
+
+    final_status = "stopped"
+    stop_reason = "max_autopilot_cycles_reached"
+    success = False
+
+    def emit(message: str) -> None:
+        print(f"[teamai][autopilot] {message}", file=sys.stderr, flush=True)
+
+    for cycle_index in range(1, max_cycles + 1):
+        if payload_path is None:
+            payload_path = _write_codex_payload_artifact(current_result)
+            if payload_path is not None:
+                emit(f"Wrote semantic skeleton to {payload_path}")
+
+        if payload_path is None:
+            if current_result.status == "completed":
+                final_status = "completed"
+                stop_reason = "completed_without_handoff"
+                success = True
+            elif current_result.stop_reason == "approval_required":
+                final_status = "stopped"
+                stop_reason = "manual_approval_required"
+            else:
+                final_status = current_result.status
+                stop_reason = current_result.stop_reason
+            break
+
+        emit(f"Cycle {cycle_index}/{max_cycles}: executing verified {handoff_engine} handoff")
+        cycle_record: dict[str, Any] = {
+            "cycle": cycle_index,
+            "source_result": {
+                "status": current_result.status,
+                "task_route": current_result.task_route,
+                "stop_reason": current_result.stop_reason,
+            },
+        }
+        try:
+            handoff = _execute_verified_handoff_workflow(
+                project_root=project_root,
+                engine=handoff_engine,
+                payload_file=payload_path,
+                patch_file=handoff_patch_file,
+                model=handoff_model,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            handoff = {
+                "engine": handoff_engine,
+                "model": handoff_model,
+                "payload_path": str(payload_path),
+                "patch_path": str(_resolve_cli_path(project_root, str(handoff_patch_file))),
+                "verification": {
+                    "success": False,
+                    "patch_returncode": None,
+                    "test_returncode": None,
+                    "commands_run": [],
+                },
+                "approval": None,
+                "approval_error": None,
+                "failure_context_path": None,
+                "summary": f"Autopilot handoff failed: {exc}",
+                "success": False,
+                "error": str(exc),
+            }
+        cycle_record["handoff"] = handoff
+
+        if not bool(handoff.get("success", False)):
+            cycles.append(cycle_record)
+            final_status = "failed"
+            stop_reason = "verified_handoff_failed"
+            break
+
+        approval_payload = handoff.get("approval")
+        approval_id = ""
+        if isinstance(approval_payload, dict):
+            approval_id = str(approval_payload.get("approval_id", "")).strip()
+        if not approval_id:
+            cycles.append(cycle_record)
+            final_status = "failed"
+            stop_reason = "verified_handoff_missing_approval"
+            break
+
+        workspace = Path(current_result.workspace).expanduser()
+        emit(f"Cycle {cycle_index}/{max_cycles}: applying verified approval {approval_id} and continuing")
+        try:
+            continuation = _apply_approval_and_continue(
+                settings=settings,
+                workspace=workspace,
+                workspace_path=workspace_path or str(workspace),
+                approval_id=approval_id,
+                max_rounds=max_rounds,
+                max_actions=max_actions,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                progress_callback=emit,
+            )
+        except (KeyError, ValueError, RuntimeError) as exc:
+            cycle_record["approval_apply_error"] = str(exc)
+            cycles.append(cycle_record)
+            final_status = "failed"
+            stop_reason = "approval_apply_failed"
+            break
+
+        continuation_result = continuation["continuation_result"]
+        cycle_record["approval"] = continuation["approval_summary"]
+        cycle_record["continuation_task"] = continuation["continuation_task"]
+        cycle_record["continuation_context"] = continuation["continuation_context"]
+        cycle_record["continuation"] = continuation_result.model_dump(mode="json")
+        cycles.append(cycle_record)
+
+        current_result = continuation_result
+        payload_path = None
+
+        if current_result.status == "completed" and current_result.codex_payload is None:
+            final_status = "completed"
+            stop_reason = "task_completed"
+            success = True
+            break
+        if current_result.status == "failed":
+            final_status = "failed"
+            stop_reason = f"continuation_{current_result.stop_reason}"
+            break
+        if current_result.stop_reason == "approval_required":
+            final_status = "stopped"
+            stop_reason = "manual_approval_required"
+            break
+    else:
+        final_status = "stopped"
+        stop_reason = "max_autopilot_cycles_reached"
+
+    autopilot = {
+        "requested_cycles": max_cycles,
+        "completed_cycles": len(cycles),
+        "status": final_status,
+        "stop_reason": stop_reason,
+        "cycles": cycles,
+        "final_result": current_result.model_dump(mode="json"),
+        "success": success,
+    }
+    autopilot["summary"] = _render_autopilot_summary(autopilot)
+    return autopilot
+
+
+def _render_autopilot_summary(payload: dict[str, Any]) -> str:
+    lines = [
+        "Autopilot summary",
+        f"- Status: {payload.get('status', 'unknown')} ({payload.get('stop_reason', 'unknown')})",
+        f"- Requested cycles: {payload.get('requested_cycles', 0)}",
+        f"- Completed cycles: {payload.get('completed_cycles', 0)}",
+    ]
+    final_result = payload.get("final_result")
+    if isinstance(final_result, dict):
+        lines.append(
+            f"- Final result: {final_result.get('status', 'unknown')} ({final_result.get('stop_reason', 'unknown')})"
+        )
+
+    cycles = payload.get("cycles", [])
+    if isinstance(cycles, list) and cycles:
+        for cycle in cycles:
+            if not isinstance(cycle, dict):
+                continue
+            cycle_number = cycle.get("cycle", "?")
+            handoff = cycle.get("handoff", {})
+            approval = cycle.get("approval", {})
+            continuation = cycle.get("continuation", {})
+            approval_id = ""
+            if isinstance(approval, dict):
+                approval_id = str(approval.get("approval_id", "")).strip()
+            handoff_status = "passed" if isinstance(handoff, dict) and handoff.get("success") else "failed"
+            continuation_status = ""
+            if isinstance(continuation, dict):
+                continuation_status = (
+                    f" -> continuation {continuation.get('status', 'unknown')} ({continuation.get('stop_reason', 'unknown')})"
+                )
+            approval_text = f" -> approval {approval_id} applied" if approval_id else ""
+            lines.append(
+                f"- Cycle {cycle_number}: handoff {handoff_status}{approval_text}{continuation_status}"
+            )
+    else:
+        lines.append("- No autopilot cycles ran.")
+
+    return "\n".join(lines)
+
+
 def _render_execute_handoff_summary(
     *,
     engine: str,
@@ -908,6 +1379,8 @@ def _render_execute_handoff_summary(
     patch_text: str,
     verification_result: object,
     failure_context_path: Path | None,
+    approval_payload: dict[str, object] | None = None,
+    approval_error: str | None = None,
 ) -> str:
     success = bool(getattr(verification_result, "success", False))
     patch_returncode = getattr(verification_result, "patch_returncode", None)
@@ -933,10 +1406,18 @@ def _render_execute_handoff_summary(
     else:
         lines.append(f"- Test exit code: {test_returncode}")
 
+    if approval_payload is not None:
+        approval_id = str(approval_payload.get("approval_id", "")).strip()
+        change_count = int(approval_payload.get("change_count", 1) or 1)
+        lines.append(f"- Approval: {approval_id}")
+        lines.append(f"- Approval scope: {change_count} file(s)")
+    elif approval_error:
+        lines.append(f"- Approval creation: failed ({approval_error})")
+
     if failure_context_path is not None:
         lines.append(f"- Failure log: {failure_context_path}")
     lines.append(
-        f"- Next step: {_render_execute_handoff_next_step(success=success, patch_returncode=patch_returncode, test_returncode=test_returncode)}"
+        f"- Next step: {_render_execute_handoff_next_step(success=success, patch_returncode=patch_returncode, test_returncode=test_returncode, approval_payload=approval_payload, approval_error=approval_error)}"
     )
     return "\n".join(lines)
 
@@ -992,7 +1473,17 @@ def _render_execute_handoff_next_step(
     success: bool,
     patch_returncode: int | None,
     test_returncode: int | None,
+    approval_payload: dict[str, object] | None = None,
+    approval_error: str | None = None,
 ) -> str:
+    if success and approval_payload is not None:
+        approval_id = str(approval_payload.get("approval_id", "")).strip() or "<approval_id>"
+        return (
+            f"review the verified patch with `teamai approvals show {approval_id}` "
+            f"and apply it with `teamai approvals apply {approval_id}`."
+        )
+    if success and approval_error:
+        return "patch verified successfully, but approval creation failed. Inspect the patch manually before applying it."
     if success:
         return "patch verified successfully in sandbox. Ready for human review."
     if patch_returncode not in (None, 0):

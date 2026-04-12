@@ -132,12 +132,21 @@ class CodexBridgeExecutionTest(unittest.TestCase):
             with patch("teamai.integrations.codex_bridge._create_openai_client", return_value=client), patch(
                 "teamai.integrations.codex_bridge.verify_patch",
                 return_value=verification,
+            ), patch(
+                "teamai.integrations.codex_bridge.PatchApprovalStore.create_bundle_from_patch",
+                return_value={"approval_id": "approval123", "change_count": 1},
             ), patch("teamai.integrations.codex_bridge.Sandbox") as sandbox_cls:
-                sandbox_cls.return_value.__enter__.return_value = object()
+                sandbox_cls.return_value.__enter__.return_value = type(
+                    "_Sandbox",
+                    (),
+                    {"path": project_root},
+                )()
                 result = execute_verified_codex_handoff(project_root=project_root)
 
             self.assertTrue(result.verification.success)
             self.assertFalse(failure_context_path.exists())
+            self.assertEqual(result.approval, {"approval_id": "approval123", "change_count": 1})
+            self.assertIsNone(result.approval_error)
             sandbox_cls.assert_called_once_with(project_root.resolve())
 
     def test_execute_verified_codex_handoff_persists_failure_context_after_failed_verification(self) -> None:

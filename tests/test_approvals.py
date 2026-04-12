@@ -90,6 +90,46 @@ class PatchApprovalStoreTest(unittest.TestCase):
         self.assertIn(str(approval["approval_id"]), task)
         self.assertEqual(self.store.continuation_execution_mode(approval), "workspace_write")
 
+    def test_create_bundle_from_patch_applies_multiple_files_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as sandbox_dir:
+            sandbox_root = Path(sandbox_dir)
+            (self.workspace / "alpha.txt").write_text("alpha old\n", encoding="utf-8")
+            (self.workspace / "beta.txt").write_text("beta old\n", encoding="utf-8")
+            (sandbox_root / "alpha.txt").write_text("alpha new\n", encoding="utf-8")
+            (sandbox_root / "beta.txt").write_text("beta new\n", encoding="utf-8")
+            patch_text = "\n".join(
+                [
+                    "diff --git a/alpha.txt b/alpha.txt",
+                    "--- a/alpha.txt",
+                    "+++ b/alpha.txt",
+                    "@@ -1 +1 @@",
+                    "-alpha old",
+                    "+alpha new",
+                    "diff --git a/beta.txt b/beta.txt",
+                    "--- a/beta.txt",
+                    "+++ b/beta.txt",
+                    "@@ -1 +1 @@",
+                    "-beta old",
+                    "+beta new",
+                    "",
+                ]
+            )
+
+            approval = self.store.create_bundle_from_patch(
+                workspace=self.workspace,
+                sandbox_root=sandbox_root,
+                patch_text=patch_text,
+                reason="verified handoff patch",
+                source_tool="verified_codex_handoff",
+            )
+            applied = self.store.apply(workspace=self.workspace, approval_id=str(approval["approval_id"]))
+
+        self.assertEqual(approval["change_count"], 2)
+        self.assertEqual(approval["path"], "<multiple files>")
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual((self.workspace / "alpha.txt").read_text(encoding="utf-8"), "alpha new\n")
+        self.assertEqual((self.workspace / "beta.txt").read_text(encoding="utf-8"), "beta new\n")
+
     def test_build_continuation_context_includes_scoped_verification_details(self) -> None:
         (self.workspace / "teamai").mkdir()
         (self.workspace / "teamai" / "api.py").write_text("print('demo')\n", encoding="utf-8")

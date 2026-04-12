@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..approvals import PatchApprovalStore
 from ..codex_prompts import build_codex_handoff_prompt
 from ..sandbox import Sandbox
 from ..schemas import CodexHandoffPayload
@@ -31,6 +32,8 @@ class VerifiedCodexHandoffExecutionResult:
     execution: CodexHandoffExecutionResult
     verification: VerificationResult
     failure_context_file: Path
+    approval: dict[str, Any] | None = None
+    approval_error: str | None = None
 
 
 def execute_codex_handoff(
@@ -86,9 +89,27 @@ def execute_verified_codex_handoff(
         model=model,
     )
     failure_context_path = _resolve_project_path(project_root, failure_context_file)
+    approval: dict[str, Any] | None = None
+    approval_error: str | None = None
+    payload = CodexHandoffPayload.model_validate_json(execution.payload_file.read_text(encoding="utf-8"))
 
     with Sandbox(project_root) as sandbox:
         verification = verify_patch(execution.patch_file, sandbox)
+        if verification.success:
+            try:
+                approval = PatchApprovalStore().create_bundle_from_patch(
+                    workspace=project_root,
+                    sandbox_root=sandbox.path,
+                    patch_text=execution.patch_text,
+                    reason=f"Verified Codex handoff patch for: {payload.original_task}",
+                    source_tool="verified_codex_handoff",
+                    continuation={
+                        "original_task": payload.original_task,
+                        "requested_execution_mode": "workspace_write",
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - defensive surface
+                approval_error = str(exc)
 
     if verification.success:
         if failure_context_path.exists():
@@ -101,6 +122,8 @@ def execute_verified_codex_handoff(
         execution=execution,
         verification=verification,
         failure_context_file=failure_context_path,
+        approval=approval,
+        approval_error=approval_error,
     )
 
 

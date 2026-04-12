@@ -159,6 +159,7 @@ class PatchApprovalStore:
             raise ValueError(f"Patch approval `{approval_id}` is not pending.")
 
         changes = self._approval_changes(payload)
+        validated_changes: list[tuple[dict[str, Any], Path, bool, str]] = []
         for change in changes:
             target = self._resolve_change_target(workspace, change["path"])
             before_exists = bool(change.get("before_exists", False))
@@ -180,14 +181,33 @@ class PatchApprovalStore:
                 )
                 self._write_record(workspace, payload)
                 raise ValueError(f"Patch approval `{approval_id}` is stale because {change['path']} changed.")
+            validated_changes.append((change, target, current_exists, current_text))
 
-        for change in changes:
-            target = self._resolve_change_target(workspace, change["path"])
-            if bool(change.get("after_exists", True)):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(change.get("after_text", "")), encoding="utf-8")
-            elif target.exists():
-                target.unlink()
+        applied_states: list[tuple[Path, bool, str]] = []
+        try:
+            for change, target, current_exists, current_text in validated_changes:
+                applied_states.append((target, current_exists, current_text))
+                if bool(change.get("after_exists", True)):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(change.get("after_text", "")), encoding="utf-8")
+                elif target.exists():
+                    target.unlink()
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for target, original_exists, original_text in reversed(applied_states):
+                try:
+                    self._restore_target_state(
+                        target=target,
+                        before_exists=original_exists,
+                        before_text=original_text,
+                    )
+                except Exception as rollback_exc:  # pragma: no cover - defensive surface
+                    rollback_errors.append(f"{target}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"Patch approval `{approval_id}` apply failed and rollback also failed: {'; '.join(rollback_errors)}"
+                ) from exc
+            raise
 
         payload["status"] = "applied"
         payload["applied_at"] = datetime.now(timezone.utc).isoformat()
@@ -539,8 +559,8 @@ class PatchApprovalStore:
                 workspace=workspace,
                 sandbox_root=sandbox_root,
                 path=path,
-                before_path=before_path or path,
-                after_path=after_path or path,
+                before_path=before_path,
+                after_path=after_path,
             )
         ]
 
@@ -574,6 +594,15 @@ class PatchApprovalStore:
             "before_text": before_text,
             "after_text": after_text,
         }
+
+    @staticmethod
+    def _restore_target_state(*, target: Path, before_exists: bool, before_text: str) -> None:
+        if before_exists:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(before_text, encoding="utf-8")
+            return
+        if target.exists():
+            target.unlink()
 
     def _write_record(self, workspace: Path, payload: dict[str, Any]) -> None:
         directory = self._approvals_dir(workspace)

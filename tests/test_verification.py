@@ -75,6 +75,60 @@ class VerificationTest(unittest.TestCase):
             self.assertEqual(len(result.commands_run), 1)
             self.assertTrue(result.commands_run[0].endswith("-m py_compile calc.py"))
 
+    def test_verify_patch_verifies_delete_patches_in_deleted_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir) / "repo"
+            project_root.mkdir(parents=True, exist_ok=True)
+            (project_root / "dead.py").write_text("print('x')\n", encoding="utf-8")
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_smoke.py").write_text(
+                "\n".join(
+                    [
+                        "from __future__ import annotations",
+                        "",
+                        "import unittest",
+                        "",
+                        "",
+                        "class SmokeTest(unittest.TestCase):",
+                        "    def test_ok(self) -> None:",
+                        "        self.assertTrue(True)",
+                        "",
+                        "",
+                        "if __name__ == '__main__':",
+                        "    unittest.main()",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            venv_bin = project_root / ".venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            (venv_bin / "python").symlink_to(Path(sys.executable))
+            patch_file = project_root / "delete.patch"
+            patch_file.write_text(
+                "\n".join(
+                    [
+                        "diff --git a/dead.py b/dead.py",
+                        "deleted file mode 100644",
+                        "--- a/dead.py",
+                        "+++ /dev/null",
+                        "@@ -1 +0,0 @@",
+                        "-print('x')",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with Sandbox(project_root) as sandbox:
+                result = verify_patch(patch_file, sandbox)
+                self.assertFalse((sandbox.path / "dead.py").exists())
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.patch_returncode, 0)
+            self.assertEqual(result.test_returncode, 0)
+
     def _create_repo_fixture(self, project_root: Path, *, replacement: str) -> Path:
         project_root.mkdir(parents=True, exist_ok=True)
         (project_root / "calc.py").write_text("def answer():\n    return 1\n", encoding="utf-8")

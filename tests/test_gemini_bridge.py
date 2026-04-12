@@ -20,7 +20,7 @@ class GeminiBridgeTest(unittest.TestCase):
             payload_path.parent.mkdir(parents=True, exist_ok=True)
             payload_path.write_text("{}", encoding="utf-8")
 
-            with patch.dict("os.environ", {}, clear=False):
+            with patch.dict("os.environ", {}, clear=True):
                 with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY is not set"):
                     execute_gemini_handoff(
                         project_root=project_root,

@@ -130,6 +130,72 @@ class PatchApprovalStoreTest(unittest.TestCase):
         self.assertEqual((self.workspace / "alpha.txt").read_text(encoding="utf-8"), "alpha new\n")
         self.assertEqual((self.workspace / "beta.txt").read_text(encoding="utf-8"), "beta new\n")
 
+    def test_apply_bundle_does_not_partially_mutate_workspace_on_write_failure(self) -> None:
+        (self.workspace / "alpha.txt").write_text("alpha old\n", encoding="utf-8")
+        (self.workspace / "dir").write_text("blocking file\n", encoding="utf-8")
+        approval = self.store.create_bundle(
+            workspace=self.workspace,
+            changes=[
+                {
+                    "path": "alpha.txt",
+                    "before_exists": True,
+                    "after_exists": True,
+                    "before_text": "alpha old\n",
+                    "after_text": "alpha new\n",
+                },
+                {
+                    "path": "dir/beta.txt",
+                    "before_exists": False,
+                    "after_exists": True,
+                    "before_text": "",
+                    "after_text": "beta new\n",
+                },
+            ],
+            reason="verified handoff patch",
+            source_tool="verified_codex_handoff",
+        )
+
+        with self.assertRaises(FileExistsError):
+            self.store.apply(workspace=self.workspace, approval_id=str(approval["approval_id"]))
+
+        self.assertEqual((self.workspace / "alpha.txt").read_text(encoding="utf-8"), "alpha old\n")
+        self.assertEqual(
+            self.store.get(workspace=self.workspace, approval_id=str(approval["approval_id"]))["status"],
+            "pending",
+        )
+
+    def test_create_bundle_from_patch_preserves_delete_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as sandbox_dir:
+            sandbox_root = Path(sandbox_dir)
+            (self.workspace / "dead.txt").write_text("obsolete\n", encoding="utf-8")
+            patch_text = "\n".join(
+                [
+                    "diff --git a/dead.txt b/dead.txt",
+                    "deleted file mode 100644",
+                    "--- a/dead.txt",
+                    "+++ /dev/null",
+                    "@@ -1 +0,0 @@",
+                    "-obsolete",
+                    "",
+                ]
+            )
+
+            approval = self.store.create_bundle_from_patch(
+                workspace=self.workspace,
+                sandbox_root=sandbox_root,
+                patch_text=patch_text,
+                reason="verified handoff patch",
+                source_tool="verified_codex_handoff",
+            )
+            change = approval["changes"][0]
+            applied = self.store.apply(workspace=self.workspace, approval_id=str(approval["approval_id"]))
+
+        self.assertTrue(change["before_exists"])
+        self.assertFalse(change["after_exists"])
+        self.assertEqual(change["after_text"], "")
+        self.assertEqual(applied["status"], "applied")
+        self.assertFalse((self.workspace / "dead.txt").exists())
+
     def test_build_continuation_context_includes_scoped_verification_details(self) -> None:
         (self.workspace / "teamai").mkdir()
         (self.workspace / "teamai" / "api.py").write_text("print('demo')\n", encoding="utf-8")

@@ -22,7 +22,9 @@ class VerificationResult:
 def verify_patch(patch_file: Path, sandbox: Sandbox) -> VerificationResult:
     patch_path = patch_file.resolve()
     patch_text = patch_path.read_text(encoding="utf-8")
-    patch_result = sandbox.run(f"patch -p1 < {shlex.quote(str(patch_path))}")
+    # `-E` removes files whose post-patch contents are empty, which keeps
+    # delete hunks aligned with the state we'll later apply to the workspace.
+    patch_result = sandbox.run(f"patch -p1 -E < {shlex.quote(str(patch_path))}")
     if patch_result.returncode != 0:
         return VerificationResult(
             success=False,

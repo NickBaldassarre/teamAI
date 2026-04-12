@@ -51,7 +51,7 @@ Hard limits:
 - do not invent tools
 - prefer read-only inspection before any write
 - only use write tools if execution mode is `workspace_write`
-- write tools create pending patch approvals instead of changing files immediately
+- write tools are governed by the active write policy and may either create an approval or apply directly in a sandbox
 - if a patch approval is pending, do not claim the task is complete
 - if the task is not solved, return at least one concrete action
 - do not ask for permission or tell another agent to execute a command; choose the action yourself
@@ -66,7 +66,7 @@ Return ONLY valid JSON matching this schema:
   "final_answer": null,
   "actions": [
     {{
-      "tool": "list_files | search_text | read_file | run_command | write_file | replace_in_file",
+      "tool": "list_files | search_text | read_file | run_command | write_file | replace_in_file | apply_patch | run_checks | create_branch | git_add | git_commit | git_restore",
       "reason": "why this action matters",
       "args": {{}}
     }}
@@ -122,7 +122,7 @@ PLANNER_JSON_SCHEMA = """{
   "final_answer": null,
   "actions": [
     {
-      "tool": "list_files | search_text | read_file | run_command | write_file | replace_in_file",
+      "tool": "list_files | search_text | read_file | run_command | write_file | replace_in_file | apply_patch | run_checks | create_branch | git_add | git_commit | git_restore",
       "reason": "why this action matters",
       "args": {}
     }
@@ -167,6 +167,7 @@ def build_round_context(
     latest_observations: str,
     recent_actions: str,
     suggested_paths: str,
+    context_package: str,
 ) -> str:
     global_section = f"\nGlobal cross-workspace lessons:\n{global_memory}\n" if global_memory else ""
     return f"""Task:
@@ -197,6 +198,9 @@ Recent successful actions:
 
 Likely next real paths:
 {suggested_paths}
+
+Deterministic context package:
+{context_package}
 
 Latest observations:
 {latest_observations}

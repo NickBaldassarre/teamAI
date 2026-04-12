@@ -7,14 +7,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .agent_registry import RouteHealth
+
 
 if TYPE_CHECKING:
-    from .schemas import RoundRecord
+    from .schemas import AutonomousRunState, RoundRecord
 
 
 STATE_DIR_NAME = ".teamai"
 RUN_HISTORY_FILE_NAME = "run-history.jsonl"
 MEMORY_FILE_NAME = "memory.md"
+POLICY_MEMORY_FILE_NAME = "policy-memory.json"
+AGENT_POLICY_MEMORY_FILE_NAME = "agent-policy-memory.json"
 MAX_HISTORY_ENTRIES = 50
 MAX_CONTEXT_RUNS = 5
 MAX_MEMORY_CHARS = 4_000
@@ -90,6 +94,7 @@ class WorkspaceMemoryStore:
         task_route: str = "multi_agent_loop",
         execution_mode: str = "read_only",
         rounds: list[RoundRecord] | None = None,
+        run_state: AutonomousRunState | None = None,
     ) -> None:
         state_dir = self._state_dir(workspace)
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +103,11 @@ class WorkspaceMemoryStore:
         summary, next_tasks = self._extract_summary_and_tasks(final_answer)
         successful_action_count, failed_action_count, saw_unittest = self._count_tool_results(rounds)
         approval_created = stop_reason == "approval_required" or self._has_pending_approval(rounds)
+        json_repair_count, structured_response_count = self._count_json_repairs(rounds)
+        json_repair_rate = (
+            json_repair_count / structured_response_count if structured_response_count else 0.0
+        )
+        memory_pressure = any("memory pressure" in warning.lower() for warning in warnings)
         improvement_notes = self._derive_improvement_notes(
             task=task,
             task_route=task_route,
@@ -110,10 +120,17 @@ class WorkspaceMemoryStore:
             saw_unittest=saw_unittest,
         )
         records = self._load_history_records(workspace)
+        retry_count = 0.0
+        verifier_disagreement_rate = 0.0
+        if run_state is not None:
+            retry_count = float(run_state.metrics.get("retry_count", 0.0))
+            verifier_disagreement_rate = float(run_state.metrics.get("verifier_disagreement_rate", 0.0))
+        task_tags = sorted(self._task_tags(task))
         records.append(
             {
                 "completed_at": completed_at.isoformat(),
                 "task": task,
+                "task_tags": task_tags,
                 "status": status,
                 "stop_reason": stop_reason,
                 "task_route": task_route,
@@ -125,6 +142,13 @@ class WorkspaceMemoryStore:
                 "successful_action_count": successful_action_count,
                 "failed_action_count": failed_action_count,
                 "approval_created": approval_created,
+                "json_repair_count": json_repair_count,
+                "structured_response_count": structured_response_count,
+                "json_repair_rate": round(json_repair_rate, 4),
+                "memory_pressure": memory_pressure,
+                "retry_count": retry_count,
+                "verifier_disagreement_rate": verifier_disagreement_rate,
+                "policy_mode": getattr(run_state, "policy_mode", execution_mode),
                 "improvement_notes": improvement_notes,
             }
         )
@@ -136,8 +160,140 @@ class WorkspaceMemoryStore:
 
         memory_path = state_dir / MEMORY_FILE_NAME
         memory_path.write_text(self._render_memory_markdown(records), encoding="utf-8")
+        self._write_policy_memory(workspace, records)
 
-        GlobalMemoryStore().update(improvement_notes)
+        try:
+            GlobalMemoryStore().update(improvement_notes)
+        except OSError:
+            pass
+
+    def load_routing_health(
+        self,
+        workspace: Path,
+        *,
+        recent_window: int = 8,
+        broken_repair_rate: float = 0.35,
+    ) -> dict[str, RouteHealth]:
+        records = self._load_history_records(workspace)
+        per_route: dict[str, list[dict[str, object]]] = {}
+
+        for record in reversed(records):
+            route = str(record.get("task_route", "")).strip()
+            if not route or route == "eval_feedback":
+                continue
+            bucket = per_route.setdefault(route, [])
+            if len(bucket) >= max(recent_window, 1):
+                continue
+            bucket.append(record)
+
+        health: dict[str, RouteHealth] = {}
+        for route, reversed_records in per_route.items():
+            route_records = list(reversed(reversed_records))
+            recent_runs = len(route_records)
+            success_count = sum(1 for record in route_records if self._record_counts_as_success(record))
+            repair_count = sum(self._record_json_repair_count(record) for record in route_records)
+            structured_count = sum(self._record_structured_response_count(record) for record in route_records)
+            repair_rate = repair_count / structured_count if structured_count else 0.0
+            average_retries = (
+                sum(float(record.get("retry_count", 0.0) or 0.0) for record in route_records) / recent_runs
+                if recent_runs
+                else 0.0
+            )
+            verifier_disagreement_rate = (
+                sum(float(record.get("verifier_disagreement_rate", 0.0) or 0.0) for record in route_records) / recent_runs
+                if recent_runs
+                else 0.0
+            )
+            memory_pressure = any(self._record_memory_pressure(record) for record in route_records)
+            health[route] = RouteHealth(
+                capability=route,
+                recent_runs=recent_runs,
+                success_rate=(success_count / recent_runs) if recent_runs else 0.0,
+                repair_rate=repair_rate,
+                average_retries=average_retries,
+                verifier_disagreement_rate=verifier_disagreement_rate,
+                broken=structured_count > 0 and repair_rate >= broken_repair_rate,
+                memory_pressure=memory_pressure,
+            )
+        return health
+
+    def load_policy_scores(
+        self,
+        workspace: Path,
+        *,
+        task: str,
+        complexity: str,
+    ) -> dict[str, float]:
+        policy_path = self._state_dir(workspace) / POLICY_MEMORY_FILE_NAME
+        if not policy_path.exists():
+            return {}
+        try:
+            payload = json.loads(policy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        task_tags = self._task_tags(task)
+        scores: dict[str, float] = {}
+        for capability, entries in payload.items():
+            if not isinstance(entries, list):
+                continue
+            adjustment = 0.0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                tags = {str(tag) for tag in (entry.get("task_tags") or [])}
+                overlap = len(task_tags & tags)
+                if task_tags and overlap == 0:
+                    continue
+                success_rate = float(entry.get("success_rate", 0.0) or 0.0)
+                retry_penalty = float(entry.get("average_retries", 0.0) or 0.0)
+                disagreement_penalty = float(entry.get("verifier_disagreement_rate", 0.0) or 0.0)
+                complexity_match = 1.0 if str(entry.get("complexity", "")) == complexity else 0.5
+                adjustment += (success_rate * 4.0 * complexity_match) + (overlap * 1.5) - retry_penalty - disagreement_penalty
+            if adjustment:
+                scores[str(capability)] = round(adjustment, 2)
+        return scores
+
+    def load_agent_policy_scores(
+        self,
+        workspace: Path,
+        *,
+        task: str,
+        complexity: str,
+    ) -> dict[str, float]:
+        policy_path = self._state_dir(workspace) / AGENT_POLICY_MEMORY_FILE_NAME
+        if not policy_path.exists():
+            return {}
+        try:
+            payload = json.loads(policy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        task_tags = self._task_tags(task)
+        scores: dict[str, float] = {}
+        for key, entries in payload.items():
+            if not isinstance(entries, list):
+                continue
+            adjustment = 0.0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                tags = {str(tag) for tag in (entry.get("task_tags") or [])}
+                overlap = len(task_tags & tags)
+                if task_tags and overlap == 0:
+                    continue
+                success_rate = float(entry.get("success_rate", 0.0) or 0.0)
+                retry_penalty = float(entry.get("average_retries", 0.0) or 0.0)
+                disagreement_penalty = float(entry.get("verifier_disagreement_rate", 0.0) or 0.0)
+                complexity_match = 1.0 if str(entry.get("complexity", "")) == complexity else 0.5
+                adjustment += (success_rate * 5.0 * complexity_match) + overlap - retry_penalty - disagreement_penalty
+            if adjustment:
+                scores[str(key)] = round(adjustment, 2)
+        return scores
 
     def persist_eval_feedback(
         self,
@@ -203,6 +359,79 @@ class WorkspaceMemoryStore:
         memory_path = state_dir / MEMORY_FILE_NAME
         memory_path.write_text(self._render_memory_markdown(records), encoding="utf-8")
 
+    def _write_policy_memory(self, workspace: Path, records: list[dict[str, object]]) -> None:
+        by_capability: dict[str, list[dict[str, object]]] = {}
+        for record in records:
+            capability = str(record.get("task_route", "")).strip()
+            if not capability or capability == "eval_feedback":
+                continue
+            by_capability.setdefault(capability, []).append(record)
+
+        payload: dict[str, list[dict[str, object]]] = {}
+        for capability, route_records in by_capability.items():
+            if not route_records:
+                continue
+            successes = sum(1 for record in route_records if self._record_counts_as_success(record))
+            retry_avg = sum(float(record.get("retry_count", 0.0) or 0.0) for record in route_records) / len(route_records)
+            disagreement_avg = (
+                sum(float(record.get("verifier_disagreement_rate", 0.0) or 0.0) for record in route_records)
+                / len(route_records)
+            )
+            tags: list[str] = []
+            for record in route_records[-6:]:
+                for tag in record.get("task_tags", []) if isinstance(record.get("task_tags"), list) else []:
+                    tag_str = str(tag)
+                    if tag_str not in tags:
+                        tags.append(tag_str)
+            payload[capability] = [
+                {
+                    "task_tags": tags,
+                    "success_rate": successes / len(route_records),
+                    "average_retries": round(retry_avg, 4),
+                    "verifier_disagreement_rate": round(disagreement_avg, 4),
+                    "complexity": self._infer_complexity_from_record(route_records[-1]),
+                }
+            ]
+
+        policy_path = self._state_dir(workspace) / POLICY_MEMORY_FILE_NAME
+        policy_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self._write_agent_policy_memory(workspace, records)
+
+    def _write_agent_policy_memory(self, workspace: Path, records: list[dict[str, object]]) -> None:
+        by_model: dict[str, list[dict[str, object]]] = {}
+        for record in records:
+            model_id = str(record.get("model_id", "")).strip()
+            if not model_id or str(record.get("task_route", "")).strip() == "eval_feedback":
+                continue
+            by_model.setdefault(model_id, []).append(record)
+
+        payload: dict[str, list[dict[str, object]]] = {}
+        for model_id, model_records in by_model.items():
+            successes = sum(1 for record in model_records if self._record_counts_as_success(record))
+            retry_avg = sum(float(record.get("retry_count", 0.0) or 0.0) for record in model_records) / len(model_records)
+            disagreement_avg = (
+                sum(float(record.get("verifier_disagreement_rate", 0.0) or 0.0) for record in model_records)
+                / len(model_records)
+            )
+            tags: list[str] = []
+            for record in model_records[-6:]:
+                for tag in record.get("task_tags", []) if isinstance(record.get("task_tags"), list) else []:
+                    tag_str = str(tag)
+                    if tag_str not in tags:
+                        tags.append(tag_str)
+            payload[model_id] = [
+                {
+                    "task_tags": tags,
+                    "success_rate": successes / len(model_records),
+                    "average_retries": round(retry_avg, 4),
+                    "verifier_disagreement_rate": round(disagreement_avg, 4),
+                    "complexity": self._infer_complexity_from_record(model_records[-1]),
+                }
+            ]
+
+        agent_policy_path = self._state_dir(workspace) / AGENT_POLICY_MEMORY_FILE_NAME
+        agent_policy_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
     def _load_history_records(self, workspace: Path) -> list[dict[str, object]]:
         history_path = self._state_dir(workspace) / RUN_HISTORY_FILE_NAME
         if not history_path.exists():
@@ -220,6 +449,88 @@ class WorkspaceMemoryStore:
             if isinstance(payload, dict):
                 records.append(payload)
         return records[-MAX_HISTORY_ENTRIES:]
+
+    @staticmethod
+    def _record_counts_as_success(record: dict[str, object]) -> bool:
+        status = str(record.get("status", "")).strip()
+        stop_reason = str(record.get("stop_reason", "")).strip()
+        return status == "completed" or stop_reason == "approval_required"
+
+    @staticmethod
+    def _record_json_repair_count(record: dict[str, object]) -> int:
+        try:
+            stored = int(record.get("json_repair_count", 0) or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        if stored > 0:
+            return stored
+
+        warnings = record.get("warnings") or []
+        if isinstance(warnings, list):
+            return sum(
+                1
+                for warning in warnings
+                if isinstance(warning, str) and "json required repair" in warning.lower()
+            )
+        return 0
+
+    @staticmethod
+    def _record_structured_response_count(record: dict[str, object]) -> int:
+        try:
+            stored = int(record.get("structured_response_count", 0) or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        if stored > 0:
+            return stored
+
+        task_route = str(record.get("task_route", "")).strip()
+        if task_route in {"deterministic_patch", "repository_inspection", "write_disabled_preflight"}:
+            return 0
+        return 2
+
+    @staticmethod
+    def _record_memory_pressure(record: dict[str, object]) -> bool:
+        if bool(record.get("memory_pressure", False)):
+            return True
+        warnings = record.get("warnings") or []
+        return isinstance(warnings, list) and any(
+            isinstance(warning, str) and "memory pressure" in warning.lower()
+            for warning in warnings
+        )
+
+    @staticmethod
+    def _infer_complexity_from_record(record: dict[str, object]) -> str:
+        task = str(record.get("task", "")).lower()
+        if any(marker in task for marker in ("refactor", "architecture", "multi-file", "cross-file", "end-to-end")):
+            return "high"
+        if any(marker in task for marker in ("implement", "fix", "repair", "update", "wire")):
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _task_tags(task: str) -> set[str]:
+        lowered = task.lower()
+        tags: set[str] = set()
+        for marker in (
+            "typescript",
+            "python",
+            "refactor",
+            "import",
+            "test",
+            "cli",
+            "api",
+            "routing",
+            "handoff",
+            "memory",
+            "write",
+            "approval",
+            "sandbox",
+        ):
+            if marker in lowered:
+                tags.add(marker)
+        for match in re.finditer(r"\b[\w./-]+\.(py|ts|tsx|js|jsx|md|json|toml|yaml|yml)\b", lowered):
+            tags.add(match.group(0))
+        return tags
 
     @staticmethod
     def _state_dir(workspace: Path) -> Path:
@@ -240,6 +551,17 @@ class WorkspaceMemoryStore:
             if stripped.startswith("- "):
                 tasks.append(stripped[2:].strip())
         return summary, tasks
+
+    @staticmethod
+    def _count_json_repairs(rounds: list[RoundRecord]) -> tuple[int, int]:
+        total_repairs = 0
+        structured_turns = 0
+        for record in rounds:
+            total_repairs += max(int(getattr(record, "planner_json_repairs", 0) or 0), 0)
+            total_repairs += max(int(getattr(record, "verifier_json_repairs", 0) or 0), 0)
+            if getattr(record, "reasoning_source", "model") == "model":
+                structured_turns += 2
+        return total_repairs, structured_turns
 
     @staticmethod
     def _render_recent_runs_text(records: list[dict[str, object]]) -> str:

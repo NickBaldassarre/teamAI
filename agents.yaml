@@ -17,95 +17,98 @@
 
 agents:
 
+  - id: deterministic_patcher
+    name: "Deterministic Patch Compiler"
+    type: deterministic
+    model_id: "deterministic"
+    capabilities:
+      - deterministic_patch
+    max_context_tokens: 0
+    cost: free
+    latency: low
+    requires_env: []
+    notes: >
+      Compiler-backed narrow write route. Produces approval-gated patches
+      without invoking a model and must always be labeled deterministic.
+
+  - id: deterministic_inspector
+    name: "Deterministic Repository Inspector"
+    type: deterministic
+    model_id: "deterministic"
+    capabilities:
+      - repository_inspection
+    max_context_tokens: 0
+    cost: free
+    latency: low
+    requires_env: []
+    notes: >
+      Deterministic repository reconnaissance and synthesis route for
+      inspection-style prompts that do not require model-authored council text.
+
   - id: local_gemma
     name: "Gemma 4 2B 4-bit (Local MLX)"
     type: local_mlx
     model_id: "mlx-community/gemma-4-2b-it-4bit"
     capabilities:
-      - repository_inspection
-      - deterministic_patch
       - multi_agent_loop
+      - codex_handoff
     max_context_tokens: 2048
     cost: free
     latency: low
     requires_env: []
     notes: >
-      Default local agent. Runs fully offline on Apple Silicon via MLX.
-      Best for read-only reconnaissance, narrow patch compilation, and
-      short multi-agent loops. Hands off broad coding tasks to cloud agents.
+      Default local reasoning agent. Runs fully offline on Apple Silicon via MLX.
+      Best for short local multi-agent loops and reconnaissance that prepares a
+      broader verified handoff when needed.
 
   - id: local_gemma_large
     name: "Gemma 4 12B 4-bit (Local MLX)"
     type: local_mlx
     model_id: "mlx-community/gemma-4-12b-it-4bit"
     capabilities:
-      - repository_inspection
-      - deterministic_patch
       - explicit_write_loop
       - multi_agent_loop
+      - codex_handoff
     max_context_tokens: 4096
     cost: free
     latency: medium
     requires_env: []
     notes: >
       Larger local model for machines with 32GB+ unified memory.
-      Can handle explicit write loops that the 2B model struggles with.
+      Can handle explicit write loops and local verified-handoff execution
+      that the 2B model struggles with.
 
   - id: codex
     name: "GPT-5.4 / Codex (OpenAI)"
     type: openai
     model_id: "gpt-5.4"
     capabilities:
-      - codex_handoff
-      - explicit_write_loop
-      - multi_agent_loop
-      - repository_inspection
+      - verified_handoff_execution
     max_context_tokens: 128000
     cost: expensive
     latency: medium
     requires_env:
       - OPENAI_API_KEY
     notes: >
-      Primary cloud agent for complex multi-file coding tasks. Receives
-      a semantic skeleton from the local model and returns a unified diff patch.
-      Used via `teamai execute-handoff --engine codex`.
+      Primary cloud execution engine for complex multi-file coding tasks.
+      Receives a semantic skeleton from the local system and returns a unified
+      diff patch for verification.
 
   - id: gemini_pro
     name: "Gemini 2.5 Pro (Google)"
     type: google
     model_id: "gemini-2.5-pro"
     capabilities:
-      - codex_handoff
-      - explicit_write_loop
-      - repository_inspection
+      - verified_handoff_execution
     max_context_tokens: 1000000
     cost: expensive
     latency: medium
     requires_env:
       - GOOGLE_API_KEY
     notes: >
-      Alternative cloud agent with very large context window. Useful for
-      whole-repository tasks where the full codebase needs to fit in context.
-      Used via `teamai execute-handoff --engine gemini`.
-
-  - id: claude_sonnet
-    name: "Claude Sonnet (Anthropic)"
-    type: anthropic
-    model_id: "claude-sonnet-4-6"
-    capabilities:
-      - codex_handoff
-      - explicit_write_loop
-      - multi_agent_loop
-      - repository_inspection
-    max_context_tokens: 200000
-    cost: moderate
-    latency: low
-    requires_env:
-      - ANTHROPIC_API_KEY
-    notes: >
-      High-quality cloud agent with strong reasoning and coding ability.
-      Well-suited for orchestration tasks, code review, and complex refactors.
-      Can be wired into the execute-handoff pipeline with a custom bridge.
+      Alternative verified-handoff engine with a very large context window.
+      Useful for whole-repository tasks where the full codebase needs to fit
+      in the downstream execution model.
 
 routing:
   # Default local agent used when no cloud agent is specified
@@ -120,3 +123,54 @@ routing:
 
   # If true, prefer cheaper agents when multiple match
   prefer_lower_cost: true
+
+  recent_success_window: 8
+  success_rate_weight: 8
+  repair_rate_weight: 12
+  broken_repair_rate: 0.35
+  broken_route_penalty: 18
+  memory_pressure_penalty: 6
+  local_preference_bonus: 2
+
+  task_profiles:
+    deterministic_patch:
+      base_score: 0
+      score_if:
+        deterministic_candidate: 18
+        workspace_write: 4
+        explicit_write: 5
+        continuation_context: -4
+        repository_inspection: -12
+        broad_coding: -14
+
+    repository_inspection:
+      base_score: 0
+      score_if:
+        repository_inspection: 18
+        read_only: 2
+        explicit_write: -10
+        deterministic_candidate: -10
+        broad_coding: -6
+
+    explicit_write_loop:
+      base_score: 0
+      score_if:
+        explicit_write: 16
+        workspace_write: 4
+        deterministic_candidate: -10
+        repository_inspection: -10
+        broad_coding: -4
+
+    codex_handoff:
+      base_score: 0
+      score_if:
+        broad_coding: 18
+        workspace_write: 2
+        repository_inspection: -8
+        deterministic_candidate: -12
+
+    multi_agent_loop:
+      base_score: 1
+      score_if:
+        continuation_context: 8
+        broad_coding: -4

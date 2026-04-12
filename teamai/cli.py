@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .autonomy import derive_write_policy
 from .schemas import RunEvent, RunResult
 
 
@@ -39,6 +40,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="read_only",
     )
     run_parser.add_argument(
+        "--write-policy",
+        choices=["read_only", "propose_only", "auto_apply_low_risk", "auto_apply_scoped", "full_auto"],
+        default=None,
+        help=(
+            "Explicit write policy. If omitted, CLI `workspace_write` runs default to `auto_apply_low_risk` "
+            "while `read_only` runs stay read-only."
+        ),
+    )
+    run_parser.add_argument(
+        "--auto-commit",
+        action="store_true",
+        help="After a successful autonomous write run, create a git commit when the workspace is a git repo.",
+    )
+    run_parser.add_argument(
+        "--auto-push",
+        action="store_true",
+        help=(
+            "After a successful autonomous write run, push the review branch to the configured remote. "
+            "Requires TEAMAI_ALLOW_GIT_PUSH=true and never pushes to a protected default branch."
+        ),
+    )
+    run_parser.add_argument(
+        "--push-branch",
+        default=None,
+        help="Optional feature-branch override used with --auto-push. Protected default branches are blocked.",
+    )
+    run_parser.add_argument(
         "--stream-format",
         choices=["text", "jsonl"],
         default="text",
@@ -67,15 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-execute-handoff",
         action="store_true",
         help=(
-            "If the run produces a Codex payload for a broad task, immediately execute the cloud handoff, "
+            "If the run produces a handoff payload for a broad task, immediately execute the selected handoff engine, "
             "verify the returned patch in a sandbox, and create a pending approval."
         ),
     )
     run_parser.add_argument(
         "--handoff-engine",
-        choices=["codex", "gemini"],
+        choices=["codex", "gemini", "local"],
         default="codex",
-        help="Cloud execution engine used with `--auto-execute-handoff`.",
+        help="Execution engine used with `--auto-execute-handoff`.",
     )
     run_parser.add_argument(
         "--handoff-model",
@@ -92,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Run a bounded autonomous loop for broad tasks: execute a verified cloud handoff, "
+            "Run a bounded autonomous loop for broad tasks: execute a verified handoff, "
             "auto-apply the verified approval, and continue the task for up to this many cycles."
         ),
     )
@@ -148,6 +176,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to also write the rendered evaluation report.",
     )
+
+    eval_artifacts_parser = subparsers.add_parser(
+        "eval-artifacts-report",
+        help="Regenerate a human-readable eval report from captured status and stdout artifacts.",
+    )
+    eval_artifacts_parser.add_argument("--status-file", required=True)
+    eval_artifacts_parser.add_argument("--stdout-file", required=True)
+    eval_artifacts_parser.add_argument("--output-file", default=None)
 
     serve_parser = subparsers.add_parser("serve", help="Run the local FastAPI service.")
     serve_parser.add_argument("--host", default=None)
@@ -229,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     execute_handoff_parser = subparsers.add_parser(
         "execute-handoff",
-        help="Send the local semantic skeleton to the cloud Codex model, verify the returned patch in a sandbox, and save the patch for review.",
+        help="Send the local semantic skeleton to the selected handoff engine, verify the returned patch in a sandbox, and save the patch for review.",
     )
     execute_handoff_parser.add_argument(
         "--payload-file",
@@ -243,14 +279,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     execute_handoff_parser.add_argument(
         "--engine",
-        choices=["codex", "gemini"],
+        choices=["codex", "gemini", "local"],
         default="codex",
-        help="Which cloud execution engine to use for the handoff.",
+        help="Which execution engine to use for the handoff.",
     )
     execute_handoff_parser.add_argument(
         "--model",
         default=None,
-        help="Optional cloud model override. Defaults to TEAMAI_CODEX_MODEL or gpt-5.4.",
+        help="Optional model override for the selected handoff engine.",
     )
 
     approvals_parser = subparsers.add_parser(
@@ -390,6 +426,9 @@ def main() -> int:
         from .supervisor import ClosedLoopSupervisor
 
         settings = Settings.from_env()
+        requested_write_policy = args.write_policy
+        if requested_write_policy is None and args.execution_mode == "workspace_write":
+            requested_write_policy = "auto_apply_low_risk"
         request = RunRequest(
             task=args.task,
             workspace_path=args.workspace,
@@ -398,6 +437,16 @@ def main() -> int:
             max_tokens_per_turn=args.max_tokens,
             temperature=args.temperature,
             execution_mode=args.execution_mode,
+            write_policy=derive_write_policy(
+                execution_mode=args.execution_mode,
+                requested_policy=requested_write_policy,
+            ),
+            auto_commit=bool(args.auto_commit),
+            auto_push=bool(args.auto_push),
+            push_remote="origin",
+            push_branch_name=args.push_branch,
+            handoff_engine=args.handoff_engine,
+            handoff_model=args.handoff_model,
         )
         progress_callback, event_callback, close_event_stream = _build_run_stream_handlers(
             project_root=Path.cwd().resolve(),
@@ -453,7 +502,7 @@ def main() -> int:
         elif getattr(args, "auto_execute_handoff", False):
             if payload_path is None:
                 print(
-                    "[teamai] Auto handoff requested, but this run did not produce a Codex payload.",
+                    "[teamai] Auto handoff requested, but this run did not produce a handoff payload.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -557,7 +606,7 @@ def main() -> int:
             )
         elif getattr(args, "follow_up", False) and auto_handoff_executed:
             print(
-                "[teamai] Skipping --follow-up because the run already continued into verified cloud handoff.",
+                "[teamai] Skipping --follow-up because the run already continued into a verified handoff.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -638,6 +687,22 @@ def main() -> int:
         _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
         print(rendered_output)
         return 0 if report.metrics.failed_cases == 0 else 1
+
+    if args.command == "eval-artifacts-report":
+        from .evals import render_eval_artifact_markdown
+
+        project_root = Path.cwd().resolve()
+        status_path = _resolve_cli_path(project_root, args.status_file)
+        stdout_path = _resolve_cli_path(project_root, args.stdout_file)
+        status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+        stdout_text = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+        rendered_output = render_eval_artifact_markdown(
+            status_payload=status_payload if isinstance(status_payload, dict) else {},
+            stdout_text=stdout_text,
+        )
+        _write_cli_output(rendered_output=rendered_output, output_file=args.output_file)
+        print(rendered_output)
+        return 0
 
     if args.command == "serve":
         from .api import create_app
@@ -1061,65 +1126,23 @@ def _execute_verified_handoff_workflow(
     model: str | None = None,
 ) -> dict[str, Any]:
     project_root = project_root.resolve()
-    payload_path = _resolve_cli_path(project_root, str(payload_file))
-    patch_path = _resolve_cli_path(project_root, str(patch_file))
-    failure_context_path = project_root / ".teamai" / "failure_context.log"
-    approval_payload = None
-    approval_error = None
+    from .integrations import get_bridge
 
-    if engine == "gemini":
-        from .approvals import PatchApprovalStore
-        from .integrations.gemini_bridge import execute_gemini_handoff
-        from .schemas import CodexHandoffPayload
-        from .verification import Sandbox, verify_patch
-
-        execution_result = execute_gemini_handoff(
-            project_root=project_root,
-            payload_file=payload_file,
-            patch_file=patch_file,
-            model=model or "gemini-2.5-pro",
-        )
-        payload_path = execution_result.payload_file
-        patch_path = execution_result.patch_file
-        model_name = execution_result.model
-        patch_text = execution_result.patch_text
-        with Sandbox(project_root) as sandbox:
-            verification_result = verify_patch(patch_path, sandbox)
-            if verification_result.success:
-                try:
-                    payload = CodexHandoffPayload.model_validate_json(
-                        payload_path.read_text(encoding="utf-8")
-                    )
-                    approval_payload = PatchApprovalStore().create_bundle_from_patch(
-                        workspace=project_root,
-                        sandbox_root=sandbox.path,
-                        patch_text=patch_text,
-                        reason=f"Verified Gemini handoff patch for: {payload.original_task}",
-                        source_tool="verified_codex_handoff",
-                        continuation={
-                            "original_task": payload.original_task,
-                            "requested_execution_mode": "workspace_write",
-                        },
-                    )
-                except Exception as exc:  # pragma: no cover - defensive surface
-                    approval_error = str(exc)
-    else:
-        from .integrations.codex_bridge import execute_verified_codex_handoff
-
-        verified_result = execute_verified_codex_handoff(
-            project_root=project_root,
-            payload_file=payload_file,
-            patch_file=patch_file,
-            model=model or "gpt-5.4",
-        )
-        payload_path = verified_result.execution.payload_file
-        patch_path = verified_result.execution.patch_file
-        model_name = verified_result.execution.model
-        patch_text = verified_result.execution.patch_text
-        verification_result = verified_result.verification
-        failure_context_path = verified_result.failure_context_file
-        approval_payload = getattr(verified_result, "approval", None)
-        approval_error = getattr(verified_result, "approval_error", None)
+    bridge = get_bridge(engine)
+    verified_result = bridge.execute_verified(
+        project_root=project_root,
+        payload_file=payload_file,
+        patch_file=patch_file,
+        model=model,
+    )
+    payload_path = verified_result.execution.payload_file
+    patch_path = verified_result.execution.patch_file
+    model_name = verified_result.execution.model
+    patch_text = verified_result.execution.patch_text
+    verification_result = verified_result.verification
+    failure_context_path = verified_result.failure_context_file
+    approval_payload = getattr(verified_result, "approval", None)
+    approval_error = getattr(verified_result, "approval_error", None)
 
     failure_context_path = _sync_failure_context_log(
         verification_result=verification_result,

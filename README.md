@@ -221,7 +221,7 @@ teamai run "Update the README after inspecting the codebase." --workspace . --ex
 
 If you request `workspace_write` while writes are disabled, `teamai run` now fails fast with a preflight-style error instead of silently downgrading to `read_only`.
 
-In `workspace_write` mode, write actions no longer mutate files immediately. They create pending patch approvals under `.teamai/approvals/`, stop the run with `approval_required`, and tell you how to review or apply the patch.
+In `workspace_write` mode, the default runtime policy is now `auto_apply_low_risk`. Read-only inspection, scoped checks, and small low-risk source or test patches inside allowed paths can apply automatically when verification is green. High-risk paths, larger patches, and unresolved verification still create pending approvals under `.teamai/approvals/`.
 
 Pending approvals may become stale if the target file changes before approval.
 
@@ -236,9 +236,11 @@ For narrow explicit edit requests, the supervisor now tries to compile determini
 - appending a missing `.env` key assignment when the requested setting is absent
 - inserting a fenced test or method block into an existing Python class
 
-Broader implementation requests are now routed differently: if the task looks too open-ended for a safe local patch flow, the run stays in reconnaissance mode and produces a Codex-oriented handoff instead of trying to autonomously carry the full change.
+Broader implementation requests are now routed differently: the supervisor first tries to escalate inline. It can switch from a weaker local model to a stronger local model, or execute a verified handoff inline and consume the revised patch inside the same autonomous run state instead of dumping a patch to disk and stopping.
 
-The supervisor also bails out earlier now when a local coding run starts drifting. In practice that means broader "improve/harden/optimize" tasks get routed to reconnaissance sooner, and explicit write loops that read the target but still fail to produce a concrete patch after repeated low-confidence rounds will stop early with a Codex-oriented handoff instead of spending the full round budget wandering.
+The supervisor also bails out earlier now when a local coding run starts drifting. Repeated repair failures, malformed planner JSON, low verifier confidence, and complexity or context pressure can now trigger inline escalation to a stronger model instead of stalling on the weaker local route.
+
+For successful write runs in git repos, `--auto-commit` creates a deterministic `teamai/<task-id>` branch and commit. `--auto-push` can also push that review branch to `origin`, but only when `TEAMAI_ALLOW_GIT_PUSH=true`, verification is green, and the target is not a protected default branch.
 
 List pending approvals:
 
@@ -385,6 +387,19 @@ For the most realistic live Gemma smoke test on macOS, use the tracked `run-smok
 ```
 
 That script launches each case through the same bridge path used for real local handoff runs, asserts that the local MLX runtime is healthy before starting, and writes the authoritative JSON report to `.teamai/evals/live-smoke-report.json`.
+
+To run the new real end-to-end autonomous integration test locally, enable the existing MLX gate and run:
+
+```bash
+TEAMAI_RUN_REAL_MLX_TESTS=1 ./.venv/bin/python -m unittest tests.test_real_autonomy_integration
+```
+
+Optional overrides:
+
+- `TEAMAI_REAL_AUTONOMY_MODEL=<model-id>` to force a stronger local model for the integration test
+- `TEAMAI_ALLOW_WRITES=true` is not required for the test itself because the test constructs a write-enabled `Settings` object internally
+
+That test creates a temporary git repo, submits a real coding task to the autonomous loop, lets the model edit files and run checks, and requires a real commit before it passes.
 
 That mode launches each case through the same bridge path used for real local handoff runs and treats the Terminal-side result artifact as the source of truth.
 

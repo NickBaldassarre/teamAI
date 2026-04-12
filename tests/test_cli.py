@@ -274,6 +274,87 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertEqual(payload["completed_cycles"], 1)
             self.assertEqual(payload["cycles"][0]["approval"]["approval_id"], "approval123")
 
+    def test_run_autopilot_workflow_accepts_local_handoff_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            initial_result = RunResult(
+                status="completed",
+                model_id="dummy",
+                workspace=str(workspace),
+                execution_mode="read_only",
+                task_route="codex_handoff",
+                stop_reason="codex_handoff_synthesized",
+                final_answer="Current state: Ready.\n\nNext engineering tasks:\n- Implement broad change.\n",
+                transcript="demo transcript",
+                warnings=[],
+                codex_payload=CodexHandoffPayload(
+                    original_task="Implement broad change.",
+                    core_dependencies=["teamai/cli.py"],
+                    distilled_context={"teamai/cli.py": "CLI entrypoint summary."},
+                    recommended_codex_action="Inspect teamai/cli.py before implementing the change.",
+                ),
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+            final_result = RunResult(
+                status="completed",
+                model_id="dummy",
+                workspace=str(workspace),
+                execution_mode="workspace_write",
+                task_route="multi_agent_loop",
+                stop_reason="verifier_declared_complete",
+                final_answer="Implemented broad change.",
+                transcript="done",
+                warnings=[],
+                codex_payload=None,
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            with patch(
+                "teamai.cli._execute_verified_handoff_workflow",
+                return_value={
+                    "engine": "local",
+                    "model": "mlx-community/gemma-4-2b-it-4bit",
+                    "payload_path": str(workspace / ".teamai" / "codex_payload.json"),
+                    "patch_path": str(workspace / ".teamai" / "local_solution.patch"),
+                    "verification": {"success": True},
+                    "approval": {"approval_id": "approval123"},
+                    "approval_error": None,
+                    "failure_context_path": None,
+                    "summary": "Local handoff execution summary",
+                    "success": True,
+                },
+            ), patch(
+                "teamai.cli._apply_approval_and_continue",
+                return_value={
+                    "approval": {"approval_id": "approval123", "status": "applied"},
+                    "approval_summary": {"approval_id": "approval123", "status": "applied"},
+                    "continuation_task": "Continue the task.",
+                    "continuation_context": {"verification_focus": "Verify the patch."},
+                    "continuation_result": final_result,
+                },
+            ):
+                payload = _run_autopilot_workflow(
+                    project_root=workspace,
+                    settings=SimpleNamespace(allow_writes=False),
+                    initial_result=initial_result,
+                    initial_payload_path=workspace / ".teamai" / "codex_payload.json",
+                    workspace_path=str(workspace),
+                    max_rounds=2,
+                    max_actions=2,
+                    max_tokens=64,
+                    temperature=0.3,
+                    handoff_engine="local",
+                    handoff_model="mlx-community/gemma-4-2b-it-4bit",
+                    handoff_patch_file=".teamai/local_solution.patch",
+                    max_cycles=1,
+                )
+
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(payload["cycles"][0]["handoff"]["engine"], "local")
+
     def test_run_autopilot_workflow_stops_when_no_handoff_is_needed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)
@@ -543,28 +624,44 @@ class CLIStreamingTest(unittest.TestCase):
 
             stdout = io.StringIO()
             with patch(
-                "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
-                return_value=SimpleNamespace(
-                    execution=SimpleNamespace(
-                        model="gpt-5.4",
-                        payload_file=project_root / ".teamai" / "codex_payload.json",
-                        patch_file=project_root / ".teamai" / "codex_solution.patch",
-                        patch_text=(
-                            "diff --git a/demo.txt b/demo.txt\n"
-                            "--- a/demo.txt\n"
-                            "+++ b/demo.txt\n"
-                            "@@ -0,0 +1 @@\n"
-                            "+patched\n"
-                        ),
-                    ),
-                    verification=SimpleNamespace(success=True, patch_returncode=0, test_returncode=0),
-                    failure_context_file=failure_log,
-                    approval={
+                "teamai.cli._execute_verified_handoff_workflow",
+                return_value={
+                    "engine": "codex",
+                    "model": "gpt-5.4",
+                    "payload_path": str(project_root / ".teamai" / "codex_payload.json"),
+                    "patch_path": str(project_root / ".teamai" / "codex_solution.patch"),
+                    "verification": {
+                        "success": True,
+                        "patch_returncode": 0,
+                        "test_returncode": 0,
+                        "commands_run": [],
+                    },
+                    "approval": {
                         "approval_id": "approval123",
                         "change_count": 1,
                     },
-                    approval_error=None,
-                ),
+                    "approval_error": None,
+                    "failure_context_path": None,
+                    "summary": "\n".join(
+                        [
+                            "Handoff execution summary",
+                            "- Engine: codex",
+                            "- Model: gpt-5.4",
+                            f"- Payload: {project_root / '.teamai' / 'codex_payload.json'}",
+                            f"- Patch: {project_root / '.teamai' / 'codex_solution.patch'}",
+                            "- Patch files: 1",
+                            "- Patch lines: 5",
+                            "- Sandbox verification: passed",
+                            "- Verification detail: patch applied and sandbox tests passed",
+                            "- Test exit code: 0",
+                            "- Approval: approval123",
+                            "- Approval scope: 1 file(s)",
+                            "teamai approvals show approval123",
+                            "teamai approvals apply approval123",
+                        ]
+                    ),
+                    "success": True,
+                },
             ), patch("sys.argv", ["teamai", "execute-handoff"]), patch("pathlib.Path.cwd", return_value=project_root), redirect_stdout(stdout):
                 exit_code = main()
 
@@ -584,36 +681,43 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertIn("- Approval scope: 1 file(s)", rendered)
             self.assertIn("teamai approvals show approval123", rendered)
             self.assertIn("teamai approvals apply approval123", rendered)
-            self.assertFalse(failure_log.exists())
 
     def test_execute_handoff_command_reports_failed_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
             failure_log = project_root / ".teamai" / "failure_context.log"
+            failure_log.parent.mkdir(parents=True, exist_ok=True)
+            failure_log.write_text("tests failed\n", encoding="utf-8")
             stdout = io.StringIO()
             with patch(
-                "teamai.integrations.codex_bridge.execute_verified_codex_handoff",
-                return_value=SimpleNamespace(
-                    execution=SimpleNamespace(
-                        model="gpt-5.4",
-                        payload_file=project_root / ".teamai" / "codex_payload.json",
-                        patch_file=project_root / ".teamai" / "codex_solution.patch",
-                        patch_text=(
-                            "diff --git a/demo.txt b/demo.txt\n"
-                            "--- a/demo.txt\n"
-                            "+++ b/demo.txt\n"
-                            "@@ -0,0 +1 @@\n"
-                            "+patched\n"
-                        ),
+                "teamai.cli._execute_verified_handoff_workflow",
+                return_value={
+                    "engine": "codex",
+                    "model": "gpt-5.4",
+                    "payload_path": str(project_root / ".teamai" / "codex_payload.json"),
+                    "patch_path": str(project_root / ".teamai" / "codex_solution.patch"),
+                    "verification": {
+                        "success": False,
+                        "patch_returncode": 0,
+                        "test_returncode": 1,
+                        "commands_run": [],
+                    },
+                    "approval": None,
+                    "approval_error": None,
+                    "failure_context_path": str(failure_log),
+                    "summary": "\n".join(
+                        [
+                            "Handoff execution summary",
+                            "- Patch files: 1",
+                            "- Sandbox verification: failed",
+                            "- Verification detail: patch applied, but sandbox tests failed",
+                            "- Test exit code: 1",
+                            f"- Failure log: {failure_log}",
+                            "sandbox test failures before retrying",
+                        ]
                     ),
-                    verification=SimpleNamespace(
-                        success=False,
-                        patch_returncode=0,
-                        test_returncode=1,
-                        log_output="tests failed\n",
-                    ),
-                    failure_context_file=failure_log,
-                ),
+                    "success": False,
+                },
             ), patch("sys.argv", ["teamai", "execute-handoff"]), patch("pathlib.Path.cwd", return_value=project_root), redirect_stdout(stdout):
                 exit_code = main()
 

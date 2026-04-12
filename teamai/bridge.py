@@ -143,7 +143,37 @@ def launch_bridge(config: BridgeLaunchConfig, *, dry_run: bool = False) -> dict[
         return queued_status
 
     if sys.platform != "darwin":
-        raise RuntimeError("Bridge launch currently supports macOS Terminal.app only.")
+        try:
+            process = subprocess.Popen(
+                ["/bin/zsh", str(config.artifacts.script_file)],
+                cwd=str(config.project_root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            failed_status = _status_payload(
+                state="launch_failed",
+                config=config,
+                event_at=datetime.now(timezone.utc),
+                exit_code=getattr(exc, "errno", None),
+                error=str(exc),
+            )
+            failed_status["launch_mode"] = "subprocess"
+            _write_status(config.artifacts.status_file, failed_status)
+            raise RuntimeError(f"Failed to launch bridge subprocess: {exc}") from exc
+
+        launched_status = _status_payload(
+            state="launched",
+            config=config,
+            event_at=datetime.now(timezone.utc),
+            exit_code=None,
+            error=None,
+        )
+        launched_status["launch_mode"] = "subprocess"
+        launched_status["pid"] = process.pid
+        _write_status(config.artifacts.status_file, launched_status)
+        return launched_status
 
     script_path_literal = _apple_script_string(str(config.artifacts.script_file))
     try:
@@ -181,6 +211,7 @@ def launch_bridge(config: BridgeLaunchConfig, *, dry_run: bool = False) -> dict[
         exit_code=None,
         error=None,
     )
+    launched_status["launch_mode"] = "terminal_app"
     _write_status(config.artifacts.status_file, launched_status)
     return launched_status
 

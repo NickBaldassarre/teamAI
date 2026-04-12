@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -9,7 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from teamai.config import Settings
-from teamai.runtime import run_runtime_doctor, select_runtime_python
+from teamai.runtime import (
+    default_runtime_subprocess_runner,
+    run_runtime_doctor,
+    run_runtime_probe,
+    select_runtime_python,
+)
 
 
 class RuntimeSelectionTest(unittest.TestCase):
@@ -141,6 +147,31 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertEqual(report.probe.status, "unavailable")
         self.assertEqual(report.probe.reason, "runtime_probe_subprocess_crash")
         self.assertIn("Terminal bridge", report.probe.summary)
+
+
+class RuntimeIntegrationTest(unittest.TestCase):
+    @unittest.skipUnless(
+        os.getenv("TEAMAI_RUN_REAL_MLX_TESTS") == "1",
+        "Set TEAMAI_RUN_REAL_MLX_TESTS=1 to run the real MLX integration probe.",
+    )
+    def test_real_mlx_generate_probe_returns_nonempty_output(self) -> None:
+        project_root = Path("/Users/home/Documents/teamAI")
+        settings = Settings.from_env()
+        selection = select_runtime_python(project_root, current_python=None)
+        report = run_runtime_probe(
+            settings=settings,
+            project_root=project_root,
+            python_executable=Path(selection.selected_python),
+            subprocess_runner=default_runtime_subprocess_runner,
+            probe_mode="generate",
+            max_tokens=8,
+            prompt="Reply with the single word OK.",
+        )
+
+        self.assertEqual(report.status, "healthy")
+        preview = str(report.details.get("output_preview", "")).strip()
+        self.assertTrue(preview)
+        self.assertIn("ok", preview.lower())
 
 
 if __name__ == "__main__":

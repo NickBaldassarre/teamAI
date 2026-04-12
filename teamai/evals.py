@@ -66,6 +66,7 @@ class EvalCase(BaseModel):
     max_tokens_per_turn: int | None = None
     temperature: float | None = None
     setup_files: list[EvalFixtureFile] = Field(default_factory=list)
+    auto_continue_after_approval: bool = False
     expectations: EvalExpectations = Field(default_factory=EvalExpectations)
 
 
@@ -83,6 +84,9 @@ class EvalCaseMetrics(BaseModel):
     tool_actions_total: int
     tool_actions_successful: int
     tool_success_rate: float
+    json_repair_count: int = 0
+    structured_response_count: int = 0
+    json_repair_rate: float = 0.0
     local_completion: bool
     routed_to_handoff: bool
     handoff_completed: bool
@@ -117,6 +121,7 @@ class EvalCaseReport(BaseModel):
     primary_task: str | None = None
     key_paths: list[str] = Field(default_factory=list)
     approval_cleanup_ids: list[str] = Field(default_factory=list)
+    artifact_source: Literal["model", "deterministic", "mixed", "none"] = "none"
     runner_mode: str = "in_process"
     memory_profile: str = "default"
     guardrail_notes: list[str] = Field(default_factory=list)
@@ -148,6 +153,7 @@ class EvalSuiteMetrics(BaseModel):
     failure_classification_counts: dict[str, int] = Field(default_factory=dict)
     task_route_counts: dict[str, int] = Field(default_factory=dict)
     stop_reason_counts: dict[str, int] = Field(default_factory=dict)
+    route_json_repair_rates: dict[str, float] = Field(default_factory=dict)
 
 
 class EvalSuiteReport(BaseModel):
@@ -252,12 +258,13 @@ def run_eval_suite(
                         task=case.task,
                         workspace=str(workspace),
                         passed=False,
-                    failures=[execution.error or "Case execution failed."],
-                    metrics=_empty_case_metrics(),
-                    result_status=execution.result_status,
-                    task_route=execution.task_route,
-                    stop_reason=execution.stop_reason,
+                        failures=[execution.error or "Case execution failed."],
+                        metrics=_empty_case_metrics(),
+                        result_status=execution.result_status,
+                        task_route=execution.task_route,
+                        stop_reason=execution.stop_reason,
                         final_answer="",
+                        artifact_source="none",
                         runner_mode=execution.runner_mode,
                         memory_profile=execution.memory_profile,
                         guardrail_notes=list(execution.guardrail_notes),
@@ -269,6 +276,17 @@ def run_eval_suite(
                 )
                 continue
             result = execution.result
+            if case.auto_continue_after_approval and result.stop_reason == "approval_required":
+                result = _continue_eval_after_approval(
+                    result=result,
+                    settings=case_settings,
+                    workspace=workspace,
+                    workspace_path=workspace_request or str(workspace),
+                    max_rounds=case.max_rounds,
+                    max_actions=case.max_actions_per_round,
+                    max_tokens=case.max_tokens_per_turn,
+                    temperature=case.temperature,
+                )
             handoff = build_handoff_packet(task=case.task, result=result)
             metrics = _build_case_metrics(result)
             failure_classification = _classify_case_failure(
@@ -303,6 +321,7 @@ def run_eval_suite(
                     primary_task=handoff.primary_task,
                     key_paths=handoff.key_paths,
                     approval_cleanup_ids=cleanup_ids,
+                    artifact_source=_derive_artifact_source(result),
                     runner_mode=execution.runner_mode,
                     memory_profile=execution.memory_profile,
                     guardrail_notes=list(execution.guardrail_notes),
@@ -334,6 +353,7 @@ def run_eval_suite(
                     task_route="failed",
                     stop_reason="case_execution_failed",
                     final_answer="",
+                    artifact_source="none",
                     runner_mode=runner_mode,
                     memory_profile="default",
                     failure_classification="harness_failure",
@@ -376,6 +396,7 @@ def render_eval_markdown(report: EvalSuiteReport) -> str:
         f"- Approval rate: {_format_percent(metrics.approval_rate)}",
         f"- Verification attempt rate: {_format_percent(metrics.verification_attempt_rate)}",
         f"- Verification success rate: {_format_percent(metrics.verification_success_rate)}",
+        f"- Route JSON repair rates: {json.dumps(metrics.route_json_repair_rates, sort_keys=True)}",
         f"- Infra failure rate: {_format_percent(metrics.infra_failure_rate)}",
         f"- Infra failure cases: {metrics.infra_failure_cases}",
         f"- Agent-behavior failure cases: {metrics.agent_failure_cases}",
@@ -391,12 +412,106 @@ def render_eval_markdown(report: EvalSuiteReport) -> str:
     for case in report.cases:
         lines.append(
             f"- `{case.case_id}`: {'PASS' if case.passed else 'FAIL'} "
-            f"({case.task_route} / {case.stop_reason} / {case.failure_classification})"
+            f"({case.task_route} / {case.stop_reason} / {case.failure_classification} / artifacts={case.artifact_source})"
         )
         if case.failures:
             for failure in case.failures:
                 lines.append(f"  - {failure}")
     return "\n".join(lines)
+
+
+def load_eval_report_text(text: str) -> EvalSuiteReport | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return EvalSuiteReport.model_validate(payload)
+    except Exception:
+        return None
+
+
+def render_eval_artifact_markdown(
+    *,
+    status_payload: dict[str, object],
+    stdout_text: str,
+) -> str:
+    report = load_eval_report_text(stdout_text)
+    state = str(status_payload.get("state", "unknown")).strip() or "unknown"
+    exit_code = status_payload.get("exit_code")
+    if report is None:
+        lines = [
+            "# Eval Report",
+            "",
+            f"Run state: {state}",
+            f"Exit code: {exit_code}",
+            "",
+            "No parseable eval report was found in the captured stdout artifact.",
+        ]
+        return "\n".join(lines)
+
+    metrics = report.metrics
+    overall_label = "completed" if state == "completed" else f"{state} (exit_code={exit_code})"
+    case_summary = f"{metrics.passed_cases}/{metrics.total_cases} case expectations passed"
+    if state != "completed":
+        case_summary = f"{case_summary}, but overall run state is {overall_label}"
+
+    lines = [
+        f"# Eval Report: {report.name}",
+        "",
+        f"Run state: {overall_label}",
+        f"Cases: {case_summary}",
+        "",
+        "## Summary",
+        "",
+        f"- Runtime health: {report.runtime_health.status} ({report.runtime_health.reason})",
+        f"- Runtime summary: {report.runtime_health.summary}",
+        f"- Pass rate: {_format_percent(metrics.pass_rate)}",
+        f"- Actionable pass rate: {_format_percent(metrics.actionable_pass_rate)}",
+        f"- Local completion rate: {_format_percent(metrics.local_completion_rate)}",
+        f"- Handoff rate: {_format_percent(metrics.handoff_rate)}",
+        f"- Handoff completion rate: {_format_percent(metrics.handoff_completion_rate)}",
+        f"- Approval rate: {_format_percent(metrics.approval_rate)}",
+        f"- Verification attempt rate: {_format_percent(metrics.verification_attempt_rate)}",
+        f"- Verification success rate: {_format_percent(metrics.verification_success_rate)}",
+        f"- Route JSON repair rates: {json.dumps(metrics.route_json_repair_rates, sort_keys=True)}",
+        f"- Infra failure rate: {_format_percent(metrics.infra_failure_rate)}",
+        f"- Infra failure cases: {metrics.infra_failure_cases}",
+        f"- Agent-behavior failure cases: {metrics.agent_failure_cases}",
+        f"- Timeout failure cases: {metrics.timeout_failure_cases}",
+        f"- Harness failure cases: {metrics.harness_failure_cases}",
+        f"- Average rounds: {metrics.average_rounds:.2f}",
+        f"- Average tool success rate: {_format_percent(metrics.average_tool_success_rate)}",
+        f"- Average duration: {metrics.average_duration_seconds:.2f}s",
+        "",
+        "## Cases",
+        "",
+    ]
+    for case in report.cases:
+        lines.append(
+            f"- `{case.case_id}`: {'PASS' if case.passed else 'FAIL'} "
+            f"({case.task_route} / {case.stop_reason} / {case.failure_classification} / artifacts={case.artifact_source})"
+        )
+        if case.failures:
+            for failure in case.failures:
+                lines.append(f"  - {failure}")
+    return "\n".join(lines)
+
+
+def _derive_artifact_source(result: RunResult | None) -> Literal["model", "deterministic", "mixed", "none"]:
+    if result is None or not result.rounds:
+        return "none"
+    sources = {record.reasoning_source for record in result.rounds}
+    if sources == {"deterministic"}:
+        return "deterministic"
+    if sources == {"model"}:
+        return "model"
+    return "mixed"
 
 
 def _default_runner(request: RunRequest, settings: Settings) -> RunResult:
@@ -747,6 +862,9 @@ def _empty_case_metrics() -> EvalCaseMetrics:
         tool_actions_total=0,
         tool_actions_successful=0,
         tool_success_rate=0.0,
+        json_repair_count=0,
+        structured_response_count=0,
+        json_repair_rate=0.0,
         local_completion=False,
         routed_to_handoff=False,
         handoff_completed=False,
@@ -852,6 +970,14 @@ def _build_case_metrics(result: RunResult) -> EvalCaseMetrics:
     tool_results = [tool_result for round_record in result.rounds for tool_result in round_record.tool_results]
     tool_actions_total = len(tool_results)
     tool_actions_successful = sum(1 for tool_result in tool_results if tool_result.success)
+    json_repair_count = sum(
+        max(int(getattr(round_record, "planner_json_repairs", 0) or 0), 0)
+        + max(int(getattr(round_record, "verifier_json_repairs", 0) or 0), 0)
+        for round_record in result.rounds
+    )
+    structured_response_count = sum(
+        2 for round_record in result.rounds if round_record.reasoning_source == "model"
+    )
     routed_to_handoff = result.task_route == "codex_handoff"
     handoff_completed = result.stop_reason == "codex_handoff_synthesized"
     approval_required = result.stop_reason == "approval_required"
@@ -872,6 +998,9 @@ def _build_case_metrics(result: RunResult) -> EvalCaseMetrics:
         tool_actions_total=tool_actions_total,
         tool_actions_successful=tool_actions_successful,
         tool_success_rate=(tool_actions_successful / tool_actions_total) if tool_actions_total else 1.0,
+        json_repair_count=json_repair_count,
+        structured_response_count=structured_response_count,
+        json_repair_rate=(json_repair_count / structured_response_count) if structured_response_count else 0.0,
         local_completion=result.status == "completed" and not routed_to_handoff,
         routed_to_handoff=routed_to_handoff,
         handoff_completed=handoff_completed,
@@ -954,12 +1083,29 @@ def _build_suite_metrics(reports: list[EvalCaseReport]) -> EvalSuiteMetrics:
     task_route_counts: dict[str, int] = {}
     stop_reason_counts: dict[str, int] = {}
     failure_classification_counts: dict[str, int] = {}
+    route_repair_numerators: dict[str, float] = {}
+    route_repair_denominators: dict[str, int] = {}
     for report in reports:
         task_route_counts[report.task_route] = task_route_counts.get(report.task_route, 0) + 1
         stop_reason_counts[report.stop_reason] = stop_reason_counts.get(report.stop_reason, 0) + 1
         failure_classification_counts[report.failure_classification] = (
             failure_classification_counts.get(report.failure_classification, 0) + 1
         )
+        route_repair_numerators[report.task_route] = (
+            route_repair_numerators.get(report.task_route, 0.0) + report.metrics.json_repair_count
+        )
+        route_repair_denominators[report.task_route] = (
+            route_repair_denominators.get(report.task_route, 0) + report.metrics.structured_response_count
+        )
+
+    route_json_repair_rates = {
+        route: (
+            route_repair_numerators.get(route, 0.0) / route_repair_denominators[route]
+            if route_repair_denominators.get(route, 0)
+            else 0.0
+        )
+        for route in task_route_counts
+    }
 
     return EvalSuiteMetrics(
         total_cases=total_cases,
@@ -993,6 +1139,7 @@ def _build_suite_metrics(reports: list[EvalCaseReport]) -> EvalSuiteMetrics:
         failure_classification_counts=failure_classification_counts,
         task_route_counts=task_route_counts,
         stop_reason_counts=stop_reason_counts,
+        route_json_repair_rates=route_json_repair_rates,
     )
 
 
@@ -1051,6 +1198,68 @@ def _cleanup_approvals(*, workspace: Path, approval_ids: list[str]) -> list[str]
             continue
         cleaned.append(approval_id)
     return cleaned
+
+
+def _continue_eval_after_approval(
+    *,
+    result: RunResult,
+    settings: Settings,
+    workspace: Path,
+    workspace_path: str,
+    max_rounds: int | None,
+    max_actions: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+) -> RunResult:
+    approval_ids = sorted(
+        {
+            str(tool_result.metadata.get("approval_id", "")).strip()
+            for round_record in result.rounds
+            for tool_result in round_record.tool_results
+            if str(tool_result.metadata.get("approval_id", "")).strip()
+        }
+    )
+    if not approval_ids:
+        return result
+
+    store = PatchApprovalStore()
+    approval_id = approval_ids[-1]
+    applied = store.apply(workspace=workspace, approval_id=approval_id)
+    continuation_context = store.build_continuation_context(applied, workspace=workspace)
+    continuation_task = store.build_continuation_task(
+        applied,
+        continuation_context=continuation_context,
+    )
+    continuation_mode = store.continuation_execution_mode(applied)
+    continuation_settings = settings
+    if continuation_mode == "workspace_write" and not continuation_settings.allow_writes:
+        continuation_settings = replace(continuation_settings, allow_writes=True)
+
+    continuation_result = ClosedLoopSupervisor(continuation_settings).run(
+        RunRequest(
+            task=continuation_task,
+            workspace_path=workspace_path,
+            max_rounds=max_rounds,
+            max_actions_per_round=max_actions,
+            max_tokens_per_turn=max_tokens,
+            temperature=temperature,
+            execution_mode=continuation_mode,
+            continuation_context=continuation_context,
+        )
+    )
+    merged_warnings = [
+        *result.warnings,
+        f"Eval harness auto-applied approval `{approval_id}` and continued the local run.",
+        *continuation_result.warnings,
+    ]
+    return continuation_result.model_copy(
+        update={
+            "task_route": result.task_route,
+            "rounds": [*result.rounds, *continuation_result.rounds],
+            "warnings": merged_warnings,
+            "started_at": result.started_at,
+        }
+    )
 
 
 def _is_verification_result(tool_result: ToolExecutionResult) -> bool:

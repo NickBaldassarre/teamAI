@@ -88,6 +88,59 @@ class HandoffPacketTest(unittest.TestCase):
         self.assertEqual(packet.open_questions, ["synthesize"])
         self.assertIn("Prioritize this next task first", packet.suggested_codex_prompt)
 
+    def test_build_handoff_packet_labels_deterministic_verifier_artifacts(self) -> None:
+        result = RunResult(
+            status="completed",
+            model_id="dummy-model",
+            workspace="/tmp/demo-workspace",
+            execution_mode="read_only",
+            stop_reason="inspection_synthesized",
+            final_answer=(
+                "[deterministic-synthesis]\n"
+                "Current state: Repository inspection gathered enough evidence.\n\n"
+                "Next engineering tasks:\n"
+                "- Inspect teamai/supervisor.py.\n"
+            ),
+            transcript="demo transcript",
+            rounds=[
+                RoundRecord(
+                    round_number=1,
+                    strategist="",
+                    critic="",
+                    planner=PlannerTurn(
+                        summary="deterministic inspection bootstrap",
+                        should_stop=False,
+                        final_answer=None,
+                        actions=[ToolAction(tool="read_file", reason="inspect", args={"path": "README.md"})],
+                    ),
+                    tool_results=[
+                        ToolExecutionResult(
+                            tool="read_file",
+                            success=True,
+                            output="readme",
+                            metadata={"path": "/tmp/demo-workspace/README.md"},
+                        )
+                    ],
+                    verifier=VerifierVerdict(
+                        done=False,
+                        confidence=0.6,
+                        summary="Deterministic inspection collected repository context; no model verifier was run.",
+                        next_focus="Read the highest-signal runtime files next.",
+                    ),
+                    reasoning_source="deterministic",
+                )
+            ],
+            warnings=[],
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        packet = build_handoff_packet(task="Inspect this repository and identify the next engineering tasks.", result=result)
+
+        self.assertTrue(packet.summary.startswith("[deterministic-synthesis]"))
+        self.assertIn("Deterministic verifier note", " ".join(packet.evidence))
+        self.assertEqual(packet.open_questions, ["Deterministic next focus: Read the highest-signal runtime files next."])
+
     def test_render_handoff_markdown_includes_sections(self) -> None:
         result = RunResult(
             status="completed",

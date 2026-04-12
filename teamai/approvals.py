@@ -366,7 +366,7 @@ class PatchApprovalStore:
             related_test_paths.append(related_test_path)
             if normalized_test not in read_paths:
                 read_paths.append(normalized_test)
-            suggested_commands.append(["python", "-m", "unittest", cls.path_to_module(related_test_path)])
+            suggested_commands.append(["python3", "-m", "unittest", cls.path_to_module(related_test_path)])
 
         verification_focus = cls._build_verification_focus(
             path=path,

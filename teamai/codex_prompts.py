@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .schemas import CodexHandoffPayload
 
 
@@ -17,12 +19,16 @@ def build_codex_handoff_prompt(payload: CodexHandoffPayload) -> str:
     for path, summary in payload.distilled_context.items():
         distilled_sections.append(f"[{path}]\n{summary}")
     distilled_context = "\n\n".join(distilled_sections) or "(no distilled context provided)"
+    structured_context = json.dumps(payload.structured_context, indent=2, ensure_ascii=True).strip()
+    if not structured_context:
+        structured_context = "{}"
 
     return (
         f"{CODEX_LEAD_ARCHITECT_SYSTEM_PROMPT}\n\n"
         f"Original task:\n{payload.original_task}\n\n"
         f"Core dependencies:\n{dependencies}\n\n"
         f"Distilled context:\n{distilled_context}\n\n"
+        f"Structured context:\n{structured_context}\n\n"
         f"Recommended Codex action:\n{payload.recommended_codex_action}\n\n"
         "Patch output requirements:\n"
 "- Return ONLY a strict git unified diff patch.\n"

@@ -1,39 +1,42 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..approvals import PatchApprovalStore
-from ..codex_prompts import build_codex_handoff_prompt
-from ..sandbox import Sandbox
 from ..schemas import CodexHandoffPayload
-from ..verification import VerificationResult, verify_patch
-
+from .bridge_base import AgentBridge, BridgeExecutionResult, VerifiedBridgeExecutionResult
 
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_PAYLOAD_FILE = ".teamai/codex_payload.json"
 DEFAULT_CODEX_PATCH_FILE = ".teamai/codex_solution.patch"
 DEFAULT_CODEX_FAILURE_CONTEXT_FILE = ".teamai/failure_context.log"
 
-
-@dataclass(frozen=True)
-class CodexHandoffExecutionResult:
-    model: str
-    payload_file: Path
-    patch_file: Path
-    prompt: str
-    patch_text: str
+CodexHandoffExecutionResult = BridgeExecutionResult
+VerifiedCodexHandoffExecutionResult = VerifiedBridgeExecutionResult
 
 
-@dataclass(frozen=True)
-class VerifiedCodexHandoffExecutionResult:
-    execution: CodexHandoffExecutionResult
-    verification: VerificationResult
-    failure_context_file: Path
-    approval: dict[str, Any] | None = None
-    approval_error: str | None = None
+class CodexBridge(AgentBridge):
+    engine = "codex"
+    default_model = DEFAULT_CODEX_MODEL
+
+    def _request_patch(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        payload: CodexHandoffPayload,
+        payload_path: Path,
+        project_root: Path,
+    ) -> str:
+        client = _create_openai_client()
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return _extract_response_text(response)
 
 
 def execute_codex_handoff(
@@ -43,33 +46,11 @@ def execute_codex_handoff(
     patch_file: str | Path = DEFAULT_CODEX_PATCH_FILE,
     model: str | None = None,
 ) -> CodexHandoffExecutionResult:
-    project_root = project_root.resolve()
-    payload_path = _resolve_project_path(project_root, payload_file)
-    patch_path = _resolve_project_path(project_root, patch_file)
-
-    payload = CodexHandoffPayload.model_validate_json(payload_path.read_text(encoding="utf-8"))
-    prompt = build_codex_handoff_prompt(payload)
-    client = _create_openai_client()
-    model_name = (model or os.getenv("TEAMAI_CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL)
-    response = client.responses.create(
-        model=model_name,
-        input=[
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    raw_text = _extract_response_text(response)
-    patch_text = _sanitize_patch_output(raw_text)
-
-    patch_path.parent.mkdir(parents=True, exist_ok=True)
-    patch_path.write_text(_ensure_trailing_newline(patch_text), encoding="utf-8")
-
-    return CodexHandoffExecutionResult(
-        model=model_name,
-        payload_file=payload_path,
-        patch_file=patch_path,
-        prompt=prompt,
-        patch_text=patch_text,
+    return CodexBridge().execute(
+        project_root=project_root,
+        payload_file=payload_file,
+        patch_file=patch_file,
+        model=model or os.getenv("TEAMAI_CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL,
     )
 
 
@@ -81,55 +62,13 @@ def execute_verified_codex_handoff(
     failure_context_file: str | Path = DEFAULT_CODEX_FAILURE_CONTEXT_FILE,
     model: str | None = None,
 ) -> VerifiedCodexHandoffExecutionResult:
-    project_root = project_root.resolve()
-    execution = execute_codex_handoff(
+    return CodexBridge().execute_verified(
         project_root=project_root,
         payload_file=payload_file,
         patch_file=patch_file,
-        model=model,
+        failure_context_file=failure_context_file,
+        model=model or os.getenv("TEAMAI_CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL,
     )
-    failure_context_path = _resolve_project_path(project_root, failure_context_file)
-    approval: dict[str, Any] | None = None
-    approval_error: str | None = None
-    payload = CodexHandoffPayload.model_validate_json(execution.payload_file.read_text(encoding="utf-8"))
-
-    with Sandbox(project_root) as sandbox:
-        verification = verify_patch(execution.patch_file, sandbox)
-        if verification.success:
-            try:
-                approval = PatchApprovalStore().create_bundle_from_patch(
-                    workspace=project_root,
-                    sandbox_root=sandbox.path,
-                    patch_text=execution.patch_text,
-                    reason=f"Verified Codex handoff patch for: {payload.original_task}",
-                    source_tool="verified_codex_handoff",
-                    continuation={
-                        "original_task": payload.original_task,
-                        "requested_execution_mode": "workspace_write",
-                    },
-                )
-            except Exception as exc:  # pragma: no cover - defensive surface
-                approval_error = str(exc)
-
-    if verification.success:
-        if failure_context_path.exists():
-            failure_context_path.unlink()
-    else:
-        failure_context_path.parent.mkdir(parents=True, exist_ok=True)
-        failure_context_path.write_text(_ensure_trailing_newline(verification.log_output), encoding="utf-8")
-
-    return VerifiedCodexHandoffExecutionResult(
-        execution=execution,
-        verification=verification,
-        failure_context_file=failure_context_path,
-        approval=approval,
-        approval_error=approval_error,
-    )
-
-
-def _resolve_project_path(project_root: Path, raw_path: str | Path) -> Path:
-    path = Path(raw_path).expanduser()
-    return path if path.is_absolute() else project_root / path
 
 
 def _create_openai_client() -> Any:
@@ -170,19 +109,3 @@ def _extract_response_text(response: Any) -> str:
             return "\n".join(chunks)
 
     raise RuntimeError("Codex response did not contain any text output.")
-
-
-def _sanitize_patch_output(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            stripped = "\n".join(lines[1:-1]).strip()
-
-    if not any(marker in stripped for marker in ("diff --git", "--- ", "+++ ")):
-        raise RuntimeError("Codex response did not look like a unified diff patch.")
-    return stripped
-
-
-def _ensure_trailing_newline(text: str) -> str:
-    return text if text.endswith("\n") else f"{text}\n"

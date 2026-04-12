@@ -19,9 +19,16 @@ class SandboxCommandResult:
 
 
 class Sandbox:
-    def __init__(self, project_root: Path, *, symlink_venv: bool = True) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        symlink_venv: bool = True,
+        preserve_git: bool = False,
+    ) -> None:
         self._project_root = project_root.resolve()
         self._symlink_venv = symlink_venv
+        self._preserve_git = preserve_git
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         self._path: Path | None = None
 
@@ -83,7 +90,7 @@ class Sandbox:
 
     def _populate(self, destination: Path) -> None:
         for source in self._project_root.iterdir():
-            if source.name == ".git":
+            if source.name == ".git" and not self._preserve_git:
                 continue
             target = destination / source.name
             if source.name == ".venv" and self._symlink_venv and source.exists():

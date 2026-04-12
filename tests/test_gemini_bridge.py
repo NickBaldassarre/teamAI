@@ -18,7 +18,17 @@ class GeminiBridgeTest(unittest.TestCase):
             project_root = Path(temp_dir)
             payload_path = project_root / ".teamai" / "codex_payload.json"
             payload_path.parent.mkdir(parents=True, exist_ok=True)
-            payload_path.write_text("{}", encoding="utf-8")
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "original_task": "Improve streaming output.",
+                        "core_dependencies": ["teamai/cli.py"],
+                        "distilled_context": {"teamai/cli.py": "CLI summary."},
+                        "recommended_codex_action": "Inspect teamai/cli.py before implementing the change.",
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             with patch.dict("os.environ", {}, clear=True):
                 with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY is not set"):
@@ -39,6 +49,7 @@ class GeminiBridgeTest(unittest.TestCase):
                         "original_task": "Improve streaming output.",
                         "core_dependencies": ["teamai/cli.py"],
                         "distilled_context": {"teamai/cli.py": "CLI summary."},
+                        "recommended_codex_action": "Inspect teamai/cli.py before implementing the change.",
                     }
                 ),
                 encoding="utf-8",
@@ -92,11 +103,12 @@ class GeminiBridgeTest(unittest.TestCase):
                 )
 
             self.assertEqual(returned_path.model, "gemini-2.5-pro")
+            self.assertEqual(returned_path.engine, "gemini")
             self.assertEqual(returned_path.payload_file.resolve(), payload_path.resolve())
             self.assertEqual(returned_path.patch_file.resolve(), patch_path.resolve())
             self.assertTrue(patch_path.exists())
             self.assertIn("diff --git a/teamai/cli.py b/teamai/cli.py", patch_path.read_text(encoding="utf-8"))
-            self.assertIn("TASK: Improve streaming output.", returned_path.prompt)
+            self.assertIn("Original task:\nImprove streaming output.", returned_path.prompt)
             self.assertIn("diff --git a/teamai/cli.py b/teamai/cli.py", returned_path.patch_text)
             self.assertEqual(captured["api_key"], "test-key")
             request = captured["request"]

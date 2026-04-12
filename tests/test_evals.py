@@ -9,7 +9,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from teamai.config import Settings
-from teamai.evals import EvalSuite, load_eval_suite, run_eval_suite
+from teamai.evals import (
+    EvalSuite,
+    load_eval_suite,
+    render_eval_artifact_markdown,
+    render_eval_markdown,
+    run_eval_suite,
+)
 from teamai.schemas import PlannerTurn, RoundRecord, RunRequest, RunResult, ToolExecutionResult, VerifierVerdict
 
 
@@ -22,6 +28,9 @@ def _build_result(
     final_answer: str = "Next engineering tasks: strengthen evals.",
     warnings: list[str] | None = None,
     tool_results: list[ToolExecutionResult] | None = None,
+    reasoning_source: str = "model",
+    planner_json_repairs: int = 0,
+    verifier_json_repairs: int = 0,
 ) -> RunResult:
     timestamp = datetime.now(timezone.utc)
     return RunResult(
@@ -41,6 +50,9 @@ def _build_result(
                 planner=PlannerTurn(summary="plan", should_stop=False, final_answer=None, actions=[]),
                 tool_results=tool_results or [],
                 verifier=VerifierVerdict(done=False, confidence=0.5, summary="summary", next_focus="focus"),
+                reasoning_source=reasoning_source,
+                planner_json_repairs=planner_json_repairs,
+                verifier_json_repairs=verifier_json_repairs,
             )
         ],
         warnings=warnings or [],
@@ -170,6 +182,95 @@ class EvalHarnessTest(unittest.TestCase):
         self.assertEqual(latest["task"], "Eval suite: smoke")
         self.assertIn("Eval suite `smoke` completed", latest["summary"])
         self.assertTrue(latest["improvement_notes"])
+
+    def test_render_eval_markdown_surfaces_deterministic_artifact_source(self) -> None:
+        deterministic = _build_result(
+            workspace=self.workspace,
+            task_route="deterministic_patch",
+            stop_reason="approval_required",
+            final_answer="[deterministic-synthesis]\nApproval required.",
+            reasoning_source="deterministic",
+        )
+        suite = EvalSuite.model_validate(
+            {
+                "name": "deterministic-artifacts",
+                "cases": [
+                    {
+                        "case_id": "patch",
+                        "task": "patch",
+                        "expectations": {
+                            "allowed_task_routes": ["deterministic_patch"],
+                            "approval_required": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        report = run_eval_suite(
+            settings=self.settings,
+            suite=suite,
+            runner=lambda request, settings: deterministic,
+        )
+
+        rendered = render_eval_markdown(report)
+
+        self.assertEqual(report.cases[0].artifact_source, "deterministic")
+        self.assertIn("artifacts=deterministic", rendered)
+
+    def test_render_eval_markdown_surfaces_route_json_repair_rates(self) -> None:
+        repaired = _build_result(
+            workspace=self.workspace,
+            task_route="multi_agent_loop",
+            stop_reason="planner_declared_complete",
+            final_answer="done",
+            planner_json_repairs=1,
+            verifier_json_repairs=1,
+        )
+        suite = EvalSuite.model_validate(
+            {
+                "name": "repair-rates",
+                "cases": [
+                    {
+                        "case_id": "repaired",
+                        "task": "repaired",
+                        "expectations": {"allowed_stop_reasons": ["planner_declared_complete"]},
+                    }
+                ],
+            }
+        )
+
+        report = run_eval_suite(
+            settings=self.settings,
+            suite=suite,
+            runner=lambda request, settings: repaired,
+        )
+
+        self.assertAlmostEqual(report.metrics.route_json_repair_rates["multi_agent_loop"], 1.0)
+        rendered = render_eval_markdown(report)
+        self.assertIn("Route JSON repair rates", rendered)
+
+    def test_render_eval_artifact_markdown_never_reports_all_green_when_status_failed(self) -> None:
+        report = EvalSuite.model_validate(
+            {
+                "name": "artifact-failure",
+                "description": "",
+                "cases": [],
+            }
+        )
+        suite_report = run_eval_suite(
+            settings=self.settings,
+            suite=report,
+            runner=lambda request, settings: _build_result(workspace=self.workspace),
+        )
+
+        rendered = render_eval_artifact_markdown(
+            status_payload={"state": "failed", "exit_code": 1},
+            stdout_text=json.dumps(suite_report.model_dump(mode="json"), indent=2),
+        )
+
+        self.assertIn("Run state: failed (exit_code=1)", rendered)
+        self.assertIn("but overall run state is failed", rendered)
 
     def test_run_eval_suite_isolated_subprocess_uses_guardrailed_case_runs(self) -> None:
         captured: dict[str, object] = {}

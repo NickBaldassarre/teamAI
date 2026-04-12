@@ -221,7 +221,10 @@ def _collect_evidence(result: RunResult) -> list[str]:
                 return evidence
         verifier_summary = record.verifier.summary.strip()
         if verifier_summary:
-            item = f"Verifier summary: {verifier_summary}"
+            prefix = "Verifier summary"
+            if record.reasoning_source == "deterministic":
+                prefix = "Deterministic verifier note"
+            item = f"{prefix}: {verifier_summary}"
             if item not in seen:
                 seen.add(item)
                 evidence.append(item)
@@ -245,12 +248,15 @@ def _collect_open_questions(
     for record in result.rounds:
         next_focus = (record.verifier.next_focus or "").strip()
         if next_focus and next_focus not in seen:
+            rendered_focus = next_focus
+            if record.reasoning_source == "deterministic":
+                rendered_focus = f"Deterministic next focus: {next_focus}"
             seen.add(next_focus)
             candidates.append(
                 (
-                    next_focus,
+                    rendered_focus,
                     _score_open_question(
-                        next_focus,
+                        rendered_focus,
                         pending_themes=pending_themes,
                         implemented_themes=implemented_themes,
                     ),

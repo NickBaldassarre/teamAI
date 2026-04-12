@@ -157,6 +157,17 @@ class BridgeLauncherTest(unittest.TestCase):
         self.assertIn("retrying_after_memory_pressure", rendered)
         self.assertIn("Memory pressure detected. Retrying with", rendered)
 
+    def test_launch_bridge_uses_subprocess_fallback_off_macos(self) -> None:
+        process = type("_Process", (), {"pid": 4242})()
+
+        with patch("sys.platform", "linux"), patch("subprocess.Popen", return_value=process) as popen:
+            status = launch_bridge(self.config, dry_run=False)
+
+        self.assertEqual(status["state"], "launched")
+        self.assertEqual(status["launch_mode"], "subprocess")
+        self.assertEqual(status["pid"], 4242)
+        popen.assert_called_once()
+
     def test_load_bridge_status_preserves_memory_pressure_payload(self) -> None:
         self.artifacts.status_file.parent.mkdir(parents=True, exist_ok=True)
         self.artifacts.status_file.write_text(

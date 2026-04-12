@@ -16,6 +16,9 @@ DEFAULT_MAX_FILE_BYTES = 50_000
 DEFAULT_MAX_COMMAND_OUTPUT_CHARS = 12_000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+DEFAULT_ALLOW_GIT_PUSH = False
+DEFAULT_DEFAULT_HANDOFF_ENGINE = "codex"
+DEFAULT_MAX_INLINE_HANDOFF_REVISIONS = 1
 
 
 class ConfigError(ValueError):
@@ -71,6 +74,9 @@ class Settings:
     host: str
     port: int
     model_router: bool = False
+    allow_git_push: bool = DEFAULT_ALLOW_GIT_PUSH
+    default_handoff_engine: str = DEFAULT_DEFAULT_HANDOFF_ENGINE
+    max_inline_handoff_revisions: int = DEFAULT_MAX_INLINE_HANDOFF_REVISIONS
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -120,6 +126,16 @@ class Settings:
             host=os.getenv("TEAMAI_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST,
             port=_env_int("TEAMAI_PORT", DEFAULT_PORT, minimum=1),
             model_router=_env_bool("TEAMAI_MODEL_ROUTER", False),
+            allow_git_push=_env_bool("TEAMAI_ALLOW_GIT_PUSH", DEFAULT_ALLOW_GIT_PUSH),
+            default_handoff_engine=(
+                os.getenv("TEAMAI_DEFAULT_HANDOFF_ENGINE", DEFAULT_DEFAULT_HANDOFF_ENGINE).strip().lower()
+                or DEFAULT_DEFAULT_HANDOFF_ENGINE
+            ),
+            max_inline_handoff_revisions=_env_int(
+                "TEAMAI_MAX_INLINE_HANDOFF_REVISIONS",
+                DEFAULT_MAX_INLINE_HANDOFF_REVISIONS,
+                minimum=0,
+            ),
         )
 
     def resolve_workspace(self, requested_path: str | None) -> Path:

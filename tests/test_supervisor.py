@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from teamai.agent_registry import AgentEntry, RouteHealth, RoutingDecision
+from teamai.approvals import PatchApprovalStore
 from teamai.config import Settings
 from teamai.model_backend import ModelResponse
 from teamai.schemas import PlannerTurn, RoundRecord, RunEvent, RunRequest, ToolAction, ToolExecutionResult, VerifierVerdict
@@ -97,6 +99,33 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
 
         self.assertEqual(planner.actions[0].tool, "read_file")
         self.assertIn("required repair", warnings[0])
+
+    def test_routing_keeps_configured_model_when_model_router_is_disabled(self) -> None:
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([]))
+        original_backend = supervisor._backend  # noqa: SLF001 - asserting current routing behavior
+
+        supervisor._apply_routing_decision(  # noqa: SLF001 - exercising routing application directly
+            RoutingDecision(
+                agent=AgentEntry(
+                    id="local_gemma_large",
+                    name="Gemma 4 12B 4-bit (Local MLX)",
+                    type="local_mlx",
+                    model_id="mlx-community/gemma-4-12b-it-4bit",
+                    capabilities=["explicit_write_loop"],
+                    max_context_tokens=4096,
+                    cost="free",
+                    latency="medium",
+                    requires_env=[],
+                ),
+                capability="explicit_write_loop",
+                score=20.0,
+                reasons=("explicit_write=+16",),
+                health=RouteHealth(capability="explicit_write_loop"),
+            )
+        )
+
+        self.assertEqual(supervisor._active_model_id, self.settings.model_id)  # noqa: SLF001
+        self.assertIs(supervisor._backend, original_backend)  # noqa: SLF001
 
     def test_planner_heuristic_fallback_uses_readme(self) -> None:
         (self.workspace / "README.md").write_text("# demo\n", encoding="utf-8")
@@ -536,8 +565,12 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.stop_reason, "inspection_synthesized")
+        self.assertTrue(result.final_answer.startswith("[deterministic-synthesis]"))
         self.assertIn("Next engineering tasks", result.final_answer)
         self.assertIn("Runtime settings are centralized", result.final_answer)
+        self.assertEqual(result.rounds[0].reasoning_source, "deterministic")
+        self.assertIn("Reasoning Source\ndeterministic", result.transcript)
+        self.assertIn("deterministic route", result.transcript)
 
     def test_repository_inspection_run_can_complete_without_model_calls(self) -> None:
         (self.workspace / "README.md").write_text(
@@ -563,8 +596,12 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.stop_reason, "inspection_synthesized")
+        self.assertTrue(result.final_answer.startswith("[deterministic-synthesis]"))
         self.assertIn("Next engineering tasks", result.final_answer)
         self.assertIn("Runtime settings are centralized", result.final_answer)
+        self.assertEqual(result.rounds[0].reasoning_source, "deterministic")
+        self.assertIn("Reasoning Source\ndeterministic", result.transcript)
+        self.assertIn("deterministic route", result.transcript)
 
     def test_repository_inspection_deterministic_route_reads_pyproject_early_when_available(self) -> None:
         (self.workspace / "README.md").write_text("# teamAI\nlocal-first closed-loop orchestration\n", encoding="utf-8")
@@ -620,6 +657,10 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                     '{"summary":"Prepare a README patch.","should_stop":false,"final_answer":null,"actions":['
                     '{"tool":"write_file","reason":"Propose a README update.","args":{"path":"README.md","content":"# updated\\n"}}]}'
                 ),
+                (
+                    '{"done":false,"confidence":0.8,"summary":"A patch approval is now pending review.",'
+                    '"next_focus":"Review and apply the pending patch approval, then continue the task."}'
+                ),
             ]
         )
 
@@ -628,6 +669,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 task="Update the README with a patch-oriented approval flow.",
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
             ),
         )
 
@@ -636,7 +678,9 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertIn("teamai approvals show", result.final_answer)
         self.assertIn("No file changes were applied yet.", result.final_answer)
         self.assertEqual((self.workspace / "README.md").read_text(encoding="utf-8"), "# demo\n")
-        self.assertEqual(result.rounds[0].verifier.summary, "Patch approval is required before the proposed file changes can be applied.")
+        self.assertEqual(result.rounds[0].verifier.summary, "A patch approval is now pending review.")
+        self.assertEqual(result.rounds[0].reasoning_source, "model")
+        self.assertIn("Reasoning Source\nmodel", result.transcript)
 
     def test_workspace_write_run_fails_fast_when_writes_are_disabled(self) -> None:
         result = ClosedLoopSupervisor(self.settings, backend=FakeBackend([])).run(
@@ -1074,6 +1118,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 task="Use workspace_write mode. Add the import 'import threading' to teamai/api.py.",
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
             ),
         )
 
@@ -1162,6 +1207,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 ),
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
                 max_rounds=1,
                 max_actions_per_round=2,
             ),
@@ -1214,6 +1260,9 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual(result.stop_reason, "approval_required")
         self.assertEqual(len(result.rounds), 1)
         self.assertIn("deterministic", result.rounds[0].planner.summary.lower())
+        self.assertEqual(result.rounds[0].reasoning_source, "deterministic")
+        self.assertTrue(result.final_answer.startswith("[deterministic-synthesis]"))
+        self.assertIn("Reasoning Source\ndeterministic", result.transcript)
         approval_files = sorted((self.workspace / ".teamai" / "approvals").glob("*.json"))
         self.assertEqual(len(approval_files), 1)
         self.assertIn("New note.", approval_files[0].read_text(encoding="utf-8"))
@@ -1370,6 +1419,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 ),
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
                 max_rounds=1,
                 max_actions_per_round=2,
             ),
@@ -1489,6 +1539,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 task="Implement better task routing across the supervisor and bridge.",
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
                 max_rounds=2,
                 max_actions_per_round=3,
             ),
@@ -1580,6 +1631,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                 task="Use workspace_write mode. Update README.md to clarify the patch approval caveat in the approval section.",
                 workspace_path=".",
                 execution_mode="workspace_write",
+                write_policy="propose_only",
                 max_rounds=4,
                 max_actions_per_round=2,
             ),
@@ -1831,6 +1883,10 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                     '{"summary":"Patch ready.","should_stop":false,"final_answer":null,"actions":['
                     '{"tool":"replace_in_file","reason":"Attempt the patch.","args":{"path":"README.md","old_text":"In `workspace_write` mode, write actions no longer mutate files immediately. They create pending patch approvals under `.teamai/approvals/`, stop the run with `approval_required`, and tell you how to review or apply the patch.","new_text":"In `workspace_write` mode, write actions","replace_all":false}}]}'
                 ),
+                (
+                    '{"done":false,"confidence":0.8,"summary":"A patch approval is pending after the corrected replace_in_file action.",'
+                    '"next_focus":"Review and apply the pending patch approval, then continue the task."}'
+                ),
             ]
         )
 
@@ -1937,6 +1993,94 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual(result.rounds[0].tool_results[0].tool, "read_file")
         self.assertIn("patched line", result.rounds[0].tool_results[0].output)
         self.assertEqual(result.task_route, "multi_agent_loop")
+
+    def test_deterministic_bundle_patch_can_close_after_verified_continuation_probe(self) -> None:
+        (self.workspace / "app.py").write_text(
+            "def normalize_name(value: str) -> str:\n"
+            "    return value\n",
+            encoding="utf-8",
+        )
+        tests_dir = self.workspace / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_app.py").write_text(
+            "import unittest\n\n"
+            "from app import normalize_name\n\n\n"
+            "class NormalizeNameTest(unittest.TestCase):\n"
+            "    def test_preserves_original_value(self) -> None:\n"
+            "        self.assertEqual(normalize_name('Jane Doe'), 'Jane Doe')\n\n\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n",
+            encoding="utf-8",
+        )
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=4,
+            max_actions_per_round=3,
+            max_tokens_per_turn=192,
+            temperature=0.3,
+            allow_shell=True,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=20_000,
+            max_command_output_chars=20_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+        task = (
+            "Use workspace_write mode. Read app.py and tests/test_app.py, update normalize_name so it trims whitespace "
+            "and title-cases each word, then add or update a unittest that proves '  jAnE   DOE  ' becomes 'Jane Doe'."
+        )
+
+        initial = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task=task,
+                workspace_path=".",
+                execution_mode="workspace_write",
+                write_policy="propose_only",
+                max_rounds=4,
+                max_actions_per_round=3,
+                max_tokens_per_turn=192,
+            )
+        )
+
+        self.assertEqual(initial.task_route, "deterministic_patch")
+        self.assertEqual(initial.stop_reason, "approval_required")
+        approval_id = str(initial.rounds[0].tool_results[0].metadata["approval_id"])
+        approval = PatchApprovalStore().apply(workspace=self.workspace, approval_id=approval_id)
+        self.assertEqual(approval["change_count"], 2)
+        self.assertEqual(sorted(approval["changed_paths"]), ["app.py", "tests/test_app.py"])
+
+        store = PatchApprovalStore()
+        continuation_context = store.build_continuation_context(approval, workspace=self.workspace)
+        continuation_task = store.build_continuation_task(
+            approval,
+            continuation_context=continuation_context,
+        )
+        continued = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task=continuation_task,
+                workspace_path=".",
+                execution_mode=store.continuation_execution_mode(approval),
+                write_policy="propose_only",
+                max_rounds=4,
+                max_actions_per_round=3,
+                max_tokens_per_turn=192,
+                continuation_context=continuation_context,
+            )
+        )
+
+        self.assertEqual(continued.status, "completed")
+        self.assertEqual(continued.stop_reason, "verifier_declared_complete")
+        self.assertEqual(continued.rounds[0].round_number, 0)
+        self.assertTrue(any(result.tool == "run_command" and result.success for result in continued.rounds[0].tool_results))
+        self.assertIn("tests.test_app", continued.final_answer)
+        self.assertEqual((self.workspace / "app.py").read_text(encoding="utf-8"), "def normalize_name(value: str) -> str:\n    return \" \".join(part.capitalize() for part in value.split())\n")
+        self.assertIn("self.assertEqual(normalize_name('  jAnE   DOE  '), 'Jane Doe')", (tests_dir / "test_app.py").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

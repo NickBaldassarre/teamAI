@@ -4,12 +4,33 @@ import json
 import os
 import re
 import textwrap
+import hashlib
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from pydantic import ValidationError
 
+from .agent_registry import AgentRegistry, RoutingDecision, TaskSignature
+from .autonomy import (
+    AutonomousRunStateStore,
+    ContextPackager,
+    PatchExecutionContext,
+    PatchExecutor,
+    RepoIndexer,
+    SafeCommandExecutor,
+    build_commit_message,
+    classify_failure,
+    collect_workspace_changes,
+    compute_complexity,
+    derive_write_policy,
+    infer_task_scopes,
+    new_run_state,
+    render_change_diff,
+    update_run_state_metrics,
+)
 from .config import Settings
 from .distillation import generate_semantic_skeleton
 from .events import build_run_event
@@ -17,28 +38,37 @@ from .handoff import build_handoff_packet
 from .json_utils import JsonExtractionError, extract_json_object
 from .model_backend import MLXModelBackend, ModelBackendError
 from .memory import WorkspaceMemorySnapshot, WorkspaceMemoryStore
+from .patch_utils import extract_patch_targets
 from .prompts import (
     CRITIC_SYSTEM_PROMPT,
     JSON_REPAIR_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT_TEMPLATE,
     PLANNER_JSON_SCHEMA,
-    ROUTE_CLASSIFIER_PROMPT,
     STRATEGIST_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
     VERIFIER_JSON_SCHEMA,
     build_round_context,
 )
 from .schemas import (
+    AutonomousRunState,
+    CheckExecution,
     CodexHandoffPayload,
+    FailureDiagnosis,
+    HandoffArtifact,
     PlannerTurn,
+    RepoIndex,
+    RepairAttempt,
     RoundRecord,
+    RoutingTraceEntry,
     RunRequest,
     RunEvent,
     RunResult,
     ToolAction,
     ToolExecutionResult,
+    VerifierOutput,
     VerifierVerdict,
 )
+from .sandbox import Sandbox
 from .tools import WorkspaceTools
 
 
@@ -50,14 +80,40 @@ _VALID_ROUTES: frozenset[str] = frozenset({
     "multi_agent_loop",
 })
 
+# Marker prepended to any final answer assembled by deterministic synthesis
+# rather than written by the local model. The marker travels with the answer
+# wherever it is persisted (transcripts, run history, handoff payloads, eval
+# reports) so downstream readers cannot conflate templated text with model
+# reasoning.
+DETERMINISTIC_SYNTHESIS_LABEL = "[deterministic-synthesis]"
+
+# Placeholder rendered in transcripts when a deterministic route does not
+# invoke the model for the strategist/critic step. The on-disk RoundRecord
+# stores empty strings; the transcript renderer substitutes this notice so
+# readers can immediately tell that no model reasoning was generated.
+DETERMINISTIC_PERSONA_TRANSCRIPT_NOTICE = (
+    "(deterministic route — no model strategist/critic was generated for this round)"
+)
+
 
 class ClosedLoopSupervisor:
     def __init__(self, settings: Settings, backend: MLXModelBackend | None = None) -> None:
         self._settings = settings
         self._backend = backend or MLXModelBackend(settings)
+        self._owns_backend = backend is None
+        self._backend_by_model: dict[str, MLXModelBackend] = {settings.model_id: self._backend}
         self._memory = WorkspaceMemoryStore()
         self._tools = WorkspaceTools(settings)
-        self._route_cache: dict[str, str] = {}
+        self._registry = AgentRegistry.load()
+        self._repo_indexer = RepoIndexer()
+        self._context_packager = ContextPackager()
+        self._patch_executor = PatchExecutor()
+        self._safe_commands = SafeCommandExecutor(timeout_seconds=settings.command_timeout_seconds)
+        self._run_state_store = AutonomousRunStateStore()
+        self._last_routing_decision: RoutingDecision | None = None
+        self._active_model_id = settings.model_id
+        self._last_planner_json_repairs = 0
+        self._last_verifier_json_repairs = 0
 
     @property
     def model_loaded(self) -> bool:
@@ -76,6 +132,10 @@ class ClosedLoopSupervisor:
         max_tokens = request.max_tokens_per_turn or self._settings.max_tokens_per_turn
         temperature = request.temperature if request.temperature is not None else self._settings.temperature
         execution_mode = request.execution_mode
+        write_policy = derive_write_policy(
+            execution_mode=execution_mode,
+            requested_policy=request.write_policy,
+        )
         continuation_context = request.continuation_context or {}
 
         warnings: list[str] = []
@@ -84,6 +144,38 @@ class ClosedLoopSupervisor:
         stop_reason = "max_rounds_reached"
         status: RunResult["status"] = "stopped"
         event_sequence = 0
+        self._last_routing_decision = None
+        self._active_model_id = self._settings.model_id
+        self._backend = self._backend_by_model.get(self._settings.model_id, self._backend)
+        self._last_planner_json_repairs = 0
+        self._last_verifier_json_repairs = 0
+
+        if execution_mode == "workspace_write" and write_policy not in {"read_only", "propose_only"}:
+            preview_route = self._classify_task_route(
+                task=request.task,
+                execution_mode=execution_mode,
+                workspace=workspace,
+                continuation_context=continuation_context,
+            )
+            if preview_route == "codex_handoff" and not self._can_inline_escalate(
+                request=request,
+                task_route=preview_route,
+            ):
+                execution_mode = "read_only"
+                write_policy = "read_only"
+            else:
+                return self._run_autonomous_workspace_write(
+                    request=request,
+                    workspace=workspace,
+                    started_at=started_at,
+                    max_rounds=max_rounds,
+                    max_actions=max_actions,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    write_policy=write_policy,
+                    progress_callback=progress_callback,
+                    event_callback=event_callback,
+                )
 
         def emit_progress(message: str) -> None:
             nonlocal event_sequence
@@ -119,7 +211,7 @@ class ClosedLoopSupervisor:
                     final_answer=final_answer,
                     warnings=warnings,
                     completed_at=completed_at,
-                    model_id=self._settings.model_id,
+                    model_id=self._active_model_id,
                     task_route=task_route,
                     execution_mode=execution_mode,
                     rounds=round_records,
@@ -128,9 +220,10 @@ class ClosedLoopSupervisor:
                 warnings.append(f"Failed to persist workspace memory: {exc}")
             return RunResult(
                 status=status,
-                model_id=self._settings.model_id,
+                model_id=self._active_model_id,
                 workspace=str(workspace),
                 execution_mode=execution_mode,
+                write_policy=write_policy,
                 task_route=task_route,
                 stop_reason=stop_reason,
                 final_answer=final_answer,
@@ -159,7 +252,7 @@ class ClosedLoopSupervisor:
 
         emit_progress(
             f"Starting run in {workspace} "
-            f"(mode={execution_mode}, max_rounds={max_rounds}, max_actions={max_actions})"
+            f"(mode={execution_mode}, write_policy={write_policy}, max_rounds={max_rounds}, max_actions={max_actions})"
         )
         emit_progress(f"Task route: {task_route}")
 
@@ -178,6 +271,15 @@ class ClosedLoopSupervisor:
                 )
                 if probe_round is not None:
                     round_records.append(probe_round)
+                    continuation_completion = self._maybe_complete_after_continuation_probe(
+                        task=request.task,
+                        workspace=workspace,
+                        continuation_context=continuation_context,
+                        probe_round=probe_round,
+                    )
+                    if continuation_completion is not None:
+                        final_answer, stop_reason, status = continuation_completion
+                        emit_progress(f"Completed: {stop_reason}")
             if task_route == "deterministic_patch":
                 (
                     deterministic_rounds,
@@ -271,12 +373,14 @@ class ClosedLoopSupervisor:
                     workspace=workspace,
                     previous_rounds=round_records,
                     execution_mode=execution_mode,
+                    write_policy=write_policy,
                     task_route=task_route,
                     max_actions=max_actions,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     warnings=warnings,
                 )
+                planner_json_repairs = self._last_planner_json_repairs
 
                 if planner.actions:
                     emit_progress(
@@ -288,35 +392,12 @@ class ClosedLoopSupervisor:
                     planner.actions[:max_actions],
                     workspace=workspace,
                     execution_mode=execution_mode,
+                    write_policy=write_policy,
                     approval_context={
                         "task": request.task,
                         "execution_mode": execution_mode,
                     },
                 )
-
-                pending_approvals = self._collect_pending_approvals(tool_results, workspace)
-                if pending_approvals:
-                    verifier = VerifierVerdict(
-                        done=False,
-                        confidence=0.9,
-                        summary="Patch approval is required before the proposed file changes can be applied.",
-                        next_focus="Review and apply the pending patch approval, then continue the task.",
-                    )
-                    round_records.append(
-                        RoundRecord(
-                            round_number=round_number,
-                            strategist=strategist,
-                            critic=critic,
-                            planner=planner,
-                            tool_results=tool_results,
-                            verifier=verifier,
-                        )
-                    )
-                    final_answer = self._build_approval_required_answer(pending_approvals)
-                    stop_reason = "approval_required"
-                    status = "stopped"
-                    emit_progress(f"Stopped: {stop_reason}")
-                    break
 
                 verifier_context = self._build_verifier_context(
                     task=request.task,
@@ -333,6 +414,27 @@ class ClosedLoopSupervisor:
                     temperature=temperature,
                     warnings=warnings,
                 )
+                verifier_json_repairs = self._last_verifier_json_repairs
+
+                pending_approvals = self._collect_pending_approvals(tool_results, workspace)
+                if pending_approvals:
+                    round_records.append(
+                        RoundRecord(
+                            round_number=round_number,
+                            strategist=strategist,
+                            critic=critic,
+                            planner=planner,
+                            tool_results=tool_results,
+                            verifier=verifier,
+                            planner_json_repairs=planner_json_repairs,
+                            verifier_json_repairs=verifier_json_repairs,
+                        )
+                    )
+                    final_answer = self._build_approval_required_answer(pending_approvals)
+                    stop_reason = "approval_required"
+                    status = "stopped"
+                    emit_progress(f"Stopped: {stop_reason}")
+                    break
 
                 round_records.append(
                     RoundRecord(
@@ -342,6 +444,8 @@ class ClosedLoopSupervisor:
                         planner=planner,
                         tool_results=tool_results,
                         verifier=verifier,
+                        planner_json_repairs=planner_json_repairs,
+                        verifier_json_repairs=verifier_json_repairs,
                     )
                 )
 
@@ -465,6 +569,9 @@ class ClosedLoopSupervisor:
             final_answer = "The local model backend failed before the loop could finish."
             emit_progress(f"Failed: {stop_reason}")
 
+        if self._rounds_are_fully_deterministic(round_records):
+            final_answer = self._label_deterministic_synthesis(final_answer)
+
         completed_at = datetime.now(timezone.utc)
         try:
             self._memory.persist_run(
@@ -475,7 +582,7 @@ class ClosedLoopSupervisor:
                 final_answer=final_answer,
                 warnings=warnings,
                 completed_at=completed_at,
-                model_id=self._settings.model_id,
+                model_id=self._active_model_id,
                 task_route=task_route,
                 execution_mode=execution_mode,
                 rounds=round_records,
@@ -487,9 +594,10 @@ class ClosedLoopSupervisor:
 
         provisional_result = RunResult(
             status=status,
-            model_id=self._settings.model_id,
+            model_id=self._active_model_id,
             workspace=str(workspace),
             execution_mode=execution_mode,
+            write_policy=write_policy,
             task_route=task_route,
             stop_reason=stop_reason,
             final_answer=final_answer,
@@ -525,6 +633,820 @@ class ClosedLoopSupervisor:
     ) -> None:
         if callback is not None:
             callback(message)
+
+    def _run_autonomous_workspace_write(
+        self,
+        *,
+        request: RunRequest,
+        workspace: Path,
+        started_at: datetime,
+        max_rounds: int,
+        max_actions: int,
+        max_tokens: int,
+        temperature: float,
+        write_policy: str,
+        progress_callback: Callable[[str], None] | None,
+        event_callback: Callable[[RunEvent], None] | None,
+    ) -> RunResult:
+        warnings: list[str] = []
+        round_records: list[RoundRecord] = []
+        final_answer = ""
+        stop_reason = "max_rounds_reached"
+        status: RunResult["status"] = "stopped"
+        event_sequence = 0
+
+        def emit_progress(message: str) -> None:
+            nonlocal event_sequence
+            self._emit_progress(progress_callback, message)
+            if event_callback is None:
+                return
+            event_sequence += 1
+            event_callback(build_run_event(sequence=event_sequence, message=message))
+
+        if not self._settings.allow_writes:
+            final_answer = (
+                "Run refused: autonomous write policy was requested, but TEAMAI_ALLOW_WRITES is false in local configuration."
+            )
+            warnings.append(final_answer)
+            completed_at = datetime.now(timezone.utc)
+            return RunResult(
+                status="failed",
+                model_id=self._active_model_id,
+                workspace=str(workspace),
+                execution_mode=request.execution_mode,
+                write_policy=write_policy,  # type: ignore[arg-type]
+                task_route="write_disabled_preflight",
+                stop_reason="write_disabled_preflight",
+                final_answer=final_answer,
+                transcript=self._render_transcript(round_records, request.task, workspace, warnings),
+                rounds=round_records,
+                warnings=warnings,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+        repo_index = self._repo_indexer.build(workspace)
+        scopes = infer_task_scopes(task=request.task, workspace=workspace, repo_index=repo_index)
+        complexity = compute_complexity(
+            task=request.task,
+            repo_index=repo_index,
+            expected_files_touched=max(len(scopes), 1),
+        )
+        run_state = new_run_state(workspace=workspace, policy=write_policy, complexity=complexity)
+        task_route = self._classify_task_route(
+            task=request.task,
+            execution_mode=request.execution_mode,
+            workspace=workspace,
+            continuation_context=request.continuation_context,
+        )
+        emit_progress(
+            f"Starting sandboxed autonomous run in {workspace} "
+            f"(mode={request.execution_mode}, write_policy={write_policy}, max_rounds={max_rounds}, max_actions={max_actions})"
+        )
+        emit_progress(f"Task route: {task_route}")
+
+        with Sandbox(workspace, preserve_git=True) as sandbox:
+            sandbox_workspace = sandbox.path
+            run_state = run_state.model_copy(update={"sandbox_path": str(sandbox_workspace)})
+            memory_snapshot = self._memory.load_snapshot(
+                workspace,
+                task=request.task,
+                task_route=task_route,
+                continuation_context=request.continuation_context,
+            )
+            sandbox_repo_index = self._repo_indexer.build(sandbox_workspace)
+            allowed_scopes = infer_task_scopes(task=request.task, workspace=sandbox_workspace, repo_index=sandbox_repo_index)
+            self._append_routing_trace(
+                run_state,
+                stage="initial_route",
+                capability=task_route,
+                model_id=self._active_model_id,
+                agent_id=getattr(self._last_routing_decision.agent, "id", None) if self._last_routing_decision else None,
+                score=self._last_routing_decision.score if self._last_routing_decision else None,
+                reasons=self._last_routing_decision.reasons if self._last_routing_decision else (),
+                complexity=run_state.complexity,
+                outcome="selected",
+            )
+            json_repair_rounds = 0
+            active_agent = self._active_agent_entry()
+            if (
+                getattr(active_agent, "is_local", False)
+                and run_state.complexity == "high"
+                and int(getattr(active_agent, "max_context_tokens", 0) or 0) < 4096
+            ):
+                escalated_route = self._try_escalate_to_stronger_local(
+                    task_route=task_route,
+                    run_state=run_state,
+                    reason="repository_complexity_above_local_threshold",
+                    emit_progress=emit_progress,
+                    warnings=warnings,
+                )
+                if escalated_route is not None:
+                    task_route = escalated_route
+
+            if task_route == "codex_handoff" and not final_answer:
+                escalated_route = self._try_escalate_to_stronger_local(
+                    task_route=task_route,
+                    run_state=run_state,
+                    reason="broad_task_requires_inline_escalation",
+                    emit_progress=emit_progress,
+                    warnings=warnings,
+                )
+                if escalated_route is not None:
+                    task_route = escalated_route
+                else:
+                    handoff_result = self._execute_inline_verified_handoff(
+                        task=request.task,
+                        request=request,
+                        sandbox_workspace=sandbox_workspace,
+                        repo_index=sandbox_repo_index,
+                        task_scopes=allowed_scopes,
+                        round_records=round_records,
+                        run_state=run_state,
+                        reason="broad_task_requires_inline_verified_handoff",
+                        emit_progress=emit_progress,
+                        warnings=warnings,
+                    )
+                    if handoff_result.get("accepted", False):
+                        final_answer = str(
+                            handoff_result.get("summary")
+                            or "Inline verified handoff produced a patch that passed checks."
+                        )
+                        stop_reason = "inline_verified_handoff_verified"
+                        status = "completed"
+                    else:
+                        stop_reason = str(handoff_result.get("stop_reason", "verified_handoff_rejected"))
+                        status = "stopped"
+                        final_answer = str(
+                            handoff_result.get("final_answer")
+                            or "Inline verified handoff could not produce an acceptable patch."
+                        )
+
+            if not final_answer:
+                for round_number in range(1, max_rounds + 1):
+                    run_state.round_number = round_number
+                    emit_progress(f"Round {round_number}/{max_rounds}: building context")
+                    latest_failure = run_state.failures_encountered[-1] if run_state.failures_encountered else None
+                    current_diff = self._current_diff_text(
+                        workspace=workspace,
+                        sandbox_workspace=sandbox_workspace,
+                    )
+                    context = self._build_context(
+                        task=request.task,
+                        workspace=sandbox_workspace,
+                        round_number=round_number,
+                        task_route=task_route,
+                        memory_snapshot=memory_snapshot,
+                        continuation_context=request.continuation_context,
+                        previous_rounds=round_records,
+                        repo_index=sandbox_repo_index,
+                        task_scopes=allowed_scopes,
+                        changed_paths=tuple(run_state.files_changed),
+                        failure_output=latest_failure.raw_output if latest_failure is not None else "",
+                        prior_failed_repairs=tuple(
+                            f"{attempt.status}: {attempt.strategy}"
+                            for attempt in run_state.repair_attempts[-4:]
+                        ),
+                        current_diff=current_diff,
+                    )
+
+                    strategist = ""
+                    critic = ""
+                    planner: PlannerTurn
+                    if round_number == 1 and task_route == "deterministic_patch":
+                        compiled = self._compile_small_write_action_from_task(task=request.task, workspace=sandbox_workspace)
+                        if compiled is None:
+                            planner = PlannerTurn(
+                                summary="Autonomous route could not compile a deterministic patch.",
+                                should_stop=False,
+                                final_answer=None,
+                                actions=[],
+                            )
+                        else:
+                            planner = PlannerTurn(
+                                summary="Deterministic autonomous route compiled the requested patch directly in sandbox.",
+                                should_stop=False,
+                                final_answer=None,
+                                actions=[compiled],
+                            )
+                    else:
+                        emit_progress(f"Round {round_number}/{max_rounds}: strategist")
+                        strategist = self._ask_model(
+                            system_prompt=STRATEGIST_SYSTEM_PROMPT,
+                            user_prompt=context,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+                        critic_context = (
+                            f"{context}\n\nStrategist output:\n{strategist}\n\n"
+                            "Respond with critique and missing considerations."
+                        )
+                        emit_progress(f"Round {round_number}/{max_rounds}: critic")
+                        critic = self._ask_model(
+                            system_prompt=CRITIC_SYSTEM_PROMPT,
+                            user_prompt=critic_context,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+                        planner_context = (
+                            f"{context}\n\nStrategist output:\n{strategist}\n\n"
+                            f"Critic output:\n{critic}\n\n"
+                            "Create the next action plan."
+                        )
+                        emit_progress(f"Round {round_number}/{max_rounds}: planner")
+                        planner = self._plan(
+                            task=request.task,
+                            user_prompt=planner_context,
+                            workspace=sandbox_workspace,
+                            previous_rounds=round_records,
+                            execution_mode=request.execution_mode,
+                            write_policy=write_policy,
+                            task_route=task_route,
+                            max_actions=max_actions,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            warnings=warnings,
+                        )
+
+                    if self._last_planner_json_repairs > 0:
+                        json_repair_rounds += 1
+                    else:
+                        json_repair_rounds = 0
+
+                    emit_progress(
+                        f"Round {round_number}/{max_rounds}: executing {len(planner.actions[:max_actions])} tool action(s)"
+                    )
+                    tool_results = self._tools.execute_actions(
+                        planner.actions[:max_actions],
+                        workspace=sandbox_workspace,
+                        execution_mode=request.execution_mode,
+                        approval_context={
+                            "task": request.task,
+                            "execution_mode": request.execution_mode,
+                        },
+                        write_policy=write_policy,
+                        patch_context=PatchExecutionContext(
+                            policy=write_policy,  # type: ignore[arg-type]
+                            phase="sandbox",
+                            allowed_path_scopes=allowed_scopes,
+                        ),
+                    )
+
+                    changed_paths = self._collect_directly_applied_paths(tool_results)
+                    check_records: list[CheckExecution] = []
+                    if changed_paths:
+                        run_state.files_changed = list(dict.fromkeys([*run_state.files_changed, *changed_paths]))
+                        check_result = self._tools.execute_actions(
+                            [
+                                ToolAction(
+                                    tool="run_checks",
+                                    reason="Validate the edited files before merging them back to the workspace.",
+                                    args={"paths": changed_paths},
+                                )
+                            ],
+                            workspace=sandbox_workspace,
+                            execution_mode="read_only",
+                        )[0]
+                        tool_results.append(check_result)
+                        raw_checks = check_result.metadata.get("checks", [])
+                        if isinstance(raw_checks, list):
+                            for item in raw_checks:
+                                try:
+                                    check_records.append(CheckExecution.model_validate(item))
+                                except ValidationError:
+                                    continue
+                        run_state.checks_run.extend(check_records)
+                        diagnosis = classify_failure(check_records)
+                        if not check_result.success:
+                            if diagnosis is None:
+                                diagnosis = FailureDiagnosis(
+                                    failure_type="unknown",
+                                    summary="Sandbox checks failed, but the failure could not be classified cleanly.",
+                                    strategy="Inspect the failing check output, repair the smallest broken surface, and rerun the narrowest check first.",
+                                    raw_output=check_result.output,
+                                )
+                            run_state.failures_encountered.append(diagnosis)
+                            run_state.hypotheses.append(diagnosis.strategy)
+                            run_state.repair_attempts.append(
+                                RepairAttempt(
+                                    round_number=round_number,
+                                    failure_type=diagnosis.failure_type,
+                                    strategy=diagnosis.strategy,
+                                    status="failed",
+                                    notes=diagnosis.summary,
+                                )
+                            )
+                            verifier = VerifierVerdict(
+                                done=False,
+                                confidence=0.25,
+                                summary=diagnosis.summary,
+                                next_focus=diagnosis.strategy,
+                            )
+                            round_records.append(
+                                RoundRecord(
+                                    round_number=round_number,
+                                    strategist=strategist,
+                                    critic=critic,
+                                    planner=planner,
+                                    tool_results=tool_results,
+                                    verifier=verifier,
+                                    reasoning_source="deterministic" if task_route == "deterministic_patch" and round_number == 1 else "model",
+                                )
+                            )
+                            max_repairs = request.max_repair_attempts or 2
+                            if (
+                                len(run_state.failures_encountered) >= max_repairs
+                                or diagnosis.failure_type in {"missing_dependency", "unknown"}
+                            ):
+                                escalated_route = self._try_escalate_to_stronger_local(
+                                    task_route=task_route,
+                                    run_state=run_state,
+                                    reason="repair_budget_exhausted",
+                                    emit_progress=emit_progress,
+                                    warnings=warnings,
+                                )
+                                if escalated_route is not None:
+                                    task_route = escalated_route
+                                    continue
+                                handoff_result = self._execute_inline_verified_handoff(
+                                    task=request.task,
+                                    request=request,
+                                    sandbox_workspace=sandbox_workspace,
+                                    repo_index=sandbox_repo_index,
+                                    task_scopes=allowed_scopes,
+                                    round_records=round_records,
+                                    run_state=run_state,
+                                    reason="repair_budget_exhausted",
+                                    emit_progress=emit_progress,
+                                    warnings=warnings,
+                                )
+                                if handoff_result.get("accepted", False):
+                                    final_answer = str(
+                                        handoff_result.get("summary")
+                                        or "Inline verified handoff recovered the autonomous run."
+                                    )
+                                    stop_reason = "inline_verified_handoff_verified"
+                                    status = "completed"
+                                else:
+                                    warnings.append(diagnosis.summary)
+                                    handoff_stop = str(handoff_result.get("stop_reason", "repair_budget_exhausted"))
+                                    stop_reason = (
+                                        "repair_budget_exhausted"
+                                        if handoff_stop in {"verified_handoff_unavailable", "verified_handoff_failed"}
+                                        else handoff_stop
+                                    )
+                                    status = "stopped"
+                                    final_answer = str(
+                                        handoff_result.get("final_answer")
+                                        or (
+                                            f"Autonomous repair loop escalated after {len(run_state.failures_encountered)} "
+                                            f"failed verification attempt(s): {diagnosis.summary}"
+                                        )
+                                    )
+                                break
+                            continue
+
+                    if (
+                        task_route == "deterministic_patch"
+                        and changed_paths
+                        and all(check.returncode == 0 for check in check_records)
+                    ):
+                        verifier = VerifierVerdict(
+                            done=True,
+                            confidence=0.95,
+                            summary="Scoped sandbox checks passed after the deterministic patch.",
+                            next_focus="none",
+                        )
+                        run_state.verifier_outputs.append(
+                            VerifierOutput(
+                                source="operational",
+                                passed=True,
+                                confidence=0.95,
+                                summary=verifier.summary,
+                            )
+                        )
+                        round_records.append(
+                            RoundRecord(
+                                round_number=round_number,
+                                strategist=strategist,
+                                critic=critic,
+                                planner=planner,
+                                tool_results=tool_results,
+                                verifier=verifier,
+                                reasoning_source="deterministic",
+                            )
+                        )
+                        final_answer = planner.final_answer or verifier.summary
+                        stop_reason = "autonomous_checks_passed"
+                        status = "completed"
+                        break
+
+                    verifier_context = self._build_verifier_context(
+                        task=request.task,
+                        workspace=sandbox_workspace,
+                        strategist=strategist,
+                        critic=critic,
+                        planner=planner,
+                        tool_results=tool_results,
+                        repo_index=sandbox_repo_index,
+                        task_scopes=allowed_scopes,
+                        changed_paths=tuple(changed_paths),
+                        failure_output=latest_failure.raw_output if latest_failure is not None else "",
+                        prior_failed_repairs=tuple(
+                            f"{attempt.status}: {attempt.strategy}"
+                            for attempt in run_state.repair_attempts[-4:]
+                        ),
+                        current_diff=current_diff,
+                    )
+                    emit_progress(f"Round {round_number}/{max_rounds}: verifier")
+                    verifier = self._verify(
+                        verifier_context,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        warnings=warnings,
+                    )
+                    if self._last_verifier_json_repairs > 0:
+                        json_repair_rounds += 1
+                    else:
+                        json_repair_rounds = 0 if self._last_planner_json_repairs == 0 else json_repair_rounds
+                    operational_confidence = 0.85 if changed_paths and (not check_records or all(check.returncode == 0 for check in check_records)) else 0.0
+                    if changed_paths and operational_confidence:
+                        run_state.verifier_outputs.append(
+                            VerifierOutput(
+                                source="operational",
+                                passed=True,
+                                confidence=operational_confidence,
+                                summary="Scoped sandbox checks passed after the latest patch.",
+                            )
+                        )
+                    run_state.verifier_outputs.append(
+                        VerifierOutput(
+                            source="model",
+                            passed=verifier.done,
+                            confidence=verifier.confidence,
+                            summary=verifier.summary,
+                            next_focus=verifier.next_focus,
+                        )
+                    )
+                    round_records.append(
+                        RoundRecord(
+                            round_number=round_number,
+                            strategist=strategist,
+                            critic=critic,
+                            planner=planner,
+                            tool_results=tool_results,
+                            verifier=verifier,
+                            reasoning_source="deterministic" if task_route == "deterministic_patch" and round_number == 1 else "model",
+                        )
+                    )
+
+                    if not verifier.done and (
+                        json_repair_rounds >= 2
+                        or (
+                            verifier.confidence < 0.4
+                            and len(run_state.failures_encountered) >= max(1, request.max_repair_attempts or 2)
+                        )
+                    ):
+                        escalation_reason = (
+                            "planner_json_malformed_repeatedly" if json_repair_rounds >= 2 else "verifier_confidence_below_threshold"
+                        )
+                        escalated_route = self._try_escalate_to_stronger_local(
+                            task_route=task_route,
+                            run_state=run_state,
+                            reason=escalation_reason,
+                            emit_progress=emit_progress,
+                            warnings=warnings,
+                        )
+                        if escalated_route is not None:
+                            task_route = escalated_route
+                            continue
+                        handoff_result = self._execute_inline_verified_handoff(
+                            task=request.task,
+                            request=request,
+                            sandbox_workspace=sandbox_workspace,
+                            repo_index=sandbox_repo_index,
+                            task_scopes=allowed_scopes,
+                            round_records=round_records,
+                            run_state=run_state,
+                            reason=escalation_reason,
+                            emit_progress=emit_progress,
+                            warnings=warnings,
+                        )
+                        if handoff_result.get("accepted", False):
+                            final_answer = str(
+                                handoff_result.get("summary")
+                                or "Inline verified handoff completed the task."
+                            )
+                            stop_reason = "inline_verified_handoff_verified"
+                            status = "completed"
+                        else:
+                            stop_reason = str(
+                                handoff_result.get("stop_reason", "inline_escalation_failed")
+                            )
+                            status = "stopped"
+                            final_answer = str(
+                                handoff_result.get("final_answer")
+                                or "Inline escalation could not recover the run."
+                            )
+                        break
+
+                    if changed_paths and all(check.returncode == 0 for check in check_records):
+                        if planner.should_stop and planner.final_answer:
+                            final_answer = planner.final_answer
+                        elif verifier.done or self._is_explicit_write_task(request.task):
+                            final_answer = planner.final_answer or verifier.summary or "Autonomous sandbox checks passed."
+                        if final_answer:
+                            stop_reason = "autonomous_checks_passed"
+                            status = "completed"
+                            break
+
+                    if planner.should_stop and planner.final_answer and not changed_paths:
+                        final_answer = planner.final_answer
+                        stop_reason = "planner_declared_complete"
+                        status = "completed"
+                        break
+
+            if status == "completed" and run_state.files_changed:
+                run_state = update_run_state_metrics(run_state)
+                if final_answer and self._rounds_are_fully_deterministic(round_records):
+                    final_answer = self._label_deterministic_synthesis(final_answer)
+                merged = self._merge_autonomous_changes(
+                    workspace=workspace,
+                    sandbox_workspace=sandbox_workspace,
+                    task=request.task,
+                    run_state=run_state,
+                    write_policy=write_policy,
+                    allowed_scopes=scopes,
+                    auto_commit=request.auto_commit or request.auto_push,
+                    auto_push=request.auto_push,
+                    push_remote=request.push_remote,
+                    push_branch_name=request.push_branch_name,
+                )
+                warnings.extend(merged.get("warnings", []))
+                commit_metadata = merged.get("commit_metadata", {})
+                if not merged.get("applied", False):
+                    status = "stopped"
+                    stop_reason = merged.get("stop_reason", "approval_required")
+                    final_answer = str(merged.get("final_answer", final_answer))
+                    if final_answer and self._rounds_are_fully_deterministic(round_records):
+                        final_answer = self._label_deterministic_synthesis(final_answer)
+                else:
+                    if not final_answer:
+                        final_answer = "Applied the sandboxed changes to the workspace."
+                    run_state = run_state.model_copy(update={"final_outcome": stop_reason})
+                    completed_at = datetime.now(timezone.utc)
+                    persisted_state = self._run_state_store.persist(workspace=workspace, state=run_state)
+                    warnings.append(f"Autonomous run state: {persisted_state}")
+                    self._memory.persist_run(
+                        workspace=workspace,
+                        task=request.task,
+                        status=status,
+                        stop_reason=stop_reason,
+                        final_answer=final_answer,
+                        warnings=warnings,
+                        completed_at=completed_at,
+                        model_id=self._active_model_id,
+                        task_route=task_route,
+                        execution_mode=request.execution_mode,
+                        rounds=round_records,
+                        run_state=run_state,
+                    )
+                    return RunResult(
+                        status=status,
+                        model_id=self._active_model_id,
+                        workspace=str(workspace),
+                        execution_mode=request.execution_mode,
+                        write_policy=write_policy,  # type: ignore[arg-type]
+                        task_route=task_route,
+                        stop_reason=stop_reason,
+                        final_answer=final_answer,
+                        transcript=self._render_transcript(round_records, request.task, workspace, warnings),
+                        rounds=round_records,
+                        warnings=warnings,
+                        run_state=run_state,
+                        commit_metadata=commit_metadata if isinstance(commit_metadata, dict) else {},
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    )
+
+        run_state = update_run_state_metrics(run_state)
+        run_state = run_state.model_copy(update={"final_outcome": stop_reason})
+        completed_at = datetime.now(timezone.utc)
+        persisted_state = self._run_state_store.persist(workspace=workspace, state=run_state)
+        warnings.append(f"Autonomous run state: {persisted_state}")
+        self._memory.persist_run(
+            workspace=workspace,
+            task=request.task,
+            status=status,
+            stop_reason=stop_reason,
+            final_answer=final_answer or self._build_fallback_answer(round_records, request.task),
+            warnings=warnings,
+            completed_at=completed_at,
+            model_id=self._active_model_id,
+            task_route=task_route,
+            execution_mode=request.execution_mode,
+            rounds=round_records,
+            run_state=run_state,
+        )
+        return RunResult(
+            status=status,
+            model_id=self._active_model_id,
+            workspace=str(workspace),
+            execution_mode=request.execution_mode,
+            write_policy=write_policy,  # type: ignore[arg-type]
+            task_route=task_route,
+            stop_reason=stop_reason,
+            final_answer=final_answer or self._build_fallback_answer(round_records, request.task),
+            transcript=self._render_transcript(round_records, request.task, workspace, warnings),
+            rounds=round_records,
+            warnings=warnings,
+            run_state=run_state,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+
+    @staticmethod
+    def _collect_directly_applied_paths(tool_results: list[ToolExecutionResult]) -> list[str]:
+        changed_paths: list[str] = []
+        for result in tool_results:
+            receipt = result.metadata.get("mutation_receipt")
+            if not isinstance(receipt, dict):
+                continue
+            if not receipt.get("applied", False):
+                continue
+            for path in receipt.get("changed_paths", []) or []:
+                path_str = str(path)
+                if path_str and path_str not in changed_paths:
+                    changed_paths.append(path_str)
+        return changed_paths
+
+    @staticmethod
+    def _latest_check_batch_passed(checks: list[CheckExecution]) -> bool:
+        if not checks:
+            return False
+        saw_green = False
+        for check in reversed(checks):
+            if check.returncode != 0:
+                return saw_green
+            saw_green = True
+        return saw_green
+
+    def _merge_autonomous_changes(
+        self,
+        *,
+        workspace: Path,
+        sandbox_workspace: Path,
+        task: str,
+        run_state: AutonomousRunState,
+        write_policy: str,
+        allowed_scopes: tuple[str, ...],
+        auto_commit: bool,
+        auto_push: bool,
+        push_remote: str,
+        push_branch_name: str | None,
+    ) -> dict[str, object]:
+        changes = collect_workspace_changes(source_root=workspace, modified_root=sandbox_workspace)
+        if not changes:
+            return {
+                "applied": False,
+                "stop_reason": "no_changes_detected",
+                "final_answer": "Autonomous run completed its sandbox loop, but no file changes were produced.",
+                "warnings": [],
+            }
+        verifier_confidence = max(
+            [output.confidence for output in run_state.verifier_outputs if output.passed] or [0.0]
+        )
+        latest_checks_green = self._latest_check_batch_passed(run_state.checks_run)
+        receipt = self._patch_executor.execute_bundle(
+            workspace=workspace,
+            changes=changes,
+            reason=f"Autonomous run {run_state.task_id} for: {task}",
+            source_tool="autonomous_supervisor",
+            context=PatchExecutionContext(
+                policy=write_policy,  # type: ignore[arg-type]
+                phase="workspace",
+                allowed_path_scopes=allowed_scopes,
+                tests_passed=latest_checks_green,
+                verifier_confidence=verifier_confidence,
+            ),
+            continuation=None,
+        )
+        warnings: list[str] = []
+        commit_metadata: dict[str, object] = {}
+        final_answer = ""
+        stop_reason = "autonomous_merge_complete"
+        requested_branch_name = (push_branch_name or "").strip()
+        blocked_push_branch = requested_branch_name in {"main", "master", "default", "trunk"}
+        if receipt.approval_required and receipt.approval_id:
+            final_answer = self._build_approval_required_answer(
+                [
+                    {
+                        "approval_id": receipt.approval_id,
+                        "path": receipt.changed_paths[0] if receipt.changed_paths else "(unknown path)",
+                        "tool": "autonomous_merge",
+                    }
+                ]
+            )
+            stop_reason = "approval_required"
+            return {
+                "applied": False,
+                "stop_reason": stop_reason,
+                "final_answer": final_answer,
+                "warnings": warnings,
+            }
+        if not receipt.applied:
+            return {
+                "applied": False,
+                "stop_reason": "policy_violation",
+                "final_answer": receipt.blocked_reason or "Autonomous merge was blocked by policy.",
+                "warnings": warnings,
+            }
+        self._append_routing_trace(
+            run_state,
+            stage="merge",
+            capability="autonomous_merge",
+            model_id=self._active_model_id,
+            complexity=run_state.complexity,
+            outcome="applied",
+        )
+
+        if auto_commit and (workspace / ".git").exists():
+            branch_name = (
+                requested_branch_name
+                if requested_branch_name and not blocked_push_branch
+                else self._default_push_branch_name(run_state.task_id)
+            )
+            if blocked_push_branch:
+                warnings.append(
+                    f"Requested push branch `{requested_branch_name}` is protected; using local feature branch `{branch_name}` and skipping push."
+                )
+            branch_result = self._safe_commands.create_branch(workspace=workspace, branch_name=branch_name)
+            if branch_result.returncode != 0:
+                warnings.append(branch_result.stderr.strip() or "Autonomous branch creation failed.")
+            else:
+                add_result = self._safe_commands.git_add(workspace=workspace, paths=receipt.changed_paths)
+                if add_result.returncode != 0:
+                    warnings.append(add_result.stderr.strip() or "Autonomous git add failed.")
+                else:
+                    commit_message = build_commit_message(task=task, state=run_state)
+                    commit_result = self._safe_commands.git_commit(workspace=workspace, message=commit_message)
+                    if commit_result.returncode != 0:
+                        warnings.append(commit_result.stderr.strip() or "Autonomous git commit failed.")
+                    else:
+                        head = self._safe_commands.current_head(workspace=workspace)
+                        run_state.branch_name = branch_name
+                        run_state.commit_sha = head
+                        commit_metadata = {
+                            "branch": branch_name,
+                            "commit_sha": head,
+                            "message": commit_message,
+                            "review_ready": True,
+                        }
+                        if auto_push:
+                            if not latest_checks_green:
+                                warnings.append("Autonomous push skipped because verification is not green.")
+                            elif blocked_push_branch:
+                                warnings.append(
+                                    f"Autonomous push blocked for protected branch `{requested_branch_name}`."
+                                )
+                            elif not self._settings.allow_git_push:
+                                warnings.append(
+                                    "Autonomous push requested, but TEAMAI_ALLOW_GIT_PUSH is false; leaving a review-ready local branch."
+                                )
+                            else:
+                                push_result = self._safe_commands.git_push(
+                                    workspace=workspace,
+                                    remote=push_remote,
+                                    branch_name=branch_name,
+                                )
+                                if push_result.returncode != 0:
+                                    warnings.append(push_result.stderr.strip() or "Autonomous git push failed.")
+                                else:
+                                    run_state.pushed_remote = push_remote
+                                    run_state.pushed_branch = branch_name
+                                    commit_metadata.update(
+                                        {
+                                            "pushed": True,
+                                            "remote": push_remote,
+                                        }
+                                    )
+                                    self._append_routing_trace(
+                                        run_state,
+                                        stage="push",
+                                        capability="git_push",
+                                        model_id=self._active_model_id,
+                                        complexity=run_state.complexity,
+                                        outcome="pushed",
+                                    )
+        elif auto_push:
+            warnings.append("Autonomous push requested, but no local git commit was created.")
+        return {
+            "applied": True,
+            "stop_reason": stop_reason,
+            "final_answer": final_answer,
+            "warnings": warnings,
+            "commit_metadata": commit_metadata,
+        }
 
     def _maybe_generate_codex_payload(
         self,
@@ -601,6 +1523,7 @@ class ClosedLoopSupervisor:
         workspace: Path,
         previous_rounds: list[RoundRecord],
         execution_mode: str,
+        write_policy: str | None = None,
         max_actions: int,
         max_tokens: int,
         temperature: float,
@@ -612,8 +1535,9 @@ class ClosedLoopSupervisor:
             if task_route != "multi_agent_loop"
             else self._classify_task_route(task=task, execution_mode=execution_mode, workspace=workspace)
         )
+        json_repairs = 0
         planner_prompt = PLANNER_SYSTEM_PROMPT_TEMPLATE.format(
-            tool_manifest=self._tools.describe_tools(execution_mode=execution_mode),
+            tool_manifest=self._tools.describe_tools(execution_mode=execution_mode, write_policy=write_policy),
             execution_mode=execution_mode,
             max_actions=max_actions,
         )
@@ -635,8 +1559,10 @@ class ClosedLoopSupervisor:
             try:
                 payload = extract_json_object(repaired_raw)
                 planner = PlannerTurn.model_validate(payload)
+                json_repairs = 1
                 warnings.append(f"Planner JSON required repair: {exc}")
             except (JsonExtractionError, ValidationError) as repair_exc:
+                json_repairs = 1
                 warnings.append(
                     f"Planner JSON could not be parsed cleanly: {exc}; repair failed: {repair_exc}"
                 )
@@ -734,6 +1660,7 @@ class ClosedLoopSupervisor:
                 )
                 planner = planner.model_copy(update={"actions": supplemented_actions})
 
+        self._last_planner_json_repairs = json_repairs
         return planner
 
     def _verify(
@@ -744,6 +1671,7 @@ class ClosedLoopSupervisor:
         temperature: float,
         warnings: list[str],
     ) -> VerifierVerdict:
+        json_repairs = 0
         raw = self._ask_model(
             system_prompt=VERIFIER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
@@ -762,8 +1690,10 @@ class ClosedLoopSupervisor:
             try:
                 payload = extract_json_object(repaired_raw)
                 verdict = VerifierVerdict.model_validate(payload)
+                json_repairs = 1
                 warnings.append(f"Verifier JSON required repair: {exc}")
             except (JsonExtractionError, ValidationError) as repair_exc:
+                json_repairs = 1
                 warnings.append(
                     f"Verifier JSON could not be parsed cleanly: {exc}; repair failed: {repair_exc}"
                 )
@@ -774,6 +1704,7 @@ class ClosedLoopSupervisor:
                     next_focus="Recover structured planning and keep gathering evidence.",
                 )
         verdict.confidence = min(max(verdict.confidence, 0.0), 1.0)
+        self._last_verifier_json_repairs = json_repairs
         return verdict
 
     def _repair_json_response(
@@ -805,6 +1736,12 @@ class ClosedLoopSupervisor:
         memory_snapshot: WorkspaceMemorySnapshot,
         continuation_context: dict[str, object],
         previous_rounds: list[RoundRecord],
+        repo_index: RepoIndex | None = None,
+        task_scopes: tuple[str, ...] = (),
+        changed_paths: tuple[str, ...] = (),
+        failure_output: str = "",
+        prior_failed_repairs: tuple[str, ...] = (),
+        current_diff: str = "",
     ) -> str:
         previous = []
         for record in previous_rounds[-2:]:
@@ -827,6 +1764,19 @@ class ClosedLoopSupervisor:
             latest = previous_rounds[-1].tool_results
             latest_observations = self._render_tool_observations(latest) or latest_observations
 
+        bundle = self._context_packager.build(
+            task=task,
+            workspace=workspace,
+            repo_index=repo_index,
+            task_scopes=task_scopes,
+            observed_paths=self._observed_paths_from_rounds(previous_rounds, workspace),
+            changed_paths=changed_paths,
+            failure_output=failure_output,
+            prior_failed_repairs=prior_failed_repairs,
+        )
+        if current_diff:
+            bundle = self._context_packager.with_diff(bundle, diff_text=current_diff)
+
         return build_round_context(
             task=task,
             workspace=str(workspace),
@@ -840,6 +1790,7 @@ class ClosedLoopSupervisor:
             latest_observations=latest_observations,
             recent_actions=recent_actions,
             suggested_paths=suggested_paths,
+            context_package=self._context_packager.render(bundle),
         )
 
     def _build_verifier_context(
@@ -851,7 +1802,25 @@ class ClosedLoopSupervisor:
         critic: str,
         planner: PlannerTurn,
         tool_results: list[ToolExecutionResult],
+        repo_index: RepoIndex | None = None,
+        task_scopes: tuple[str, ...] = (),
+        changed_paths: tuple[str, ...] = (),
+        failure_output: str = "",
+        prior_failed_repairs: tuple[str, ...] = (),
+        current_diff: str = "",
     ) -> str:
+        bundle = self._context_packager.build(
+            task=task,
+            workspace=workspace,
+            repo_index=repo_index,
+            task_scopes=task_scopes,
+            observed_paths=self._tool_result_paths(tool_results, workspace),
+            changed_paths=changed_paths,
+            failure_output=failure_output,
+            prior_failed_repairs=prior_failed_repairs,
+        )
+        if current_diff:
+            bundle = self._context_packager.with_diff(bundle, diff_text=current_diff)
         return (
             f"Task:\n{task}\n\n"
             f"Workspace:\n{workspace}\n\n"
@@ -859,8 +1828,32 @@ class ClosedLoopSupervisor:
             f"Critic:\n{critic}\n\n"
             f"Planner summary:\n{planner.summary}\n\n"
             f"Candidate final answer:\n{planner.final_answer or '(none)'}\n\n"
+            f"Deterministic context package:\n{self._context_packager.render(bundle)}\n\n"
             f"Tool results:\n{self._render_tool_observations(tool_results)}"
         )
+
+    def _observed_paths_from_rounds(self, rounds: list[RoundRecord], workspace: Path) -> tuple[str, ...]:
+        observed: list[str] = []
+        for record in rounds:
+            for result in record.tool_results:
+                raw_path = str(result.metadata.get("path", "")).strip()
+                if not raw_path:
+                    continue
+                normalized = self._normalize_path_arg(raw_path, workspace)
+                if normalized and normalized not in observed:
+                    observed.append(normalized)
+        return tuple(observed)
+
+    def _tool_result_paths(self, tool_results: list[ToolExecutionResult], workspace: Path) -> tuple[str, ...]:
+        observed: list[str] = []
+        for result in tool_results:
+            raw_path = str(result.metadata.get("path", "")).strip()
+            if not raw_path:
+                continue
+            normalized = self._normalize_path_arg(raw_path, workspace)
+            if normalized and normalized not in observed:
+                observed.append(normalized)
+        return tuple(observed)
 
     def _build_continuation_probe_round(
         self,
@@ -884,10 +1877,15 @@ class ClosedLoopSupervisor:
             verifier_summary = "Scoped continuation verification found an issue that should be addressed before more edits."
             next_focus = "Review the failing scoped verification result first, then continue the remaining task."
 
+        # Deterministic continuation probe: the strategist/critic step is
+        # intentionally not delegated to the model. Persona fields are blank
+        # and `reasoning_source="deterministic"` labels the round so the
+        # transcript and downstream artifacts cannot conflate this with model
+        # reasoning.
         return RoundRecord(
             round_number=0,
-            strategist="Run scoped verification against the just-applied patch before resuming broader work.",
-            critic="Prefer the smallest verification surface first so the resumed run does not lose momentum.",
+            strategist="",
+            critic="",
             planner=PlannerTurn(
                 summary="Ran deterministic post-approval verification before continuing.",
                 should_stop=False,
@@ -901,7 +1899,52 @@ class ClosedLoopSupervisor:
                 summary=verifier_summary,
                 next_focus=next_focus,
             ),
+            reasoning_source="deterministic",
         )
+
+    def _maybe_complete_after_continuation_probe(
+        self,
+        *,
+        task: str,
+        workspace: Path,
+        continuation_context: dict[str, object],
+        probe_round: RoundRecord,
+    ) -> tuple[str, str, RunResult["status"]] | None:
+        if any(not result.success for result in probe_round.tool_results):
+            return None
+
+        verification_results = [result for result in probe_round.tool_results if result.tool == "run_command"]
+        if not verification_results or not all(result.success for result in verification_results):
+            return None
+
+        changed_paths = [
+            self._normalize_path_arg(path, workspace)
+            for path in continuation_context.get("changed_paths", [])
+            if str(path).strip()
+        ]
+        if not changed_paths:
+            return None
+
+        original_task = str(continuation_context.get("original_task", "")).strip() or task
+        explicit_targets = self._extract_file_targets(original_task, workspace)
+        if not explicit_targets:
+            return None
+        if not all(target in changed_paths for target in explicit_targets):
+            return None
+
+        verified_commands = []
+        for command in continuation_context.get("suggested_commands", []):
+            if isinstance(command, list) and command:
+                verified_commands.append(" ".join(str(part) for part in command))
+
+        changed_label = ", ".join(changed_paths)
+        command_label = verified_commands[0] if verified_commands else "the directly related verification command"
+        final_answer = (
+            f"Verified the approved patch for {changed_label}. "
+            f"Read the changed files and confirmed `{command_label}` succeeded. "
+            "No remaining work was detected for the approved task."
+        )
+        return final_answer, "verifier_declared_complete", "completed"
 
     @staticmethod
     def _build_continuation_probe_actions(continuation_context: dict[str, object]) -> list[ToolAction]:
@@ -1041,6 +2084,26 @@ class ClosedLoopSupervisor:
             f"Latest verifier summary: {last_round.verifier.summary}"
         )
 
+    @staticmethod
+    def _rounds_are_fully_deterministic(rounds: list[RoundRecord]) -> bool:
+        return bool(rounds) and all(record.reasoning_source == "deterministic" for record in rounds)
+
+    @staticmethod
+    def _label_deterministic_synthesis(text: str) -> str:
+        stripped = text.strip()
+        if not stripped:
+            return text
+        if stripped.startswith(DETERMINISTIC_SYNTHESIS_LABEL):
+            return stripped
+        return f"{DETERMINISTIC_SYNTHESIS_LABEL}\n{stripped}"
+
+    @staticmethod
+    def _render_round_persona_text(text: str, *, reasoning_source: str) -> str:
+        stripped = text.strip()
+        if stripped or reasoning_source != "deterministic":
+            return text
+        return DETERMINISTIC_PERSONA_TRANSCRIPT_NOTICE
+
     def _run_deterministic_patch_route(
         self,
         *,
@@ -1052,14 +2115,12 @@ class ClosedLoopSupervisor:
         if action is None:
             return ([], "", "max_rounds_reached", "stopped")
 
-        strategist = (
-            "Task routing classified this as a narrow explicit write request that can be compiled into one deterministic patch."
-        )
-        critic = (
-            "The highest-confidence path is to skip free-form planning and create exactly one approval-gated patch proposal."
-        )
+        # Deterministic route: the model is intentionally not invoked for the
+        # strategist/critic step. The persona fields are left empty and the
+        # round is labeled `reasoning_source="deterministic"` so downstream
+        # consumers cannot mistake template text for model reasoning.
         planner = PlannerTurn(
-            summary="Deterministic task routing compiled the requested patch approval without invoking the local model.",
+            summary="Deterministic task routing compiled the requested patch action without invoking the local model.",
             should_stop=False,
             final_answer=None,
             actions=[action],
@@ -1078,18 +2139,19 @@ class ClosedLoopSupervisor:
             verifier = VerifierVerdict(
                 done=False,
                 confidence=0.95,
-                summary="Deterministic routing created a pending patch approval without needing free-form model planning.",
+                summary="Deterministic patch compiler produced a pending approval; no model verifier was run.",
                 next_focus="Review and apply the pending patch approval, then continue the task.",
             )
             return (
                 [
                     RoundRecord(
                         round_number=1,
-                        strategist=strategist,
-                        critic=critic,
+                        strategist="",
+                        critic="",
                         planner=planner,
                         tool_results=tool_results,
                         verifier=verifier,
+                        reasoning_source="deterministic",
                     )
                 ],
                 self._build_approval_required_answer(pending_approvals),
@@ -1100,7 +2162,7 @@ class ClosedLoopSupervisor:
         verifier = VerifierVerdict(
             done=False,
             confidence=0.0,
-            summary="Deterministic routing did not produce a pending patch approval.",
+            summary="Deterministic patch compiler ran but did not produce a pending approval; no model verifier was run.",
             next_focus="Inspect the tool output and repair the write path before retrying.",
         )
         error_text = tool_results[0].error or "The deterministic patch route did not create an approval artifact."
@@ -1108,11 +2170,12 @@ class ClosedLoopSupervisor:
             [
                 RoundRecord(
                     round_number=1,
-                    strategist=strategist,
-                    critic=critic,
+                    strategist="",
+                    critic="",
                     planner=planner,
                     tool_results=tool_results,
                     verifier=verifier,
+                    reasoning_source="deterministic",
                 )
             ],
             error_text,
@@ -1167,18 +2230,16 @@ class ClosedLoopSupervisor:
             verifier = VerifierVerdict(
                 done=False,
                 confidence=min(0.25 + 0.2 * round_number, 0.85),
-                summary="Deterministic inspection gathered repository context without spending a model turn.",
+                summary="Deterministic inspection collected repository context; no model verifier was run.",
                 next_focus="Read the highest-signal runtime files and synthesize the next engineering tasks.",
             )
+            # Deterministic route: strategist/critic intentionally left empty
+            # and the round is labeled `reasoning_source="deterministic"`.
             rounds.append(
                 RoundRecord(
                     round_number=round_number,
-                    strategist=(
-                        "Use deterministic repository reconnaissance to gather high-signal evidence before relying on the local model."
-                    ),
-                    critic=(
-                        "Prefer README and runtime-anchor files over lower-signal docs when inspection runs are tightly budgeted."
-                    ),
+                    strategist="",
+                    critic="",
                     planner=PlannerTurn(
                         summary="Deterministic inspection bootstrap selected the next read-only repository actions.",
                         should_stop=False,
@@ -1187,6 +2248,7 @@ class ClosedLoopSupervisor:
                     ),
                     tool_results=tool_results,
                     verifier=verifier,
+                    reasoning_source="deterministic",
                 )
             )
 
@@ -1279,8 +2341,17 @@ class ClosedLoopSupervisor:
             chunks.append("WARNINGS\n" + "\n".join(f"- {warning}" for warning in warnings))
 
         for record in rounds:
-            chunks.append(f"ROUND {record.round_number}\nStrategist\n{record.strategist}")
-            chunks.append(f"ROUND {record.round_number}\nCritic\n{record.critic}")
+            chunks.append(f"ROUND {record.round_number}\nReasoning Source\n{record.reasoning_source}")
+            chunks.append(
+                "ROUND "
+                f"{record.round_number}\nStrategist\n"
+                f"{ClosedLoopSupervisor._render_round_persona_text(record.strategist, reasoning_source=record.reasoning_source)}"
+            )
+            chunks.append(
+                "ROUND "
+                f"{record.round_number}\nCritic\n"
+                f"{ClosedLoopSupervisor._render_round_persona_text(record.critic, reasoning_source=record.reasoning_source)}"
+            )
             chunks.append(
                 f"ROUND {record.round_number}\nPlanner\n{json.dumps(record.planner.model_dump(), indent=2)}"
             )
@@ -1383,8 +2454,35 @@ class ClosedLoopSupervisor:
 
     def _action_signature(self, action: ToolAction, workspace: Path) -> str:
         tool = action.tool
-        if tool in {"list_files", "read_file", "write_file", "replace_in_file"}:
+        if tool == "write_file":
+            changes = action.args.get("changes")
+            if isinstance(changes, list) and changes:
+                bundle_paths = []
+                for entry in changes:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized_path = self._normalize_path_arg(entry.get("path", "."), workspace)
+                    bundle_paths.append(
+                        f"{normalized_path}:{self._digest_signature_value(entry.get('content', ''))}"
+                    )
+                if bundle_paths:
+                    return f"{tool}:{'|'.join(bundle_paths)}"
+            content = str(action.args.get("content", ""))
+            path = self._normalize_path_arg(action.args.get("path", "."), workspace)
+            return f"{tool}:{path}:{self._digest_signature_value(content)}"
+        if tool in {"list_files", "read_file"}:
             return f"{tool}:{self._normalize_path_arg(action.args.get('path', '.'), workspace)}"
+        if tool == "replace_in_file":
+            path = self._normalize_path_arg(action.args.get("path", "."), workspace)
+            old_text = str(action.args.get("old_text", ""))
+            new_text = str(action.args.get("new_text", ""))
+            replace_all = bool(action.args.get("replace_all", False))
+            return (
+                f"{tool}:{path}:"
+                f"{self._digest_signature_value(old_text)}:"
+                f"{self._digest_signature_value(new_text)}:"
+                f"{replace_all}"
+            )
         if tool == "search_text":
             pattern = str(action.args.get("pattern", "")).strip()
             path = self._normalize_path_arg(action.args.get("path", "."), workspace)
@@ -1394,6 +2492,11 @@ class ClosedLoopSupervisor:
             cwd = self._normalize_path_arg(action.args.get("cwd", "."), workspace)
             return f"{tool}:{cwd}:{command}"
         return tool
+
+    @staticmethod
+    def _digest_signature_value(value: object) -> str:
+        digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()
+        return digest[:12]
 
     @staticmethod
     def _action_needs_existing_target(action: ToolAction) -> bool:
@@ -1412,6 +2515,14 @@ class ClosedLoopSupervisor:
                 return any(str(part).strip() for part in command)
             return bool(str(command).strip())
         if action.tool == "write_file":
+            changes = args.get("changes")
+            if isinstance(changes, list):
+                return any(
+                    isinstance(change, dict)
+                    and bool(str(change.get("path", "")).strip())
+                    and "content" in change
+                    for change in changes
+                )
             return "path" in args and "content" in args
         if action.tool == "replace_in_file":
             return "path" in args and "old_text" in args and "new_text" in args
@@ -1645,57 +2756,574 @@ class ClosedLoopSupervisor:
         workspace: Path,
         continuation_context: dict[str, object] | None = None,
     ) -> str:
-        # Fast deterministic paths that don't need a model call
-        if continuation_context:
-            if execution_mode == "workspace_write":
-                compiled = self._compile_small_write_action_from_task(task=task, workspace=workspace)
-                if compiled is not None:
-                    return "deterministic_patch"
-            return "multi_agent_loop"
-        if execution_mode == "workspace_write":
-            compiled = self._compile_small_write_action_from_task(task=task, workspace=workspace)
-            if compiled is not None:
-                return "deterministic_patch"
-            if self._is_explicit_write_task(task):
-                return "explicit_write_loop"
+        signature = self._build_task_signature(
+            task=task,
+            execution_mode=execution_mode,
+            workspace=workspace,
+            continuation_context=continuation_context or {},
+        )
+        decision = self._registry.pick_best(
+            task_signature=signature,
+            prefer_local=True,
+            env_check=False,
+        )
+        if isinstance(decision, RoutingDecision) and decision.capability in _VALID_ROUTES:
+            self._apply_routing_decision(decision)
+            return decision.capability
 
-        # Model-based classification (opt-in via TEAMAI_MODEL_ROUTER=true)
-        if self._settings.model_router:
-            model_route = self._classify_task_route_via_model(task)
-            if model_route:
-                return model_route
-
-        # Heuristic fallback (always active)
-        if self._is_repository_inspection_task(task):
-            return "repository_inspection"
-        if self._is_broad_coding_task(task):
-            return "codex_handoff"
+        self._last_routing_decision = None
+        self._active_model_id = self._settings.model_id
+        self._backend = self._backend_by_model.get(self._settings.model_id, self._backend)
         return "multi_agent_loop"
 
-    def _classify_task_route_via_model(self, task: str) -> str | None:
-        """Ask the local model to classify the task route. Returns None on failure."""
-        cache_key = task.strip().lower()
-        if cache_key in self._route_cache:
-            return self._route_cache[cache_key]
-        try:
-            raw = self._backend.generate_messages(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": ROUTE_CLASSIFIER_PROMPT.format(task=task),
-                    }
-                ],
-                max_tokens=12,
-                temperature=0.0,
-                enable_thinking=False,
-            ).text
-            label = re.sub(r"[^\w_]", "", raw.strip().split()[0]) if raw.strip() else ""
-            if label in _VALID_ROUTES:
-                self._route_cache[cache_key] = label
-                return label
-        except Exception:
-            pass
+    def _build_task_signature(
+        self,
+        *,
+        task: str,
+        execution_mode: str,
+        workspace: Path,
+        continuation_context: dict[str, object],
+    ) -> TaskSignature:
+        compiled = None
+        if execution_mode == "workspace_write":
+            compiled = self._compile_small_write_action_from_task(task=task, workspace=workspace)
+
+        repo_index = self._repo_indexer.build(workspace)
+        expected_files_touched = max(len(infer_task_scopes(task=task, workspace=workspace, repo_index=repo_index)), 1)
+        route_health = self._memory.load_routing_health(
+            workspace,
+            recent_window=self._registry.routing.recent_success_window,
+            broken_repair_rate=self._registry.routing.broken_repair_rate,
+        )
+        broad_coding = self._is_broad_coding_task(task)
+        memory_pressure = any(health.memory_pressure for health in route_health.values())
+        if broad_coding and self._settings.max_tokens_per_turn >= 256:
+            memory_pressure = True
+        complexity = compute_complexity(
+            task=task,
+            repo_index=repo_index,
+            expected_files_touched=expected_files_touched,
+        )
+        policy_scores = self._memory.load_policy_scores(
+            workspace,
+            task=task,
+            complexity=complexity,
+        )
+        agent_policy_scores = self._memory.load_agent_policy_scores(
+            workspace,
+            task=task,
+            complexity=complexity,
+        )
+
+        return TaskSignature(
+            task=task,
+            execution_mode=execution_mode,
+            complexity=complexity,
+            continuation=bool(continuation_context),
+            deterministic_candidate=compiled is not None,
+            explicit_write=execution_mode == "workspace_write" and self._is_explicit_write_task(task),
+            repository_inspection=self._is_repository_inspection_task(task),
+            broad_coding=broad_coding,
+            memory_pressure=memory_pressure,
+            expected_files_touched=expected_files_touched,
+            has_tests=repo_index.has_tests,
+            policy_scores=policy_scores,
+            agent_policy_scores=agent_policy_scores,
+            route_health=route_health,
+        )
+
+    def _apply_routing_decision(self, decision: RoutingDecision) -> None:
+        self._last_routing_decision = decision
+        self._active_model_id = self._settings.model_id
+        self._backend = self._backend_by_model.get(self._settings.model_id, self._backend)
+
+        if decision.agent.type != "local_mlx":
+            return
+        if decision.capability == "codex_handoff":
+            return
+        if not self._settings.model_router:
+            return
+
+        target_model = decision.agent.model_id.strip() or self._settings.model_id
+        self._active_model_id = target_model
+        if target_model == self._settings.model_id or not self._owns_backend:
+            return
+        if target_model not in self._backend_by_model:
+            override_settings = self._settings.__class__(
+                model_id=target_model,
+                model_revision=self._settings.model_revision,
+                force_download=self._settings.force_download,
+                trust_remote_code=self._settings.trust_remote_code,
+                enable_thinking=self._settings.enable_thinking,
+                workspace_root=self._settings.workspace_root,
+                max_rounds=self._settings.max_rounds,
+                max_actions_per_round=self._settings.max_actions_per_round,
+                max_tokens_per_turn=self._settings.max_tokens_per_turn,
+                temperature=self._settings.temperature,
+                allow_shell=self._settings.allow_shell,
+                allow_writes=self._settings.allow_writes,
+                command_timeout_seconds=self._settings.command_timeout_seconds,
+                max_file_bytes=self._settings.max_file_bytes,
+                max_command_output_chars=self._settings.max_command_output_chars,
+                host=self._settings.host,
+                port=self._settings.port,
+                model_router=self._settings.model_router,
+            )
+            self._backend_by_model[target_model] = MLXModelBackend(override_settings)
+        self._backend = self._backend_by_model[target_model]
+
+    def _active_agent_entry(self) -> object | None:
+        for agent in self._registry.agents:
+            if agent.model_id == self._active_model_id:
+                return agent
         return None
+
+    @staticmethod
+    def _latest_verifier_confidence(run_state: AutonomousRunState) -> float | None:
+        if not run_state.verifier_outputs:
+            return None
+        return run_state.verifier_outputs[-1].confidence
+
+    def _append_routing_trace(
+        self,
+        run_state: AutonomousRunState,
+        *,
+        stage: str,
+        capability: str,
+        model_id: str,
+        complexity: str,
+        agent_id: str | None = None,
+        score: float | None = None,
+        reasons: tuple[str, ...] | list[str] = (),
+        escalation_reason: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        run_state.routing_trace.append(
+            RoutingTraceEntry(
+                stage=stage,  # type: ignore[arg-type]
+                capability=capability,
+                model_id=model_id,
+                agent_id=agent_id,
+                complexity=complexity,  # type: ignore[arg-type]
+                score=score,
+                reasons=[str(reason) for reason in reasons],
+                escalation_reason=escalation_reason,
+                outcome=outcome,
+                retries=len(run_state.failures_encountered),
+                verifier_confidence=self._latest_verifier_confidence(run_state),
+            )
+        )
+
+    def _activate_backend_for_model(self, model_id: str) -> bool:
+        target_model = model_id.strip()
+        if not target_model:
+            return False
+        backend = self._backend_by_model.get(target_model)
+        if backend is None:
+            if not self._owns_backend:
+                return False
+            override_settings = self._settings.__class__(
+                model_id=target_model,
+                model_revision=self._settings.model_revision,
+                force_download=self._settings.force_download,
+                trust_remote_code=self._settings.trust_remote_code,
+                enable_thinking=self._settings.enable_thinking,
+                workspace_root=self._settings.workspace_root,
+                max_rounds=self._settings.max_rounds,
+                max_actions_per_round=self._settings.max_actions_per_round,
+                max_tokens_per_turn=self._settings.max_tokens_per_turn,
+                temperature=self._settings.temperature,
+                allow_shell=self._settings.allow_shell,
+                allow_writes=self._settings.allow_writes,
+                command_timeout_seconds=self._settings.command_timeout_seconds,
+                max_file_bytes=self._settings.max_file_bytes,
+                max_command_output_chars=self._settings.max_command_output_chars,
+                host=self._settings.host,
+                port=self._settings.port,
+                model_router=self._settings.model_router,
+                allow_git_push=self._settings.allow_git_push,
+                default_handoff_engine=self._settings.default_handoff_engine,
+                max_inline_handoff_revisions=self._settings.max_inline_handoff_revisions,
+            )
+            backend = MLXModelBackend(override_settings)
+            self._backend_by_model[target_model] = backend
+        self._active_model_id = target_model
+        self._backend = backend
+        return True
+
+    def _try_escalate_to_stronger_local(
+        self,
+        *,
+        task_route: str,
+        run_state: AutonomousRunState,
+        reason: str,
+        emit_progress: Callable[[str], None],
+        warnings: list[str],
+    ) -> str | None:
+        attempted_models = {
+            entry.model_id
+            for entry in run_state.routing_trace
+            if entry.stage == "inline_escalation" and entry.model_id
+        }
+        candidates = self._registry.stronger_local_candidates(
+            current_model_id=self._active_model_id,
+            capabilities=[task_route, "explicit_write_loop", "multi_agent_loop"],
+            env_check=False,
+        )
+        for agent in candidates:
+            if agent.model_id in attempted_models:
+                continue
+            previous_model_id = self._active_model_id
+            if not self._activate_backend_for_model(agent.model_id):
+                continue
+            warnings.append(
+                f"Inline escalation switched from `{previous_model_id}` to stronger local model `{agent.model_id}` "
+                f"because {reason}."
+            )
+            emit_progress(f"Inline escalation: switching to stronger local model `{agent.model_id}`")
+            run_state.repair_attempts.append(
+                RepairAttempt(
+                    round_number=run_state.round_number,
+                    failure_type="unknown",
+                    strategy=f"Escalate to stronger local model because {reason}.",
+                    status="escalated",
+                    notes=agent.id,
+                )
+            )
+            next_route = "explicit_write_loop" if task_route == "codex_handoff" else task_route
+            self._append_routing_trace(
+                run_state,
+                stage="inline_escalation",
+                capability=next_route,
+                model_id=agent.model_id,
+                agent_id=agent.id,
+                complexity=run_state.complexity,
+                escalation_reason=reason,
+                outcome="stronger_local_selected",
+            )
+            return next_route
+        return None
+
+    @staticmethod
+    def _bridge_engine_from_agent(agent: object | None) -> str | None:
+        if agent is None:
+            return None
+        agent_type = str(getattr(agent, "type", "")).strip().lower()
+        agent_id = str(getattr(agent, "id", "")).strip().lower()
+        if agent_type == "openai" or agent_id.startswith("codex"):
+            return "codex"
+        if agent_type == "google" or agent_id.startswith("gemini"):
+            return "gemini"
+        if agent_type == "local_mlx" or agent_id.startswith("local"):
+            return "local"
+        return None
+
+    def _select_verified_handoff_target(self, request: RunRequest) -> tuple[str, str | None] | None:
+        requested_engine = (request.handoff_engine or "").strip().lower()
+        requested_model = (request.handoff_model or "").strip() or None
+        if requested_engine in {"codex", "gemini", "local"}:
+            return requested_engine, requested_model
+
+        default_cloud = self._registry.pick_cloud(env_check=True)
+        engine = self._bridge_engine_from_agent(default_cloud)
+        if engine is not None:
+            model = requested_model or (str(getattr(default_cloud, "model_id", "")).strip() or None)
+            return engine, model
+
+        fallback_engine = (self._settings.default_handoff_engine or "").strip().lower()
+        fallback_allowed = (
+            fallback_engine == "local"
+            or (fallback_engine == "codex" and bool(os.getenv("OPENAI_API_KEY", "").strip()))
+            or (fallback_engine == "gemini" and bool(os.getenv("GOOGLE_API_KEY", "").strip()))
+        )
+        if fallback_engine in {"codex", "gemini", "local"} and fallback_allowed:
+            return fallback_engine, requested_model
+        return None
+
+    def _has_available_stronger_local(self, *, task_route: str) -> bool:
+        candidates = self._registry.stronger_local_candidates(
+            current_model_id=self._active_model_id,
+            capabilities=[task_route, "explicit_write_loop", "multi_agent_loop"],
+            env_check=False,
+        )
+        return any(self._owns_backend or agent.model_id in self._backend_by_model for agent in candidates)
+
+    def _can_inline_escalate(self, *, request: RunRequest, task_route: str) -> bool:
+        return self._has_available_stronger_local(task_route=task_route) or self._select_verified_handoff_target(request) is not None
+
+    @staticmethod
+    def _default_push_branch_name(task_id: str) -> str:
+        return f"teamai/{task_id}"
+
+    def _current_diff_text(self, *, workspace: Path, sandbox_workspace: Path) -> str:
+        return render_change_diff(collect_workspace_changes(source_root=workspace, modified_root=sandbox_workspace))
+
+    def _build_inline_handoff_payload(
+        self,
+        *,
+        task: str,
+        workspace: Path,
+        repo_index: RepoIndex,
+        task_scopes: tuple[str, ...],
+        round_records: list[RoundRecord],
+        run_state: AutonomousRunState,
+        current_diff: str,
+    ) -> CodexHandoffPayload:
+        observed_paths = self._observed_paths_from_rounds(round_records, workspace)
+        latest_failure = run_state.failures_encountered[-1] if run_state.failures_encountered else None
+        repair_notes = tuple(
+            f"{attempt.status}: {attempt.strategy} ({attempt.notes})".strip()
+            for attempt in run_state.repair_attempts[-4:]
+        )
+        bundle = self._context_packager.build(
+            task=task,
+            workspace=workspace,
+            repo_index=repo_index,
+            task_scopes=task_scopes,
+            observed_paths=observed_paths,
+            changed_paths=tuple(run_state.files_changed),
+            failure_output=latest_failure.raw_output if latest_failure is not None else "",
+            prior_failed_repairs=repair_notes,
+        )
+        bundle = self._context_packager.with_diff(bundle, diff_text=current_diff)
+        core_dependencies = list(bundle.relevant_paths[:4]) or list(task_scopes[:4]) or list(self._task_relevant_candidates(task, workspace)[:4])
+        distilled_context: dict[str, str] = {}
+        for path in core_dependencies:
+            detail_parts: list[str] = []
+            if path in bundle.symbol_definitions:
+                detail_parts.append("symbols: " + ", ".join(bundle.symbol_definitions[path][:4]))
+            if path in bundle.nearest_imports:
+                detail_parts.append("imports: " + ", ".join(bundle.nearest_imports[path][:4]))
+            if path in bundle.failing_tests:
+                compact_test = " ".join(bundle.failing_tests[path].split())
+                detail_parts.append(f"test excerpt: {compact_test[:220]}")
+            if path in bundle.dependent_call_sites:
+                detail_parts.append("dependent call sites: " + " | ".join(bundle.dependent_call_sites[path][:3]))
+            if not detail_parts:
+                try:
+                    compact = " ".join((workspace / path).read_text(encoding="utf-8")[:400].split())
+                except OSError:
+                    compact = "No local excerpt available."
+                detail_parts.append(compact[:240])
+            distilled_context[path] = " ".join(detail_parts)
+
+        structured_context = {
+            "task": task,
+            "repo_summary": bundle.repo_summary,
+            "files_inspected": list(observed_paths),
+            "current_diff": bundle.current_diff,
+            "failing_checks": [
+                {
+                    "command": check.command,
+                    "returncode": check.returncode,
+                    "stdout_excerpt": (check.stdout or "")[-400:],
+                    "stderr_excerpt": (check.stderr or "")[-400:],
+                }
+                for check in run_state.checks_run[-3:]
+            ],
+            "failure_classifications": [
+                {
+                    "type": failure.failure_type,
+                    "summary": failure.summary,
+                    "strategy": failure.strategy,
+                }
+                for failure in run_state.failures_encountered[-3:]
+            ],
+            "verifier_output": [
+                {
+                    "source": output.source,
+                    "passed": output.passed,
+                    "confidence": output.confidence,
+                    "summary": output.summary,
+                    "next_focus": output.next_focus,
+                }
+                for output in run_state.verifier_outputs[-4:]
+            ],
+            "prior_repair_attempts": [attempt.model_dump(mode="json") for attempt in run_state.repair_attempts[-4:]],
+            "context_package": self._context_packager.render(bundle),
+        }
+        recommended_action = (
+            "Produce a minimal verified patch that keeps scope narrow, fixes the failing checks, and preserves "
+            "all unrelated behavior."
+        )
+        return CodexHandoffPayload(
+            original_task=task,
+            core_dependencies=core_dependencies,
+            distilled_context=distilled_context,
+            recommended_codex_action=recommended_action,
+            structured_context=structured_context,
+        )
+
+    def _apply_verified_patch_inline(
+        self,
+        *,
+        patch_file: Path,
+        workspace: Path,
+    ) -> tuple[bool, str, list[str]]:
+        result = subprocess.run(
+            ["patch", "-p1", "-E", "-i", str(patch_file.resolve())],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        targets = [target.primary_path for target in extract_patch_targets(patch_file.read_text(encoding="utf-8"))]
+        output = (result.stdout or "").strip()
+        if result.stderr:
+            output = f"{output}\n{result.stderr.strip()}".strip()
+        return result.returncode == 0, output, [path for path in targets if path]
+
+    def _execute_inline_verified_handoff(
+        self,
+        *,
+        task: str,
+        request: RunRequest,
+        sandbox_workspace: Path,
+        repo_index: RepoIndex,
+        task_scopes: tuple[str, ...],
+        round_records: list[RoundRecord],
+        run_state: AutonomousRunState,
+        reason: str,
+        emit_progress: Callable[[str], None],
+        warnings: list[str],
+    ) -> dict[str, object]:
+        target = self._select_verified_handoff_target(request)
+        if target is None:
+            return {"accepted": False, "stop_reason": "verified_handoff_unavailable"}
+
+        engine, model = target
+        from .integrations import get_bridge
+
+        payload = self._build_inline_handoff_payload(
+            task=task,
+            workspace=sandbox_workspace,
+            repo_index=repo_index,
+            task_scopes=task_scopes,
+            round_records=round_records,
+            run_state=run_state,
+            current_diff=self._current_diff_text(workspace=Path(run_state.workspace_path), sandbox_workspace=sandbox_workspace),
+        )
+        payload_dir = sandbox_workspace / ".teamai"
+        payload_dir.mkdir(parents=True, exist_ok=True)
+        payload_file = payload_dir / f"inline-handoff-{run_state.task_id}.json"
+        patch_file = payload_dir / f"inline-handoff-{run_state.task_id}.patch"
+        payload_file.write_text(payload.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        emit_progress(f"Inline escalation: executing verified `{engine}` handoff")
+        bridge = get_bridge(engine)
+        try:
+            verified = bridge.execute_verified(
+                project_root=sandbox_workspace,
+                payload_file=payload_file,
+                patch_file=patch_file,
+                model=model,
+                max_revision_attempts=(
+                    request.max_handoff_revision_attempts
+                    if request.max_handoff_revision_attempts is not None
+                    else self._settings.max_inline_handoff_revisions
+                ),
+                create_approval=False,
+            )
+        except Exception as exc:
+            warnings.append(f"Inline verified handoff failed before verification: {exc}")
+            return {
+                "accepted": False,
+                "stop_reason": "verified_handoff_failed",
+                "final_answer": f"Inline verified handoff failed: {exc}",
+            }
+
+        artifact = verified.artifact or HandoffArtifact(
+            engine=engine,
+            summary=f"Inline {engine} handoff patch.",
+            diff=verified.execution.patch_text,
+            rationale="Inline verified handoff fallback artifact.",
+            confidence=0.6,
+        )
+        run_state.handoffs.append(artifact)
+        run_state.verifier_outputs.append(
+            VerifierOutput(
+                source="handoff",
+                passed=bool(verified.accepted and verified.verification.success),
+                confidence=artifact.confidence,
+                summary=artifact.summary,
+                next_focus=(verified.revision_requests[-1].details if verified.revision_requests else None),
+            )
+        )
+        self._append_routing_trace(
+            run_state,
+            stage="verified_handoff",
+            capability="verified_handoff_execution",
+            model_id=verified.execution.model,
+            complexity=run_state.complexity,
+            escalation_reason=reason,
+            outcome="accepted" if verified.accepted else "rejected",
+        )
+        if not verified.accepted:
+            warnings.append(
+                "Inline verified handoff was rejected after revision requests: "
+                + (verified.revision_requests[-1].details if verified.revision_requests else "verification failed")
+            )
+            return {
+                "accepted": False,
+                "stop_reason": "verified_handoff_rejected",
+                "final_answer": (
+                    "Inline verified handoff could not produce an acceptable patch. "
+                    + (verified.revision_requests[-1].details if verified.revision_requests else "Verification failed.")
+                ),
+            }
+
+        applied, apply_output, changed_paths = self._apply_verified_patch_inline(
+            patch_file=verified.execution.patch_file,
+            workspace=sandbox_workspace,
+        )
+        if not applied:
+            warnings.append(apply_output or "Inline verified patch could not be applied to the active sandbox.")
+            return {
+                "accepted": False,
+                "stop_reason": "verified_handoff_apply_failed",
+                "final_answer": "Inline verified handoff succeeded in isolation but the patch could not be applied to the active sandbox.",
+            }
+
+        normalized_changed_paths = [
+            self._normalize_path_arg(path, sandbox_workspace)
+            for path in changed_paths
+            if str(path).strip()
+        ]
+        run_state.files_changed = list(dict.fromkeys([*run_state.files_changed, *normalized_changed_paths]))
+        check_records = self._safe_commands.run_checks(
+            workspace=sandbox_workspace,
+            changed_paths=normalized_changed_paths,
+            repo_index=repo_index,
+        )
+        run_state.checks_run.extend(check_records)
+        check_success = bool(check_records) and all(check.returncode == 0 for check in check_records)
+        if not check_success:
+            diagnosis = classify_failure(check_records)
+            if diagnosis is not None:
+                run_state.failures_encountered.append(diagnosis)
+                run_state.repair_attempts.append(
+                    RepairAttempt(
+                        round_number=run_state.round_number,
+                        failure_type=diagnosis.failure_type,
+                        strategy=diagnosis.strategy,
+                        status="failed",
+                        notes="inline_verified_handoff_post_apply",
+                    )
+                )
+            return {
+                "accepted": False,
+                "stop_reason": "verified_handoff_post_apply_checks_failed",
+                "final_answer": "Inline verified handoff patch applied, but the active sandbox checks still failed.",
+                "changed_paths": normalized_changed_paths,
+            }
+
+        warnings.append(
+            f"Inline verified handoff via `{engine}` succeeded after {verified.revision_count} revision request(s)."
+        )
+        return {
+            "accepted": True,
+            "changed_paths": normalized_changed_paths,
+            "summary": artifact.summary,
+        }
 
     @staticmethod
     def _is_explicit_write_task(task: str) -> bool:
@@ -1992,12 +3620,69 @@ class ClosedLoopSupervisor:
             },
         )
 
+    def _compile_python_function_and_unittest_bundle_action(
+        self,
+        *,
+        task: str,
+        workspace: Path,
+    ) -> ToolAction | None:
+        targets = self._extract_file_targets(task, workspace)
+        if len(targets) < 2:
+            return None
+
+        source_path = next((path for path in targets if path.endswith(".py") and "test" not in Path(path).name.lower()), None)
+        test_path = next((path for path in targets if path.endswith(".py") and "test" in path.lower()), None)
+        if source_path is None or test_path is None:
+            return None
+
+        function_name = self._extract_function_update_target(task)
+        return_template = self._extract_python_string_normalizer_template(task)
+        expectation = self._extract_unittest_io_expectation(task)
+        if function_name is None or return_template is None or expectation is None:
+            return None
+
+        try:
+            source_text = (workspace / source_path).read_text(encoding="utf-8")
+            test_text = (workspace / test_path).read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+        updated_source = self._build_python_function_return_update(
+            file_text=source_text,
+            function_name=function_name,
+            return_template=return_template,
+        )
+        updated_test = self._build_python_unittest_expectation_update(
+            file_text=test_text,
+            function_name=function_name,
+            input_value=expectation[0],
+            output_value=expectation[1],
+        )
+
+        changes: list[dict[str, str]] = []
+        if updated_source is not None:
+            changes.append({"path": source_path, "content": updated_source})
+        if updated_test is not None:
+            changes.append({"path": test_path, "content": updated_test})
+        if not changes:
+            return None
+
+        return ToolAction(
+            tool="write_file",
+            reason="Compile the explicit multi-file code-and-test request into a bundled patch approval.",
+            args={"changes": changes},
+        )
+
     def _compile_small_write_action_from_task(
         self,
         *,
         task: str,
         workspace: Path,
     ) -> ToolAction | None:
+        bundled = self._compile_python_function_and_unittest_bundle_action(task=task, workspace=workspace)
+        if bundled is not None:
+            return bundled
+
         target_path = self._extract_primary_file_target(task, workspace)
         if target_path is None:
             return None
@@ -2310,6 +3995,10 @@ class ClosedLoopSupervisor:
             return False
 
         if action.tool == "write_file":
+            expected_bundle = self._normalize_write_bundle(expected_action.args, workspace)
+            actual_bundle = self._normalize_write_bundle(action.args, workspace)
+            if expected_bundle is not None or actual_bundle is not None:
+                return actual_bundle == expected_bundle
             return str(action.args.get("content", "")) == str(expected_action.args.get("content", ""))
 
         return (
@@ -2318,13 +4007,139 @@ class ClosedLoopSupervisor:
             and bool(action.args.get("replace_all", False)) == bool(expected_action.args.get("replace_all", False))
         )
 
-    def _extract_primary_file_target(self, task: str, workspace: Path) -> str | None:
+    def _normalize_write_bundle(
+        self,
+        args: dict[str, object],
+        workspace: Path,
+    ) -> list[tuple[str, str]] | None:
+        raw_changes = args.get("changes")
+        if not isinstance(raw_changes, list):
+            return None
+        normalized: list[tuple[str, str]] = []
+        for entry in raw_changes:
+            if not isinstance(entry, dict):
+                continue
+            path = self._normalize_path_arg(entry.get("path", "."), workspace)
+            normalized.append((path, str(entry.get("content", ""))))
+        return normalized
+
+    def _extract_file_targets(self, task: str, workspace: Path) -> list[str]:
+        targets: list[str] = []
         for candidate in self._extract_candidate_paths(task):
             normalized = self._normalize_path_arg(candidate, workspace)
             resolved = (workspace / normalized).resolve()
-            if resolved.exists() and resolved.is_file():
-                return normalized
+            if resolved.exists() and resolved.is_file() and normalized not in targets:
+                targets.append(normalized)
+        return targets
+
+    def _extract_primary_file_target(self, task: str, workspace: Path) -> str | None:
+        targets = self._extract_file_targets(task, workspace)
+        return targets[0] if targets else None
+
+    @staticmethod
+    def _extract_function_update_target(task: str) -> str | None:
+        match = re.search(r"\bupdate\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+so it\b", task, flags=re.IGNORECASE)
+        if match:
+            return match.group("name").strip()
         return None
+
+    @staticmethod
+    def _extract_python_string_normalizer_template(task: str) -> str | None:
+        lowered = task.lower()
+        trims_whitespace = (
+            "trim whitespace" in lowered
+            or "trims whitespace" in lowered
+            or "trim surrounding whitespace" in lowered
+        )
+        title_cases = (
+            "title-cases each word" in lowered
+            or "title-case each word" in lowered
+            or "title cases each word" in lowered
+            or "title case each word" in lowered
+        )
+        if trims_whitespace and title_cases:
+            return '" ".join(part.capitalize() for part in {param}.split())'
+        return None
+
+    @staticmethod
+    def _extract_unittest_io_expectation(task: str) -> tuple[str, str] | None:
+        match = re.search(
+            r"proves?\s+(?P<input_quote>['\"`])(?P<input>.+?)(?P=input_quote)\s+becomes\s+"
+            r"(?P<output_quote>['\"`])(?P<output>.+?)(?P=output_quote)",
+            task,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group("input"), match.group("output")
+        return None
+
+    @staticmethod
+    def _build_python_function_return_update(
+        *,
+        file_text: str,
+        function_name: str,
+        return_template: str,
+    ) -> str | None:
+        lines = file_text.splitlines(keepends=True)
+        function_pattern = re.compile(
+            rf"^(?P<indent>\s*)def\s+{re.escape(function_name)}\s*\((?P<params>[^)]*)\)\s*(?:->\s*[^:]+)?:\s*$"
+        )
+        for index, line in enumerate(lines):
+            match = function_pattern.match(line.rstrip("\n"))
+            if not match:
+                continue
+            indent = match.group("indent")
+            params = match.group("params")
+            first_param = params.split(",", 1)[0].strip() if params.strip() else "value"
+            param_name = first_param.split(":", 1)[0].split("=", 1)[0].strip() or "value"
+            body_start = index + 1
+            body_end = len(lines)
+            for candidate_index in range(body_start, len(lines)):
+                stripped = lines[candidate_index].strip()
+                if not stripped:
+                    continue
+                current_indent = len(lines[candidate_index]) - len(lines[candidate_index].lstrip(" "))
+                if current_indent <= len(indent):
+                    body_end = candidate_index
+                    break
+            body_indent = f"{indent}    "
+            new_body_line = f"{body_indent}return {return_template.format(param=param_name)}\n"
+            existing_body = "".join(lines[body_start:body_end]).strip()
+            if existing_body == new_body_line.strip():
+                return None
+            return "".join([*lines[:body_start], new_body_line, *lines[body_end:]])
+        return None
+
+    def _build_python_unittest_expectation_update(
+        self,
+        *,
+        file_text: str,
+        function_name: str,
+        input_value: str,
+        output_value: str,
+    ) -> str | None:
+        assertion = f"self.assertEqual({function_name}({input_value!r}), {output_value!r})"
+        if assertion in file_text:
+            return None
+
+        class_match = re.search(
+            r"^class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\((?:.*\.)?TestCase\):\s*$",
+            file_text,
+            flags=re.MULTILINE,
+        )
+        if class_match is None:
+            return None
+
+        method_name = f"test_{function_name}_normalizes_whitespace_and_title_case"
+        block_text = (
+            f"def {method_name}(self) -> None:\n"
+            f"    {assertion}"
+        )
+        return self._build_class_block_inserted_text(
+            file_text=file_text,
+            class_name=class_match.group("name"),
+            block_text=block_text,
+        )
 
     @staticmethod
     def _strip_read_file_line_numbers(text: str) -> str:
@@ -3299,13 +5114,25 @@ class ClosedLoopSupervisor:
             final_conf = 0.0
             if rounds and getattr(rounds[-1], "verifier", None):
                 final_conf = getattr(rounds[-1].verifier, "confidence", 0.0)
+            json_repair_count = sum(
+                max(int(getattr(record, "planner_json_repairs", 0) or 0), 0)
+                + max(int(getattr(record, "verifier_json_repairs", 0) or 0), 0)
+                for record in rounds
+            )
+            structured_response_count = sum(2 for record in rounds if record.reasoning_source == "model")
 
             entry = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "task_route": task_route,
                 "total_rounds": len(rounds),
                 "tool_mix": mix,
                 "unique_files_touched": unique_files,
                 "synthesis_confidence": final_conf,
+                "json_repair_count": json_repair_count,
+                "structured_response_count": structured_response_count,
+                "json_repair_rate": (
+                    json_repair_count / structured_response_count if structured_response_count else 0.0
+                ),
             }
 
             with log_file.open("a", encoding="utf-8") as f:

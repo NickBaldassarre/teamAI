@@ -1,0 +1,38 @@
+{
+  "name": "teamai_local_autonomy",
+  "description": "Exercises at least one non-trivial local write loop end-to-end without deterministic compilation or a cloud handoff.",
+  "cleanup_approvals": true,
+  "cases": [
+    {
+      "case_id": "local_nontrivial_patch_roundtrip",
+      "task": "Use workspace_write mode. Read app.py and tests/test_app.py, update normalize_name so it trims whitespace and title-cases each word, then add or update a unittest that proves '  jAnE   DOE  ' becomes 'Jane Doe'.",
+      "execution_mode": "workspace_write",
+      "max_rounds": 4,
+      "max_actions_per_round": 3,
+      "max_tokens_per_turn": 192,
+      "auto_continue_after_approval": true,
+      "setup_files": [
+        {
+          "path": "app.py",
+          "content": "def normalize_name(value: str) -> str:\\n    return value\\n"
+        },
+        {
+          "path": "tests/test_app.py",
+          "content": "import unittest\\n\\nfrom app import normalize_name\\n\\n\\nclass NormalizeNameTest(unittest.TestCase):\\n    def test_preserves_original_value(self) -> None:\\n        self.assertEqual(normalize_name('Jane Doe'), 'Jane Doe')\\n\\n\\nif __name__ == '__main__':\\n    unittest.main()\\n"
+        }
+      ],
+      "expectations": {
+        "allowed_task_routes": [
+          "explicit_write_loop",
+          "multi_agent_loop"
+        ],
+        "allowed_stop_reasons": [
+          "planner_declared_complete",
+          "verifier_declared_complete"
+        ],
+        "local_completion": true,
+        "handoff": false
+      }
+    }
+  ]
+}

@@ -83,6 +83,7 @@ class CodexBridgeExecutionTest(unittest.TestCase):
             with patch("teamai.integrations.codex_bridge._create_openai_client", return_value=client):
                 result = execute_codex_handoff(project_root=project_root)
 
+            self.assertEqual(result.engine, "codex")
             self.assertEqual(result.model, "gpt-5.4")
             self.assertEqual(result.payload_file, payload_path.resolve())
             self.assertTrue(result.patch_file.exists())
@@ -130,12 +131,12 @@ class CodexBridgeExecutionTest(unittest.TestCase):
             )
 
             with patch("teamai.integrations.codex_bridge._create_openai_client", return_value=client), patch(
-                "teamai.integrations.codex_bridge.verify_patch",
+                "teamai.integrations.bridge_base.verify_patch",
                 return_value=verification,
             ), patch(
-                "teamai.integrations.codex_bridge.PatchApprovalStore.create_bundle_from_patch",
+                "teamai.integrations.bridge_base.PatchApprovalStore.create_bundle_from_patch",
                 return_value={"approval_id": "approval123", "change_count": 1},
-            ), patch("teamai.integrations.codex_bridge.Sandbox") as sandbox_cls:
+            ), patch("teamai.integrations.bridge_base.Sandbox") as sandbox_cls:
                 sandbox_cls.return_value.__enter__.return_value = type(
                     "_Sandbox",
                     (),
@@ -183,14 +184,16 @@ class CodexBridgeExecutionTest(unittest.TestCase):
             )
 
             with patch("teamai.integrations.codex_bridge._create_openai_client", return_value=client), patch(
-                "teamai.integrations.codex_bridge.verify_patch",
+                "teamai.integrations.bridge_base.verify_patch",
                 return_value=verification,
-            ), patch("teamai.integrations.codex_bridge.Sandbox") as sandbox_cls:
+            ), patch("teamai.integrations.bridge_base.Sandbox") as sandbox_cls:
                 sandbox_cls.return_value.__enter__.return_value = object()
                 result = execute_verified_codex_handoff(project_root=project_root)
 
             self.assertFalse(result.verification.success)
-            self.assertEqual(failure_context_path.read_text(encoding="utf-8"), "tests failed\n")
+            failure_text = failure_context_path.read_text(encoding="utf-8")
+            self.assertIn("failing_tests", failure_text)
+            self.assertIn("tests failed", failure_text)
             sandbox_cls.assert_called_once_with(project_root.resolve())
 
 

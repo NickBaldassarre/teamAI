@@ -223,9 +223,9 @@ class PatchApprovalStoreTest(unittest.TestCase):
 
         self.assertEqual(context["path"], "teamai/api.py")
         self.assertIn("tests/test_api.py", context["suggested_read_paths"])
-        self.assertEqual(context["suggested_commands"][0], ["python", "-m", "unittest", "tests.test_api"])
+        self.assertEqual(context["suggested_commands"][0], ["python3", "-m", "unittest", "tests.test_api"])
         self.assertIn("Verification focus:", task)
-        self.assertIn("python -m unittest tests.test_api", task)
+        self.assertIn("python3 -m unittest tests.test_api", task)
 
 
 class ApprovalsCliTest(unittest.TestCase):

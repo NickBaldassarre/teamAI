@@ -117,9 +117,9 @@ agents:
       in the downstream execution model.
 
   - id: grok_fast
-    name: "Grok Fast Reasoning (xAI)"
+    name: "Grok 4.20 Reasoning (xAI)"
     type: xai
-    model_id: "grok-4-1-fast-reasoning"
+    model_id: "grok-4.20-reasoning"
     capabilities:
       - verified_handoff_execution
     max_context_tokens: 256000

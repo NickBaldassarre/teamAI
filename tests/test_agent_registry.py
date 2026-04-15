@@ -172,9 +172,9 @@ class AgentRegistryRoutingTest(unittest.TestCase):
                     quota_pressure=0.95,
                     window_headroom=0.05,
                 ),
-                "grok-4-1-fast-reasoning": RateLimitState(
+                "grok-4.20-reasoning": RateLimitState(
                     provider="xai",
-                    model_id="grok-4-1-fast-reasoning",
+                    model_id="grok-4.20-reasoning",
                     requests_limit=100,
                     remaining_requests=60,
                     tokens_limit=1000,
@@ -221,9 +221,9 @@ class AgentRegistryRoutingTest(unittest.TestCase):
                     success_ema=0.95,
                     latency_ema_ms=2200,
                 ),
-                "grok-4-1-fast-reasoning": ModelPerformanceRecord(
+                "grok-4.20-reasoning": ModelPerformanceRecord(
                     task_signature_hash="sig-verified",
-                    model_id="grok-4-1-fast-reasoning",
+                    model_id="grok-4.20-reasoning",
                     sample_count=6,
                     success_ema=0.2,
                     latency_ema_ms=2500,

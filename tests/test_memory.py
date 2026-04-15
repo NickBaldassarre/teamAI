@@ -85,7 +85,7 @@ class WorkspaceMemoryStoreTest(unittest.TestCase):
         first = store.update_model_stats(
             self.workspace,
             task_signature_hash="sig-123",
-            model_id="grok-4-1-fast-reasoning",
+            model_id="grok-4.20-reasoning",
             success=True,
             latency_ms=2000,
             total_tokens=300,
@@ -95,7 +95,7 @@ class WorkspaceMemoryStoreTest(unittest.TestCase):
         second = store.update_model_stats(
             self.workspace,
             task_signature_hash="sig-123",
-            model_id="grok-4-1-fast-reasoning",
+            model_id="grok-4.20-reasoning",
             success=False,
             latency_ms=6000,
             total_tokens=900,
@@ -111,8 +111,8 @@ class WorkspaceMemoryStoreTest(unittest.TestCase):
         self.assertGreater(second.success_ema, 0.0)
 
         loaded = store.get_model_stats(self.workspace, task_signature_hash="sig-123")
-        self.assertIn("grok-4-1-fast-reasoning", loaded)
-        self.assertEqual(loaded["grok-4-1-fast-reasoning"].sample_count, 2)
+        self.assertIn("grok-4.20-reasoning", loaded)
+        self.assertEqual(loaded["grok-4.20-reasoning"].sample_count, 2)
 
     def test_persist_run_writes_history_and_memory_files(self) -> None:
         store = WorkspaceMemoryStore()

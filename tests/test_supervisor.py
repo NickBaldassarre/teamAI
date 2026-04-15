@@ -147,9 +147,9 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
                     quota_pressure=0.96,
                     window_headroom=0.04,
                 ),
-                "grok-4-1-fast-reasoning": RateLimitState(
+                "grok-4.20-reasoning": RateLimitState(
                     provider="xai",
-                    model_id="grok-4-1-fast-reasoning",
+                    model_id="grok-4.20-reasoning",
                     requests_limit=100,
                     remaining_requests=80,
                     tokens_limit=1000,
@@ -163,7 +163,7 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test", "XAI_API_KEY": "test"}, clear=False):
             target = supervisor._select_verified_handoff_target(RunRequest(task="Implement the feature."))  # noqa: SLF001
 
-        self.assertEqual(target, ("grok", "grok-4-1-fast-reasoning"))
+        self.assertEqual(target, ("grok", "grok-4.20-reasoning"))
 
     def test_planner_heuristic_fallback_uses_readme(self) -> None:
         (self.workspace / "README.md").write_text("# demo\n", encoding="utf-8")

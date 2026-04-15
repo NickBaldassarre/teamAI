@@ -17,7 +17,7 @@ from .bridge_base import (
 )
 from .codex_bridge import _extract_response_text
 
-DEFAULT_GROK_MODEL = "grok-4-1-fast-reasoning"
+DEFAULT_GROK_MODEL = "grok-4.20-reasoning"
 DEFAULT_GROK_PAYLOAD_FILE = ".teamai/codex_payload.json"
 DEFAULT_GROK_PATCH_FILE = ".teamai/grok_solution.patch"
 DEFAULT_GROK_FAILURE_CONTEXT_FILE = ".teamai/failure_context.log"

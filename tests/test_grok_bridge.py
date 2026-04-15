@@ -97,7 +97,7 @@ class GrokBridgeTest(unittest.TestCase):
                 result = execute_grok_handoff(project_root=project_root)
 
             self.assertEqual(result.engine, "grok")
-            self.assertEqual(result.model, "grok-4-1-fast-reasoning")
+            self.assertEqual(result.model, "grok-4.20-reasoning")
             self.assertTrue(patch_path.exists())
             self.assertEqual(result.prompt_tokens, 120)
             self.assertEqual(result.completion_tokens, 30)
@@ -107,7 +107,7 @@ class GrokBridgeTest(unittest.TestCase):
             rate_limit_path = Path(temp_dir) / ".teamai" / "rate_limits.json"
             self.assertTrue(rate_limit_path.exists())
             stored = json.loads(rate_limit_path.read_text(encoding="utf-8"))
-            self.assertIn("grok-4-1-fast-reasoning", stored)
+            self.assertIn("grok-4.20-reasoning", stored)
 
 
 if __name__ == "__main__":

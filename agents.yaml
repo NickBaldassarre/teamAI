@@ -27,6 +27,7 @@ agents:
     cost: free
     latency: low
     requires_env: []
+    rate_limit_sensitivity: low
     notes: >
       Compiler-backed narrow write route. Produces approval-gated patches
       without invoking a model and must always be labeled deterministic.
@@ -41,6 +42,7 @@ agents:
     cost: free
     latency: low
     requires_env: []
+    rate_limit_sensitivity: low
     notes: >
       Deterministic repository reconnaissance and synthesis route for
       inspection-style prompts that do not require model-authored council text.
@@ -56,6 +58,7 @@ agents:
     cost: free
     latency: low
     requires_env: []
+    rate_limit_sensitivity: low
     notes: >
       Default local reasoning agent. Runs fully offline on Apple Silicon via MLX.
       Best for short local multi-agent loops and reconnaissance that prepares a
@@ -73,6 +76,7 @@ agents:
     cost: free
     latency: medium
     requires_env: []
+    rate_limit_sensitivity: low
     notes: >
       Larger local model for machines with 32GB+ unified memory.
       Can handle explicit write loops and local verified-handoff execution
@@ -89,6 +93,7 @@ agents:
     latency: medium
     requires_env:
       - OPENAI_API_KEY
+    rate_limit_sensitivity: high
     notes: >
       Primary cloud execution engine for complex multi-file coding tasks.
       Receives a semantic skeleton from the local system and returns a unified
@@ -104,11 +109,29 @@ agents:
     cost: expensive
     latency: medium
     requires_env:
-      - GOOGLE_API_KEY
+      - GEMINI_API_KEY
+    rate_limit_sensitivity: high
     notes: >
       Alternative verified-handoff engine with a very large context window.
       Useful for whole-repository tasks where the full codebase needs to fit
       in the downstream execution model.
+
+  - id: grok_fast
+    name: "Grok Fast Reasoning (xAI)"
+    type: xai
+    model_id: "grok-4-1-fast-reasoning"
+    capabilities:
+      - verified_handoff_execution
+    max_context_tokens: 256000
+    cost: moderate
+    latency: low
+    requires_env:
+      - XAI_API_KEY
+    rate_limit_sensitivity: high
+    notes: >
+      Fast OpenAI-compatible xAI handoff engine. Good default when we want
+      stronger reasoning than local Gemma without immediately spending Codex
+      budget or pushing the most constrained quota pool.
 
   - id: claude_desktop
     name: "Claude Desktop Control (Anthropic)"
@@ -121,6 +144,7 @@ agents:
     latency: high
     requires_env:
       - ANTHROPIC_API_KEY
+    rate_limit_sensitivity: medium
     notes: >
       Desktop automation agent using Claude Computer Use. Executes OS-level
       tasks — opening apps, clicking UI elements, filling forms, reading
@@ -148,6 +172,11 @@ routing:
   broken_route_penalty: 18
   memory_pressure_penalty: 6
   local_preference_bonus: 2
+  free_local_bonus: 6
+  model_success_weight: 10
+  model_latency_weight: 3
+  quota_pressure_weight: 18
+  exploration_weight: 3
 
   task_profiles:
     deterministic_patch:

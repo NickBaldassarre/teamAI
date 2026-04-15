@@ -161,6 +161,42 @@ class RoutingTraceEntry(BaseModel):
     verifier_confidence: float | None = None
 
 
+class RateLimitState(BaseModel):
+    provider: str
+    model_id: str
+    requests_made: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    requests_limit: int | None = None
+    remaining_requests: int | None = None
+    tokens_limit: int | None = None
+    remaining_tokens: int | None = None
+    daily_requests_limit: int | None = None
+    remaining_daily_requests: int | None = None
+    daily_tokens_limit: int | None = None
+    remaining_daily_tokens: int | None = None
+    quota_pressure: float = 0.0
+    window_headroom: float | None = None
+    daily_headroom: float | None = None
+    source: str = "usage_only"
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ModelPerformanceRecord(BaseModel):
+    task_signature_hash: str
+    model_id: str
+    sample_count: int = 0
+    success_ema: float = 0.0
+    latency_ema_ms: float = 0.0
+    prompt_tokens_ema: float = 0.0
+    completion_tokens_ema: float = 0.0
+    total_tokens_ema: float = 0.0
+    cost_ema: float = 0.0
+    quota_pressure_ema: float = 0.0
+    last_status: str | None = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class RepoIndex(BaseModel):
     workspace: str
     file_tree_summary: list[str] = Field(default_factory=list)
@@ -234,7 +270,7 @@ class RunRequest(BaseModel):
     auto_push: bool = False
     push_remote: str = "origin"
     push_branch_name: str | None = None
-    handoff_engine: Literal["codex", "gemini", "local"] | None = None
+    handoff_engine: Literal["codex", "gemini", "grok", "local"] | None = None
     handoff_model: str | None = None
     max_handoff_revision_attempts: int | None = None
     continuation_context: dict[str, Any] = Field(default_factory=dict)

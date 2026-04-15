@@ -8,16 +8,25 @@ supervisor does not need its own hardcoded route ladder.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .schemas import ModelPerformanceRecord, RateLimitState
+
 _COST_ORDER = {"free": 0, "cheap": 1, "moderate": 2, "expensive": 3}
+_LATENCY_ORDER = {"low": 0, "medium": 1, "high": 2}
+_RATE_LIMIT_SENSITIVITY = {"low": 0.35, "medium": 1.0, "high": 1.35}
 _DEFAULT_REGISTRY_SEARCH = [
     Path("agents.yaml"),
     Path("~/.teamai/agents.yaml"),
 ]
 _LOCAL_AGENT_TYPES = {"deterministic", "local_mlx"}
+_TASK_TAG_RE = re.compile(r"\b[\w./-]+\.(py|ts|tsx|js|jsx|md|json|toml|yaml|yml)\b")
 
 
 @dataclass(frozen=True)
@@ -31,6 +40,7 @@ class AgentEntry:
     cost: str
     latency: str
     requires_env: list[str]
+    rate_limit_sensitivity: str = "medium"
     notes: str = ""
 
     def supports(self, capability: str) -> bool:
@@ -48,6 +58,14 @@ class AgentEntry:
     @property
     def is_local(self) -> bool:
         return self.type in _LOCAL_AGENT_TYPES
+
+    @property
+    def latency_rank(self) -> int:
+        return _LATENCY_ORDER.get(self.latency, 1)
+
+    @property
+    def quota_sensitivity_multiplier(self) -> float:
+        return _RATE_LIMIT_SENSITIVITY.get(self.rate_limit_sensitivity, 1.0)
 
 
 @dataclass(frozen=True)
@@ -73,11 +91,14 @@ class TaskSignature:
     repository_inspection: bool = False
     broad_coding: bool = False
     memory_pressure: bool = False
+    desktop_task: bool = False
     expected_files_touched: int = 0
     has_tests: bool = False
     policy_scores: dict[str, float] = field(default_factory=dict)
     agent_policy_scores: dict[str, float] = field(default_factory=dict)
     route_health: dict[str, RouteHealth] = field(default_factory=dict)
+    rate_limits: dict[str, RateLimitState] = field(default_factory=dict)
+    model_performance: dict[str, ModelPerformanceRecord] = field(default_factory=dict)
 
     def flag_value(self, key: str) -> bool:
         normalized = key.strip().lower()
@@ -89,6 +110,7 @@ class TaskSignature:
             "repository_inspection": self.repository_inspection,
             "broad_coding": self.broad_coding,
             "memory_pressure": self.memory_pressure,
+            "desktop_task": self.desktop_task,
             "complexity_low": self.complexity == "low",
             "complexity_medium": self.complexity == "medium",
             "complexity_high": self.complexity == "high",
@@ -97,6 +119,51 @@ class TaskSignature:
             "read_only": self.execution_mode == "read_only",
         }
         return bool(flags.get(normalized, False))
+
+    @property
+    def signature_hash(self) -> str:
+        payload = {
+            "execution_mode": self.execution_mode,
+            "complexity": self.complexity,
+            "continuation": self.continuation,
+            "deterministic_candidate": self.deterministic_candidate,
+            "explicit_write": self.explicit_write,
+            "repository_inspection": self.repository_inspection,
+            "broad_coding": self.broad_coding,
+            "memory_pressure": self.memory_pressure,
+            "desktop_task": self.desktop_task,
+            "expected_files_touched": self.expected_files_touched,
+            "has_tests": self.has_tests,
+            "task_tags": sorted(self._task_tags(self.task)),
+        }
+        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _task_tags(task: str) -> set[str]:
+        lowered = task.lower()
+        tags: set[str] = set()
+        for marker in (
+            "python",
+            "typescript",
+            "javascript",
+            "routing",
+            "memory",
+            "handoff",
+            "quota",
+            "rate limit",
+            "desktop",
+            "browser",
+            "test",
+            "cli",
+            "api",
+            "refactor",
+            "write",
+        ):
+            if marker in lowered:
+                tags.add(marker.replace(" ", "_"))
+        for match in _TASK_TAG_RE.finditer(lowered):
+            tags.add(match.group(0))
+        return tags
 
 
 @dataclass(frozen=True)
@@ -121,6 +188,11 @@ class RoutingConfig:
     broken_route_penalty: int = 18
     memory_pressure_penalty: int = 6
     local_preference_bonus: int = 2
+    free_local_bonus: int = 6
+    model_success_weight: int = 10
+    model_latency_weight: float = 3.0
+    quota_pressure_weight: int = 18
+    exploration_weight: float = 3.0
     task_profiles: dict[str, TaskProfile] = field(default_factory=dict)
 
 
@@ -182,6 +254,7 @@ class AgentRegistry:
                 cost=str(raw.get("cost", "unknown")),
                 latency=str(raw.get("latency", "unknown")),
                 requires_env=[str(e) for e in (raw.get("requires_env") or [])],
+                rate_limit_sensitivity=str(raw.get("rate_limit_sensitivity", "medium") or "medium"),
                 notes=str(raw.get("notes", "") or "").strip(),
             )
         except (KeyError, TypeError, ValueError):
@@ -218,6 +291,11 @@ class AgentRegistry:
             broken_route_penalty=int(raw.get("broken_route_penalty", 18) or 18),
             memory_pressure_penalty=int(raw.get("memory_pressure_penalty", 6) or 6),
             local_preference_bonus=int(raw.get("local_preference_bonus", 2) or 2),
+            free_local_bonus=int(raw.get("free_local_bonus", 6) or 6),
+            model_success_weight=int(raw.get("model_success_weight", 10) or 10),
+            model_latency_weight=float(raw.get("model_latency_weight", 3.0) or 3.0),
+            quota_pressure_weight=int(raw.get("quota_pressure_weight", 18) or 18),
+            exploration_weight=float(raw.get("exploration_weight", 3.0) or 3.0),
             task_profiles=profiles,
         )
 
@@ -276,6 +354,47 @@ class AgentRegistry:
         if env_check:
             result = [a for a in result if a.env_satisfied()]
         return result
+
+    def pick_best_for_capability(
+        self,
+        capability: str,
+        *,
+        task_signature: TaskSignature,
+        prefer_local: bool = False,
+        env_check: bool = True,
+    ) -> RoutingDecision | None:
+        candidates: list[RoutingDecision] = []
+        for agent in self.capable_of(capability, env_check=env_check):
+            profile = self._routing.task_profiles.get(capability, TaskProfile(capability=capability))
+            health = task_signature.route_health.get(capability, RouteHealth(capability=capability))
+            score, reasons = self._score_candidate(
+                agent=agent,
+                capability=capability,
+                profile=profile,
+                task_signature=task_signature,
+                health=health,
+                prefer_local=prefer_local,
+            )
+            candidates.append(
+                RoutingDecision(
+                    agent=agent,
+                    capability=capability,
+                    score=score,
+                    reasons=tuple(reasons),
+                    health=health,
+                )
+            )
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda decision: (
+                decision.score,
+                1 if decision.agent.is_local else 0,
+                -decision.agent.cost_rank,
+                decision.agent.max_context_tokens,
+            ),
+        )
 
     def stronger_local_candidates(
         self,
@@ -397,6 +516,12 @@ class AgentRegistry:
     ) -> tuple[float, list[str]]:
         score = float(profile.base_score)
         reasons: list[str] = []
+        model_stats = task_signature.model_performance.get(agent.id) or task_signature.model_performance.get(agent.model_id)
+        total_bandit_samples = max(
+            sum(max(record.sample_count, 0) for record in task_signature.model_performance.values()),
+            1,
+        )
+        rate_limit_state = task_signature.rate_limits.get(agent.id) or task_signature.rate_limits.get(agent.model_id)
 
         for flag, weight in profile.score_if.items():
             if task_signature.flag_value(flag):
@@ -407,10 +532,63 @@ class AgentRegistry:
             score += self._routing.local_preference_bonus
             reasons.append(f"prefer_local={self._routing.local_preference_bonus:+d}")
 
+        if agent.is_local and capability != "desktop_control":
+            score += self._routing.free_local_bonus
+            reasons.append(f"free_local={self._routing.free_local_bonus:+d}")
+
         if self._routing.prefer_lower_cost:
             cost_penalty = float(agent.cost_rank)
             score -= cost_penalty
             reasons.append(f"cost={-cost_penalty:+.1f}")
+
+        if model_stats is not None and model_stats.sample_count > 0:
+            success_bonus = round(model_stats.success_ema * self._routing.model_success_weight, 2)
+            score += success_bonus
+            reasons.append(f"success_ema={success_bonus:+.2f}")
+
+            latency_penalty = round(
+                min(model_stats.latency_ema_ms / 1000.0, 90.0) / 15.0 * self._routing.model_latency_weight,
+                2,
+            )
+            if latency_penalty:
+                score -= latency_penalty
+                reasons.append(f"latency_ema={-latency_penalty:+.2f}")
+
+            if model_stats.quota_pressure_ema:
+                historical_quota_penalty = round(model_stats.quota_pressure_ema * 4.0, 2)
+                score -= historical_quota_penalty
+                reasons.append(f"quota_ema={-historical_quota_penalty:+.2f}")
+
+        exploration_denominator = float((model_stats.sample_count + 1) if model_stats is not None else 1)
+        exploration_bonus = round(
+            self._routing.exploration_weight * math.sqrt(math.log(total_bandit_samples + 1.0) / exploration_denominator),
+            2,
+        )
+        score += exploration_bonus
+        reasons.append(f"exploration={exploration_bonus:+.2f}")
+
+        if rate_limit_state is not None and not agent.is_local:
+            quota_penalty = round(
+                (rate_limit_state.quota_pressure ** 2)
+                * self._routing.quota_pressure_weight
+                * agent.quota_sensitivity_multiplier,
+                2,
+            )
+            if quota_penalty:
+                score -= quota_penalty
+                reasons.append(f"quota_pressure={-quota_penalty:+.2f}")
+            headroom = min(
+                [
+                    value
+                    for value in (rate_limit_state.window_headroom, rate_limit_state.daily_headroom)
+                    if value is not None
+                ]
+                or [1.0]
+            )
+            if headroom <= 0.2:
+                pressure_penalty = round((0.2 - headroom) * 40.0 * agent.quota_sensitivity_multiplier, 2)
+                score -= pressure_penalty
+                reasons.append(f"low_headroom={-pressure_penalty:+.2f}")
 
         if health.recent_runs:
             success_bonus = round(health.success_rate * self._routing.success_rate_weight, 2)
@@ -462,6 +640,9 @@ class AgentRegistry:
             if agent.is_local and agent.max_context_tokens < 4096:
                 score -= 6
                 reasons.append("high_complexity_small_context=-6")
+            if agent.is_local and capability == "verified_handoff_execution":
+                score -= 6
+                reasons.append("high_complexity_local_handoff=-6")
         elif task_signature.complexity == "medium":
             if agent.is_local and agent.max_context_tokens >= 4096:
                 score += 3
@@ -525,6 +706,18 @@ def _default_task_profiles() -> dict[str, TaskProfile]:
                 "deterministic_candidate": -12,
             },
         ),
+        "verified_handoff_execution": TaskProfile(
+            capability="verified_handoff_execution",
+            base_score=4,
+            score_if={
+                "broad_coding": 12,
+                "workspace_write": 2,
+                "complexity_high": 8,
+                "repository_inspection": -8,
+                "deterministic_candidate": -10,
+                "desktop_task": -12,
+            },
+        ),
         "multi_agent_loop": TaskProfile(
             capability="multi_agent_loop",
             base_score=1,
@@ -533,6 +726,16 @@ def _default_task_profiles() -> dict[str, TaskProfile]:
                 "complexity_medium": 4,
                 "complexity_high": -6,
                 "broad_coding": -4,
+            },
+        ),
+        "desktop_control": TaskProfile(
+            capability="desktop_control",
+            base_score=0,
+            score_if={
+                "desktop_task": 20,
+                "broad_coding": -16,
+                "deterministic_candidate": -18,
+                "repository_inspection": -18,
             },
         ),
     }

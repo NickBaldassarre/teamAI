@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+from time import perf_counter
 from pathlib import Path
 
 from ..schemas import CodexHandoffPayload
-from .bridge_base import AgentBridge, BridgeExecutionResult
+from .bridge_base import (
+    AgentBridge,
+    BridgeExecutionResult,
+    BridgeModelResponse,
+    build_rate_limit_state,
+    extract_headers,
+    extract_usage_counts,
+)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
 
@@ -24,7 +32,7 @@ class GeminiBridge(AgentBridge):
         payload: CodexHandoffPayload,
         payload_path: Path,
         project_root: Path,
-    ) -> str:
+    ) -> BridgeModelResponse:
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set. Export it before running `teamai execute-handoff --engine gemini`.")
@@ -53,6 +61,7 @@ class GeminiBridge(AgentBridge):
 
         client = genai.Client(api_key=api_key)
         try:
+            started = perf_counter()
             response = client.models.generate_content(
                 model=model,
                 contents=prompt_payload,
@@ -63,7 +72,28 @@ class GeminiBridge(AgentBridge):
             )
         except Exception as exc:
             raise RuntimeError(f"Gemini API request failed: {exc}") from exc
-        return str(getattr(response, "text", "") or "")
+        prompt_tokens, completion_tokens, total_tokens = extract_usage_counts(
+            getattr(response, "usage_metadata", None),
+            prompt_keys=("prompt_token_count", "prompt_tokens"),
+            completion_keys=("candidates_token_count", "completion_tokens"),
+            total_keys=("total_token_count", "total_tokens"),
+        )
+        return BridgeModelResponse(
+            patch_text=str(getattr(response, "text", "") or ""),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=(perf_counter() - started) * 1000.0,
+            rate_limit_state=build_rate_limit_state(
+                provider="gemini",
+                model_id=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                headers=extract_headers(response),
+                source="api_headers",
+            ),
+        )
 
 
 def execute_gemini_handoff(

@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .agent_registry import RouteHealth
+from .schemas import ModelPerformanceRecord, RateLimitState
 
 
 if TYPE_CHECKING:
@@ -19,6 +20,7 @@ RUN_HISTORY_FILE_NAME = "run-history.jsonl"
 MEMORY_FILE_NAME = "memory.md"
 POLICY_MEMORY_FILE_NAME = "policy-memory.json"
 AGENT_POLICY_MEMORY_FILE_NAME = "agent-policy-memory.json"
+MODEL_PERFORMANCE_FILE_NAME = "model-performance.json"
 MAX_HISTORY_ENTRIES = 50
 MAX_CONTEXT_RUNS = 5
 MAX_MEMORY_CHARS = 4_000
@@ -32,8 +34,10 @@ MAX_EVAL_FAILURE_CASES = 4
 # Global memory constants
 GLOBAL_STATE_DIR = Path("~/.teamai")
 GLOBAL_MEMORY_FILE_NAME = "global-memory.md"
+GLOBAL_RATE_LIMITS_FILE_NAME = "rate_limits.json"
 MAX_GLOBAL_MEMORY_NOTES = 20
 MAX_GLOBAL_MEMORY_CHARS = 4_000
+MODEL_PERFORMANCE_EMA_ALPHA = 0.35
 # Pattern to detect project-specific file references that make a note non-generalizable
 _SPECIFIC_FILE_RE = re.compile(
     r"\b[\w./-]+/[\w.-]+\b|\b\w+\.(py|js|ts|md|yaml|json|txt|sh|toml|cfg|lock)\b"
@@ -295,6 +299,173 @@ class WorkspaceMemoryStore:
                 scores[str(key)] = round(adjustment, 2)
         return scores
 
+    def get_rate_limits(self) -> dict[str, RateLimitState]:
+        rate_limit_path = self._global_state_dir() / GLOBAL_RATE_LIMITS_FILE_NAME
+        if not rate_limit_path.exists():
+            return {}
+        try:
+            payload = json.loads(rate_limit_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        states: dict[str, RateLimitState] = {}
+        for model_id, entry in payload.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                state = RateLimitState.model_validate(entry)
+            except Exception:
+                continue
+            states[str(model_id)] = self._normalize_rate_limit_state(state)
+        return states
+
+    def update_rate_limits(
+        self,
+        *,
+        model_id: str,
+        state: RateLimitState,
+    ) -> RateLimitState:
+        normalized_model_id = model_id.strip() or state.model_id.strip()
+        if not normalized_model_id:
+            raise ValueError("model_id is required when persisting rate-limit state.")
+
+        current = self.get_rate_limits().get(normalized_model_id)
+        merged = state.model_copy(deep=True)
+        merged.model_id = normalized_model_id
+
+        if current is not None:
+            merged.requests_made = current.requests_made + max(merged.requests_made, 0)
+            merged.tokens_in = current.tokens_in + max(merged.tokens_in, 0)
+            merged.tokens_out = current.tokens_out + max(merged.tokens_out, 0)
+
+            for field_name in (
+                "requests_limit",
+                "remaining_requests",
+                "tokens_limit",
+                "remaining_tokens",
+                "daily_requests_limit",
+                "remaining_daily_requests",
+                "daily_tokens_limit",
+                "remaining_daily_tokens",
+                "window_headroom",
+                "daily_headroom",
+            ):
+                if getattr(merged, field_name) is None:
+                    setattr(merged, field_name, getattr(current, field_name))
+            if not merged.provider:
+                merged.provider = current.provider
+            if merged.source == "usage_only":
+                merged.source = current.source
+            if merged.quota_pressure <= 0.0 and current.quota_pressure > 0.0:
+                merged.quota_pressure = current.quota_pressure
+
+        merged = self._normalize_rate_limit_state(merged)
+
+        rate_limit_path = self._global_state_dir() / GLOBAL_RATE_LIMITS_FILE_NAME
+        rate_limit_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            key: value.model_dump(mode="json")
+            for key, value in {**self.get_rate_limits(), normalized_model_id: merged}.items()
+        }
+        rate_limit_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return merged
+
+    def get_model_stats(
+        self,
+        workspace: Path,
+        *,
+        task_signature_hash: str,
+    ) -> dict[str, ModelPerformanceRecord]:
+        performance_path = self._state_dir(workspace) / MODEL_PERFORMANCE_FILE_NAME
+        if not performance_path.exists():
+            return {}
+        try:
+            payload = json.loads(performance_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        bucket = payload.get(task_signature_hash)
+        if not isinstance(bucket, dict):
+            return {}
+
+        records: dict[str, ModelPerformanceRecord] = {}
+        for model_id, entry in bucket.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                records[str(model_id)] = ModelPerformanceRecord.model_validate(entry)
+            except Exception:
+                continue
+        return records
+
+    def update_model_stats(
+        self,
+        workspace: Path,
+        *,
+        task_signature_hash: str,
+        model_id: str,
+        success: bool,
+        latency_ms: float | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cost: float | None = None,
+        quota_pressure: float | None = None,
+        status: str | None = None,
+    ) -> ModelPerformanceRecord:
+        performance_path = self._state_dir(workspace) / MODEL_PERFORMANCE_FILE_NAME
+        performance_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            payload = json.loads(performance_path.read_text(encoding="utf-8")) if performance_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        bucket = payload.setdefault(task_signature_hash, {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+            payload[task_signature_hash] = bucket
+
+        existing_raw = bucket.get(model_id)
+        existing = None
+        if isinstance(existing_raw, dict):
+            try:
+                existing = ModelPerformanceRecord.model_validate(existing_raw)
+            except Exception:
+                existing = None
+
+        record = existing or ModelPerformanceRecord(
+            task_signature_hash=task_signature_hash,
+            model_id=model_id,
+        )
+        sample_count = max(record.sample_count, 0) + 1
+        record = record.model_copy(deep=True)
+        record.sample_count = sample_count
+        record.success_ema = self._ema(record.success_ema, 1.0 if success else 0.0, previous_count=sample_count - 1)
+        if latency_ms is not None:
+            record.latency_ema_ms = self._ema(record.latency_ema_ms, float(latency_ms), previous_count=sample_count - 1)
+        if prompt_tokens is not None:
+            record.prompt_tokens_ema = self._ema(record.prompt_tokens_ema, float(prompt_tokens), previous_count=sample_count - 1)
+        if completion_tokens is not None:
+            record.completion_tokens_ema = self._ema(record.completion_tokens_ema, float(completion_tokens), previous_count=sample_count - 1)
+        if total_tokens is not None:
+            record.total_tokens_ema = self._ema(record.total_tokens_ema, float(total_tokens), previous_count=sample_count - 1)
+        if cost is not None:
+            record.cost_ema = self._ema(record.cost_ema, float(cost), previous_count=sample_count - 1)
+        if quota_pressure is not None:
+            record.quota_pressure_ema = self._ema(record.quota_pressure_ema, float(quota_pressure), previous_count=sample_count - 1)
+        record.last_status = status
+        record.updated_at = datetime.now(timezone.utc)
+
+        bucket[model_id] = record.model_dump(mode="json")
+        performance_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return record
+
     def persist_eval_feedback(
         self,
         *,
@@ -535,6 +706,54 @@ class WorkspaceMemoryStore:
     @staticmethod
     def _state_dir(workspace: Path) -> Path:
         return workspace / STATE_DIR_NAME
+
+    @staticmethod
+    def _global_state_dir() -> Path:
+        return GLOBAL_STATE_DIR.expanduser()
+
+    @classmethod
+    def _normalize_rate_limit_state(cls, state: RateLimitState) -> RateLimitState:
+        normalized = state.model_copy(deep=True)
+        normalized.window_headroom = cls._headroom(normalized.remaining_requests, normalized.requests_limit)
+        token_headroom = cls._headroom(normalized.remaining_tokens, normalized.tokens_limit)
+        if token_headroom is not None:
+            normalized.window_headroom = (
+                min(normalized.window_headroom, token_headroom)
+                if normalized.window_headroom is not None
+                else token_headroom
+            )
+        normalized.daily_headroom = cls._headroom(
+            normalized.remaining_daily_requests,
+            normalized.daily_requests_limit,
+        )
+        daily_token_headroom = cls._headroom(
+            normalized.remaining_daily_tokens,
+            normalized.daily_tokens_limit,
+        )
+        if daily_token_headroom is not None:
+            normalized.daily_headroom = (
+                min(normalized.daily_headroom, daily_token_headroom)
+                if normalized.daily_headroom is not None
+                else daily_token_headroom
+            )
+
+        headrooms = [value for value in (normalized.window_headroom, normalized.daily_headroom) if value is not None]
+        normalized.quota_pressure = round(1.0 - min(headrooms), 4) if headrooms else max(normalized.quota_pressure, 0.0)
+        normalized.observed_at = datetime.now(timezone.utc)
+        return normalized
+
+    @staticmethod
+    def _headroom(remaining: int | None, limit: int | None) -> float | None:
+        if remaining is None or limit in {None, 0}:
+            return None
+        return max(0.0, min(1.0, float(remaining) / float(limit)))
+
+    @staticmethod
+    def _ema(previous: float, value: float, *, previous_count: int) -> float:
+        if previous_count <= 0:
+            return round(value, 4)
+        alpha = MODEL_PERFORMANCE_EMA_ALPHA
+        return round((alpha * value) + ((1.0 - alpha) * previous), 4)
 
     @staticmethod
     def _extract_summary_and_tasks(final_answer: str) -> tuple[str, list[str]]:

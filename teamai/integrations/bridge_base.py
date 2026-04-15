@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..approvals import PatchApprovalStore
 from ..codex_prompts import build_codex_handoff_prompt
+from ..memory import WorkspaceMemoryStore
 from ..sandbox import Sandbox
-from ..schemas import CodexHandoffPayload, HandoffArtifact, HandoffRevisionRequest
+from ..schemas import CodexHandoffPayload, HandoffArtifact, HandoffRevisionRequest, RateLimitState
 from ..verification import VerificationResult, verify_patch
 
 DEFAULT_FAILURE_CONTEXT_FILE = ".teamai/failure_context.log"
@@ -23,6 +24,17 @@ _HANDOFF_HIGH_RISK_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 @dataclass(frozen=True)
+class BridgeModelResponse:
+    patch_text: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: float | None = None
+    rate_limit_state: RateLimitState | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class BridgeExecutionResult:
     engine: str
     model: str
@@ -30,6 +42,12 @@ class BridgeExecutionResult:
     patch_file: Path
     prompt: str
     patch_text: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: float | None = None
+    rate_limit_state: RateLimitState | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -68,7 +86,7 @@ class AgentBridge(ABC):
         if not model_name:
             raise RuntimeError(f"No model is configured for bridge engine `{self.engine}`.")
 
-        patch_text = _sanitize_patch_output(
+        response = _coerce_bridge_response(
             self._request_patch(
                 prompt=prompt,
                 model=model_name,
@@ -77,8 +95,14 @@ class AgentBridge(ABC):
                 project_root=project_root,
             )
         )
+        patch_text = _sanitize_patch_output(response.patch_text)
         patch_path.parent.mkdir(parents=True, exist_ok=True)
         patch_path.write_text(_ensure_trailing_newline(patch_text), encoding="utf-8")
+        if response.rate_limit_state is not None:
+            try:
+                WorkspaceMemoryStore().update_rate_limits(model_id=model_name, state=response.rate_limit_state)
+            except Exception:
+                pass
 
         return BridgeExecutionResult(
             engine=self.engine,
@@ -87,6 +111,12 @@ class AgentBridge(ABC):
             patch_file=patch_path,
             prompt=prompt,
             patch_text=patch_text,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            total_tokens=response.total_tokens,
+            latency_ms=response.latency_ms,
+            rate_limit_state=response.rate_limit_state,
+            metadata=dict(response.metadata),
         )
 
     def execute_verified(
@@ -120,14 +150,21 @@ class AgentBridge(ABC):
 
         for attempt in range(max_revision_attempts + 1):
             prompt = _build_revision_prompt(base_prompt=base_prompt, revision_request=revision_requests[-1] if revision_requests else None)
-            raw_response = self._request_patch(
+            response = _coerce_bridge_response(
+                self._request_patch(
                 prompt=prompt,
                 model=model_name,
                 payload=payload,
                 payload_path=payload_path,
                 project_root=project_root,
+                )
             )
-            artifact = _parse_handoff_artifact(raw_response, engine=self.engine)
+            if response.rate_limit_state is not None:
+                try:
+                    WorkspaceMemoryStore().update_rate_limits(model_id=model_name, state=response.rate_limit_state)
+                except Exception:
+                    pass
+            artifact = _parse_handoff_artifact(response.patch_text, engine=self.engine)
             patch_text = _ensure_trailing_newline(_sanitize_patch_output(artifact.diff))
             patch_path.parent.mkdir(parents=True, exist_ok=True)
             patch_path.write_text(patch_text, encoding="utf-8")
@@ -138,6 +175,12 @@ class AgentBridge(ABC):
                 patch_file=patch_path,
                 prompt=prompt,
                 patch_text=patch_text,
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.completion_tokens,
+                total_tokens=response.total_tokens,
+                latency_ms=response.latency_ms,
+                rate_limit_state=response.rate_limit_state,
+                metadata=dict(response.metadata),
             )
 
             with Sandbox(project_root) as sandbox:
@@ -210,13 +253,143 @@ class AgentBridge(ABC):
         payload: CodexHandoffPayload,
         payload_path: Path,
         project_root: Path,
-    ) -> str:
+    ) -> BridgeModelResponse | str:
         raise NotImplementedError
 
 
 def _resolve_project_path(project_root: Path, raw_path: str | Path) -> Path:
     path = Path(raw_path).expanduser()
     return path if path.is_absolute() else project_root / path
+
+
+def _coerce_bridge_response(response: BridgeModelResponse | str) -> BridgeModelResponse:
+    if isinstance(response, BridgeModelResponse):
+        return response
+    return BridgeModelResponse(patch_text=str(response))
+
+
+def build_rate_limit_state(
+    *,
+    provider: str,
+    model_id: str,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    headers: dict[str, Any] | None = None,
+    source: str = "usage_only",
+) -> RateLimitState:
+    normalized_headers = {str(key).lower(): value for key, value in (headers or {}).items()}
+    effective_total = total_tokens if total_tokens is not None else _sum_defined(prompt_tokens, completion_tokens)
+    remaining_requests = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-remaining-requests",
+        "anthropic-ratelimit-requests-remaining",
+        "ratelimit-remaining-requests",
+    )
+    requests_limit = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-limit-requests",
+        "anthropic-ratelimit-requests-limit",
+        "ratelimit-limit-requests",
+    )
+    remaining_tokens = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-remaining-tokens",
+        "anthropic-ratelimit-tokens-remaining",
+        "ratelimit-remaining-tokens",
+    )
+    tokens_limit = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-limit-tokens",
+        "anthropic-ratelimit-tokens-limit",
+        "ratelimit-limit-tokens",
+    )
+    remaining_daily_requests = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-remaining-requests-day",
+        "x-ratelimit-remaining-day-requests",
+    )
+    daily_requests_limit = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-limit-requests-day",
+        "x-ratelimit-limit-day-requests",
+    )
+    remaining_daily_tokens = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-remaining-tokens-day",
+        "x-ratelimit-remaining-day-tokens",
+    )
+    daily_tokens_limit = _first_header_int(
+        normalized_headers,
+        "x-ratelimit-limit-tokens-day",
+        "x-ratelimit-limit-day-tokens",
+    )
+
+    state = RateLimitState(
+        provider=provider,
+        model_id=model_id,
+        requests_made=1,
+        tokens_in=max(prompt_tokens or 0, 0),
+        tokens_out=max(completion_tokens or max((effective_total or 0) - max(prompt_tokens or 0, 0), 0), 0),
+        requests_limit=requests_limit,
+        remaining_requests=remaining_requests,
+        tokens_limit=tokens_limit,
+        remaining_tokens=remaining_tokens,
+        daily_requests_limit=daily_requests_limit,
+        remaining_daily_requests=remaining_daily_requests,
+        daily_tokens_limit=daily_tokens_limit,
+        remaining_daily_tokens=remaining_daily_tokens,
+        source=source,
+    )
+
+    headrooms = []
+    if requests_limit and remaining_requests is not None:
+        headrooms.append(max(0.0, min(1.0, remaining_requests / requests_limit)))
+    if tokens_limit and remaining_tokens is not None:
+        headrooms.append(max(0.0, min(1.0, remaining_tokens / tokens_limit)))
+    state.window_headroom = min(headrooms) if headrooms else None
+
+    daily_headrooms = []
+    if daily_requests_limit and remaining_daily_requests is not None:
+        daily_headrooms.append(max(0.0, min(1.0, remaining_daily_requests / daily_requests_limit)))
+    if daily_tokens_limit and remaining_daily_tokens is not None:
+        daily_headrooms.append(max(0.0, min(1.0, remaining_daily_tokens / daily_tokens_limit)))
+    state.daily_headroom = min(daily_headrooms) if daily_headrooms else None
+
+    all_headrooms = [value for value in (state.window_headroom, state.daily_headroom) if value is not None]
+    state.quota_pressure = round(1.0 - min(all_headrooms), 4) if all_headrooms else 0.0
+    return state
+
+
+def extract_headers(response: Any) -> dict[str, Any]:
+    direct_headers = getattr(response, "headers", None)
+    if isinstance(direct_headers, dict):
+        return direct_headers
+    if hasattr(direct_headers, "items"):
+        return {str(key): value for key, value in direct_headers.items()}
+
+    raw_response = getattr(response, "_response", None)
+    raw_headers = getattr(raw_response, "headers", None)
+    if isinstance(raw_headers, dict):
+        return raw_headers
+    if hasattr(raw_headers, "items"):
+        return {str(key): value for key, value in raw_headers.items()}
+    return {}
+
+
+def extract_usage_counts(
+    usage: Any,
+    *,
+    prompt_keys: tuple[str, ...] = ("input_tokens", "prompt_tokens"),
+    completion_keys: tuple[str, ...] = ("output_tokens", "completion_tokens"),
+    total_keys: tuple[str, ...] = ("total_tokens",),
+) -> tuple[int | None, int | None, int | None]:
+    prompt_tokens = _first_attr_or_key_int(usage, prompt_keys)
+    completion_tokens = _first_attr_or_key_int(usage, completion_keys)
+    total_tokens = _first_attr_or_key_int(usage, total_keys)
+    if total_tokens is None:
+        total_tokens = _sum_defined(prompt_tokens, completion_tokens)
+    return prompt_tokens, completion_tokens, total_tokens
 
 
 def _parse_handoff_artifact(text: str, *, engine: str) -> HandoffArtifact:
@@ -252,6 +425,44 @@ def _sanitize_patch_output(text: str) -> str:
 
 def _ensure_trailing_newline(text: str) -> str:
     return text if text.endswith("\n") else f"{text}\n"
+
+
+def _first_header_int(headers: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        if name not in headers:
+            continue
+        value = _coerce_int(headers.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def _first_attr_or_key_int(source: Any, names: tuple[str, ...]) -> int | None:
+    if source is None:
+        return None
+    for name in names:
+        value = getattr(source, name, None)
+        if value is None and isinstance(source, dict):
+            value = source.get(name)
+        coerced = _coerce_int(value)
+        if coerced is not None:
+            return coerced
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_defined(left: int | None, right: int | None) -> int | None:
+    if left is None and right is None:
+        return None
+    return max(left or 0, 0) + max(right or 0, 0)
 
 
 def _build_revision_prompt(*, base_prompt: str, revision_request: HandoffRevisionRequest | None) -> str:

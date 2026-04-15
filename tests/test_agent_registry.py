@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from teamai.agent_registry import AgentRegistry, RouteHealth, TaskSignature
+from teamai.schemas import ModelPerformanceRecord, RateLimitState
 
 
 class AgentRegistryRoutingTest(unittest.TestCase):
@@ -151,6 +152,94 @@ class AgentRegistryRoutingTest(unittest.TestCase):
         self.assertIsNotNone(decision)
         assert decision is not None
         self.assertEqual(decision.agent.id, "local_gemma_large")
+
+    def test_pick_best_for_capability_penalizes_cloud_quota_pressure(self) -> None:
+        registry = AgentRegistry.load(search_paths=[Path("/Users/home/Documents/teamAI/agents.yaml")])
+        signature = TaskSignature(
+            task="Implement a broad cross-file change and verify the patch.",
+            execution_mode="workspace_write",
+            complexity="high",
+            broad_coding=True,
+            route_health={"verified_handoff_execution": RouteHealth(capability="verified_handoff_execution")},
+            rate_limits={
+                "gpt-5.4": RateLimitState(
+                    provider="openai",
+                    model_id="gpt-5.4",
+                    requests_limit=100,
+                    remaining_requests=5,
+                    tokens_limit=1000,
+                    remaining_tokens=50,
+                    quota_pressure=0.95,
+                    window_headroom=0.05,
+                ),
+                "grok-4-1-fast-reasoning": RateLimitState(
+                    provider="xai",
+                    model_id="grok-4-1-fast-reasoning",
+                    requests_limit=100,
+                    remaining_requests=60,
+                    tokens_limit=1000,
+                    remaining_tokens=700,
+                    quota_pressure=0.3,
+                    window_headroom=0.6,
+                ),
+                "gemini-2.5-pro": RateLimitState(
+                    provider="gemini",
+                    model_id="gemini-2.5-pro",
+                    requests_limit=100,
+                    remaining_requests=25,
+                    tokens_limit=1000,
+                    remaining_tokens=300,
+                    quota_pressure=0.7,
+                    window_headroom=0.25,
+                ),
+            },
+        )
+
+        decision = registry.pick_best_for_capability(
+            "verified_handoff_execution",
+            task_signature=signature,
+            env_check=False,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.agent.id, "grok_fast")
+
+    def test_pick_best_for_capability_uses_model_performance_memory(self) -> None:
+        registry = AgentRegistry.load(search_paths=[Path("/Users/home/Documents/teamAI/agents.yaml")])
+        signature = TaskSignature(
+            task="Implement a broad cross-file change and verify the patch.",
+            execution_mode="workspace_write",
+            complexity="high",
+            broad_coding=True,
+            route_health={"verified_handoff_execution": RouteHealth(capability="verified_handoff_execution")},
+            model_performance={
+                "gpt-5.4": ModelPerformanceRecord(
+                    task_signature_hash="sig-verified",
+                    model_id="gpt-5.4",
+                    sample_count=6,
+                    success_ema=0.95,
+                    latency_ema_ms=2200,
+                ),
+                "grok-4-1-fast-reasoning": ModelPerformanceRecord(
+                    task_signature_hash="sig-verified",
+                    model_id="grok-4-1-fast-reasoning",
+                    sample_count=6,
+                    success_ema=0.2,
+                    latency_ema_ms=2500,
+                ),
+            },
+        )
+
+        decision = registry.pick_best_for_capability(
+            "verified_handoff_execution",
+            task_signature=signature,
+            env_check=False,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.agent.id, "codex")
 
 
 if __name__ == "__main__":

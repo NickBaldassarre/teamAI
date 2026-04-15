@@ -111,6 +111,7 @@ class ClosedLoopSupervisor:
         self._safe_commands = SafeCommandExecutor(timeout_seconds=settings.command_timeout_seconds)
         self._run_state_store = AutonomousRunStateStore()
         self._last_routing_decision: RoutingDecision | None = None
+        self._last_task_signature: TaskSignature | None = None
         self._active_model_id = settings.model_id
         self._last_planner_json_repairs = 0
         self._last_verifier_json_repairs = 0
@@ -607,6 +608,15 @@ class ClosedLoopSupervisor:
                 task_route=task_route,
                 execution_mode=execution_mode,
                 rounds=round_records,
+            )
+            self._record_model_outcome(
+                workspace=workspace,
+                model_id=self._active_model_id,
+                status=status,
+                stop_reason=stop_reason,
+                started_at=started_at,
+                completed_at=completed_at,
+                round_records=round_records,
             )
         except Exception as exc:
             warnings.append(f"Failed to persist workspace memory: {exc}")
@@ -1232,6 +1242,15 @@ class ClosedLoopSupervisor:
                         rounds=round_records,
                         run_state=run_state,
                     )
+                    self._record_model_outcome(
+                        workspace=workspace,
+                        model_id=self._active_model_id,
+                        status=status,
+                        stop_reason=stop_reason,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        round_records=round_records,
+                    )
                     return RunResult(
                         status=status,
                         model_id=self._active_model_id,
@@ -1268,6 +1287,15 @@ class ClosedLoopSupervisor:
             execution_mode=request.execution_mode,
             rounds=round_records,
             run_state=run_state,
+        )
+        self._record_model_outcome(
+            workspace=workspace,
+            model_id=self._active_model_id,
+            status=status,
+            stop_reason=stop_reason,
+            started_at=started_at,
+            completed_at=completed_at,
+            round_records=round_records,
         )
         return RunResult(
             status=status,
@@ -2692,6 +2720,23 @@ class ClosedLoopSupervisor:
             )
         )
 
+    @staticmethod
+    def _is_desktop_task(task: str) -> bool:
+        text = task.lower()
+        return any(
+            marker in text
+            for marker in (
+                "desktop",
+                "browser",
+                "screenshot",
+                "click",
+                "open safari",
+                "open chrome",
+                "computer use",
+                "ui automation",
+            )
+        )
+
     def _local_drift_reroute_reason(
         self,
         *,
@@ -2783,6 +2828,7 @@ class ClosedLoopSupervisor:
             workspace=workspace,
             continuation_context=continuation_context or {},
         )
+        self._last_task_signature = signature
         decision = self._registry.pick_best(
             task_signature=signature,
             prefer_local=True,
@@ -2793,6 +2839,7 @@ class ClosedLoopSupervisor:
             return decision.capability
 
         self._last_routing_decision = None
+        self._last_task_signature = signature
         self._active_model_id = self._settings.model_id
         self._backend = self._backend_by_model.get(self._settings.model_id, self._backend)
         return "multi_agent_loop"
@@ -2835,8 +2882,9 @@ class ClosedLoopSupervisor:
             task=task,
             complexity=complexity,
         )
+        rate_limits = self._memory.get_rate_limits()
 
-        return TaskSignature(
+        base_signature = TaskSignature(
             task=task,
             execution_mode=execution_mode,
             complexity=complexity,
@@ -2846,11 +2894,35 @@ class ClosedLoopSupervisor:
             repository_inspection=self._is_repository_inspection_task(task),
             broad_coding=broad_coding,
             memory_pressure=memory_pressure,
+            desktop_task=self._is_desktop_task(task),
             expected_files_touched=expected_files_touched,
             has_tests=repo_index.has_tests,
             policy_scores=policy_scores,
             agent_policy_scores=agent_policy_scores,
             route_health=route_health,
+        )
+        model_performance = self._memory.get_model_stats(
+            workspace,
+            task_signature_hash=base_signature.signature_hash,
+        )
+        return TaskSignature(
+            task=base_signature.task,
+            execution_mode=base_signature.execution_mode,
+            complexity=base_signature.complexity,
+            continuation=base_signature.continuation,
+            deterministic_candidate=base_signature.deterministic_candidate,
+            explicit_write=base_signature.explicit_write,
+            repository_inspection=base_signature.repository_inspection,
+            broad_coding=base_signature.broad_coding,
+            memory_pressure=base_signature.memory_pressure,
+            desktop_task=base_signature.desktop_task,
+            expected_files_touched=base_signature.expected_files_touched,
+            has_tests=base_signature.has_tests,
+            policy_scores=base_signature.policy_scores,
+            agent_policy_scores=base_signature.agent_policy_scores,
+            route_health=base_signature.route_health,
+            rate_limits=rate_limits,
+            model_performance=model_performance,
         )
 
     def _apply_routing_decision(self, decision: RoutingDecision) -> None:
@@ -3035,6 +3107,8 @@ class ClosedLoopSupervisor:
             return "codex"
         if agent_type == "google" or agent_id.startswith("gemini"):
             return "gemini"
+        if agent_type in {"xai", "grok"} or agent_id.startswith("grok"):
+            return "grok"
         if agent_type == "local_mlx" or agent_id.startswith("local"):
             return "local"
         return None
@@ -3042,24 +3116,101 @@ class ClosedLoopSupervisor:
     def _select_verified_handoff_target(self, request: RunRequest) -> tuple[str, str | None] | None:
         requested_engine = (request.handoff_engine or "").strip().lower()
         requested_model = (request.handoff_model or "").strip() or None
-        if requested_engine in {"codex", "gemini", "local"}:
+        if requested_engine in {"codex", "gemini", "grok", "local"}:
             return requested_engine, requested_model
 
-        default_cloud = self._registry.pick_cloud(env_check=True)
-        engine = self._bridge_engine_from_agent(default_cloud)
-        if engine is not None:
-            model = requested_model or (str(getattr(default_cloud, "model_id", "")).strip() or None)
+        decision = None
+        if self._last_task_signature is not None:
+            decision = self._registry.pick_best_for_capability(
+                "verified_handoff_execution",
+                task_signature=self._last_task_signature,
+                prefer_local=False,
+                env_check=True,
+            )
+        selected_agent = decision.agent if decision is not None else self._registry.pick_cloud(env_check=True)
+        engine = self._bridge_engine_from_agent(selected_agent)
+        if engine is not None and selected_agent is not None:
+            model = requested_model or (str(getattr(selected_agent, "model_id", "")).strip() or None)
             return engine, model
+
+        if self._last_task_signature is not None:
+            pressured_cloud = self._registry.pick_best_for_capability(
+                "verified_handoff_execution",
+                task_signature=self._last_task_signature,
+                prefer_local=False,
+                env_check=False,
+            )
+            if pressured_cloud is not None:
+                state = self._last_task_signature.rate_limits.get(pressured_cloud.agent.model_id)
+                headroom = min(
+                    [
+                        value
+                        for value in (
+                            getattr(state, "window_headroom", None),
+                            getattr(state, "daily_headroom", None),
+                        )
+                        if value is not None
+                    ]
+                    or [1.0]
+                )
+                if headroom <= 0.2:
+                    return "local", requested_model
 
         fallback_engine = (self._settings.default_handoff_engine or "").strip().lower()
         fallback_allowed = (
             fallback_engine == "local"
             or (fallback_engine == "codex" and bool(os.getenv("OPENAI_API_KEY", "").strip()))
-            or (fallback_engine == "gemini" and bool(os.getenv("GOOGLE_API_KEY", "").strip()))
+            or (
+                fallback_engine == "gemini"
+                and bool((os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")).strip())
+            )
+            or (fallback_engine == "grok" and bool(os.getenv("XAI_API_KEY", "").strip()))
         )
-        if fallback_engine in {"codex", "gemini", "local"} and fallback_allowed:
+        if fallback_engine in {"codex", "gemini", "grok", "local"} and fallback_allowed:
             return fallback_engine, requested_model
         return None
+
+    def _record_model_outcome(
+        self,
+        *,
+        workspace: Path,
+        model_id: str,
+        status: str,
+        stop_reason: str,
+        started_at: datetime,
+        completed_at: datetime,
+        round_records: list[RoundRecord] | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> None:
+        signature = self._last_task_signature
+        normalized_model_id = model_id.strip()
+        if signature is None or not normalized_model_id:
+            return
+        if round_records is not None and self._rounds_are_fully_deterministic(round_records):
+            return
+
+        rate_limit_state = self._memory.get_rate_limits().get(normalized_model_id)
+        self._memory.update_model_stats(
+            workspace,
+            task_signature_hash=signature.signature_hash,
+            model_id=normalized_model_id,
+            success=status == "completed" or stop_reason == "approval_required",
+            latency_ms=max((completed_at - started_at).total_seconds() * 1000.0, 0.0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost=self._cost_hint_for_model(normalized_model_id),
+            quota_pressure=(rate_limit_state.quota_pressure if rate_limit_state is not None else None),
+            status=stop_reason,
+        )
+
+    def _cost_hint_for_model(self, model_id: str) -> float:
+        for agent in self._registry.agents:
+            if agent.model_id == model_id or agent.id == model_id:
+                return float(agent.cost_rank)
+        return 0.0
 
     def _has_available_stronger_local(self, *, task_route: str) -> bool:
         candidates = self._registry.stronger_local_candidates(
@@ -3229,8 +3380,17 @@ class ClosedLoopSupervisor:
         payload_file = payload_dir / f"inline-handoff-{run_state.task_id}.json"
         patch_file = payload_dir / f"inline-handoff-{run_state.task_id}.patch"
         payload_file.write_text(payload.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+        def cleanup_inline_handoff_artifacts() -> None:
+            for candidate in (payload_file, patch_file):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    continue
+
         emit_progress(f"Inline escalation: executing verified `{engine}` handoff")
         bridge = get_bridge(engine)
+        handoff_started_at = datetime.now(timezone.utc)
         try:
             verified = bridge.execute_verified(
                 project_root=sandbox_workspace,
@@ -3245,12 +3405,24 @@ class ClosedLoopSupervisor:
                 create_approval=False,
             )
         except Exception as exc:
+            cleanup_inline_handoff_artifacts()
             warnings.append(f"Inline verified handoff failed before verification: {exc}")
             return {
                 "accepted": False,
                 "stop_reason": "verified_handoff_failed",
                 "final_answer": f"Inline verified handoff failed: {exc}",
             }
+        self._record_model_outcome(
+            workspace=Path(run_state.workspace_path),
+            model_id=verified.execution.model,
+            status="completed" if verified.accepted and verified.verification.success else "failed",
+            stop_reason="verified_handoff_accepted" if verified.accepted else "verified_handoff_rejected",
+            started_at=handoff_started_at,
+            completed_at=datetime.now(timezone.utc),
+            prompt_tokens=verified.execution.prompt_tokens,
+            completion_tokens=verified.execution.completion_tokens,
+            total_tokens=verified.execution.total_tokens,
+        )
 
         artifact = verified.artifact or HandoffArtifact(
             engine=engine,
@@ -3279,6 +3451,7 @@ class ClosedLoopSupervisor:
             outcome="accepted" if verified.accepted else "rejected",
         )
         if not verified.accepted:
+            cleanup_inline_handoff_artifacts()
             warnings.append(
                 "Inline verified handoff was rejected after revision requests: "
                 + (verified.revision_requests[-1].details if verified.revision_requests else "verification failed")
@@ -3297,6 +3470,7 @@ class ClosedLoopSupervisor:
             workspace=sandbox_workspace,
         )
         if not applied:
+            cleanup_inline_handoff_artifacts()
             warnings.append(apply_output or "Inline verified patch could not be applied to the active sandbox.")
             return {
                 "accepted": False,
@@ -3330,6 +3504,7 @@ class ClosedLoopSupervisor:
                         notes="inline_verified_handoff_post_apply",
                     )
                 )
+            cleanup_inline_handoff_artifacts()
             return {
                 "accepted": False,
                 "stop_reason": "verified_handoff_post_apply_checks_failed",
@@ -3337,6 +3512,7 @@ class ClosedLoopSupervisor:
                 "changed_paths": normalized_changed_paths,
             }
 
+        cleanup_inline_handoff_artifacts()
         warnings.append(
             f"Inline verified handoff via `{engine}` succeeded after {verified.revision_count} revision request(s)."
         )

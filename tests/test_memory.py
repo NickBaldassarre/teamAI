@@ -5,11 +5,12 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from teamai.config import Settings
 from teamai.memory import WorkspaceMemoryStore
 from teamai.model_backend import ModelResponse
-from teamai.schemas import PlannerTurn, RoundRecord, RunRequest, ToolExecutionResult, VerifierVerdict
+from teamai.schemas import PlannerTurn, RateLimitState, RoundRecord, RunRequest, ToolExecutionResult, VerifierVerdict
 from teamai.supervisor import ClosedLoopSupervisor
 
 
@@ -53,6 +54,65 @@ class WorkspaceMemoryStoreTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_update_rate_limits_persists_global_quota_state(self) -> None:
+        store = WorkspaceMemoryStore()
+        with patch.dict("os.environ", {"HOME": self.temp_dir.name}, clear=False):
+            state = store.update_rate_limits(
+                model_id="gpt-5.4",
+                state=RateLimitState(
+                    provider="openai",
+                    model_id="gpt-5.4",
+                    requests_made=1,
+                    tokens_in=120,
+                    tokens_out=40,
+                    requests_limit=100,
+                    remaining_requests=12,
+                    tokens_limit=1000,
+                    remaining_tokens=150,
+                    source="api_headers",
+                ),
+            )
+
+            self.assertGreater(state.quota_pressure, 0.8)
+            stored = store.get_rate_limits()["gpt-5.4"]
+            self.assertEqual(stored.requests_made, 1)
+            self.assertEqual(stored.tokens_in, 120)
+            self.assertEqual(stored.tokens_out, 40)
+
+    def test_update_model_stats_tracks_ema_by_task_signature(self) -> None:
+        store = WorkspaceMemoryStore()
+        first = store.update_model_stats(
+            self.workspace,
+            task_signature_hash="sig-123",
+            model_id="grok-4-1-fast-reasoning",
+            success=True,
+            latency_ms=2000,
+            total_tokens=300,
+            quota_pressure=0.1,
+            status="completed",
+        )
+        second = store.update_model_stats(
+            self.workspace,
+            task_signature_hash="sig-123",
+            model_id="grok-4-1-fast-reasoning",
+            success=False,
+            latency_ms=6000,
+            total_tokens=900,
+            quota_pressure=0.9,
+            status="failed",
+        )
+
+        self.assertEqual(first.sample_count, 1)
+        self.assertEqual(second.sample_count, 2)
+        self.assertGreater(second.latency_ema_ms, 2000)
+        self.assertLess(second.latency_ema_ms, 6000)
+        self.assertLess(second.success_ema, 1.0)
+        self.assertGreater(second.success_ema, 0.0)
+
+        loaded = store.get_model_stats(self.workspace, task_signature_hash="sig-123")
+        self.assertIn("grok-4-1-fast-reasoning", loaded)
+        self.assertEqual(loaded["grok-4-1-fast-reasoning"].sample_count, 2)
 
     def test_persist_run_writes_history_and_memory_files(self) -> None:
         store = WorkspaceMemoryStore()

@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--handoff-engine",
-        choices=["codex", "gemini", "local"],
+        choices=["codex", "gemini", "grok", "local"],
         default="codex",
         help="Execution engine used with `--auto-execute-handoff`.",
     )
@@ -279,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     execute_handoff_parser.add_argument(
         "--engine",
-        choices=["codex", "gemini", "local"],
+        choices=["codex", "gemini", "grok", "local"],
         default="codex",
         help="Which execution engine to use for the handoff.",
     )

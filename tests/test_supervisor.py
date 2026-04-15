@@ -3,12 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from teamai.agent_registry import AgentEntry, RouteHealth, RoutingDecision
+from teamai.agent_registry import AgentEntry, RouteHealth, RoutingDecision, TaskSignature
 from teamai.approvals import PatchApprovalStore
 from teamai.config import Settings
 from teamai.model_backend import ModelResponse
-from teamai.schemas import PlannerTurn, RoundRecord, RunEvent, RunRequest, ToolAction, ToolExecutionResult, VerifierVerdict
+from teamai.schemas import PlannerTurn, RateLimitState, RoundRecord, RunEvent, RunRequest, ToolAction, ToolExecutionResult, VerifierVerdict
 from teamai.supervisor import ClosedLoopSupervisor
 
 
@@ -126,6 +127,43 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
 
         self.assertEqual(supervisor._active_model_id, self.settings.model_id)  # noqa: SLF001
         self.assertIs(supervisor._backend, original_backend)  # noqa: SLF001
+
+    def test_select_verified_handoff_target_prefers_lower_pressure_engine(self) -> None:
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([]))
+        supervisor._last_task_signature = TaskSignature(  # noqa: SLF001 - targeting router state directly
+            task="Implement a broad cross-file change and verify the patch.",
+            execution_mode="workspace_write",
+            complexity="high",
+            broad_coding=True,
+            route_health={"verified_handoff_execution": RouteHealth(capability="verified_handoff_execution")},
+            rate_limits={
+                "gpt-5.4": RateLimitState(
+                    provider="openai",
+                    model_id="gpt-5.4",
+                    requests_limit=100,
+                    remaining_requests=4,
+                    tokens_limit=1000,
+                    remaining_tokens=40,
+                    quota_pressure=0.96,
+                    window_headroom=0.04,
+                ),
+                "grok-4-1-fast-reasoning": RateLimitState(
+                    provider="xai",
+                    model_id="grok-4-1-fast-reasoning",
+                    requests_limit=100,
+                    remaining_requests=80,
+                    tokens_limit=1000,
+                    remaining_tokens=800,
+                    quota_pressure=0.2,
+                    window_headroom=0.8,
+                ),
+            },
+        )
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test", "XAI_API_KEY": "test"}, clear=False):
+            target = supervisor._select_verified_handoff_target(RunRequest(task="Implement the feature."))  # noqa: SLF001
+
+        self.assertEqual(target, ("grok", "grok-4-1-fast-reasoning"))
 
     def test_planner_heuristic_fallback_uses_readme(self) -> None:
         (self.workspace / "README.md").write_text("# demo\n", encoding="utf-8")

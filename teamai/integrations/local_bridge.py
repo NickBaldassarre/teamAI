@@ -6,7 +6,7 @@ from pathlib import Path
 from ..config import Settings
 from ..model_backend import MLXModelBackend
 from ..schemas import CodexHandoffPayload
-from .bridge_base import AgentBridge, BridgeExecutionResult, VerifiedBridgeExecutionResult
+from .bridge_base import AgentBridge, BridgeExecutionResult, BridgeModelResponse, VerifiedBridgeExecutionResult
 
 DEFAULT_LOCAL_BRIDGE_PAYLOAD_FILE = ".teamai/codex_payload.json"
 DEFAULT_LOCAL_BRIDGE_PATCH_FILE = ".teamai/local_solution.patch"
@@ -34,7 +34,7 @@ class LocalMLXBridge(AgentBridge):
         payload: CodexHandoffPayload,
         payload_path: Path,
         project_root: Path,
-    ) -> str:
+    ) -> BridgeModelResponse:
         settings = Settings.from_env()
         backend_settings = settings if settings.model_id == model else replace(settings, model_id=model)
         backend = MLXModelBackend(backend_settings)
@@ -47,7 +47,12 @@ class LocalMLXBridge(AgentBridge):
             temperature=0.0,
             enable_thinking=False,
         )
-        return response.text
+        return BridgeModelResponse(
+            patch_text=response.text,
+            prompt_tokens=getattr(response, "prompt_tokens", None),
+            completion_tokens=getattr(response, "generation_tokens", None),
+            total_tokens=getattr(response, "total_tokens", None),
+        )
 
 
 def execute_local_handoff(

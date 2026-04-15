@@ -26,6 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..memory import WorkspaceMemoryStore
+from .bridge_base import build_rate_limit_state, extract_headers, extract_usage_counts
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DESKTOP_MODEL = "claude-sonnet-4-20250514"
@@ -156,6 +159,28 @@ class DesktopBridge:
                 result.status = "failed"
                 result.error = str(exc)
                 break
+
+            prompt_tokens, completion_tokens, total_tokens = extract_usage_counts(
+                getattr(response, "usage", None),
+                prompt_keys=("input_tokens",),
+                completion_keys=("output_tokens",),
+                total_keys=("total_tokens",),
+            )
+            try:
+                WorkspaceMemoryStore().update_rate_limits(
+                    model_id=model_name,
+                    state=build_rate_limit_state(
+                        provider="anthropic",
+                        model_id=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        headers=extract_headers(response),
+                        source="api_headers",
+                    ),
+                )
+            except Exception:  # pragma: no cover - telemetry should not break automation
+                logger.debug("Failed to update Anthropic quota cache", exc_info=True)
 
             # Process response content blocks
             tool_uses: list[dict[str, Any]] = []

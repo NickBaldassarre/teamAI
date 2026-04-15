@@ -13,7 +13,8 @@ from .autonomy import (
     derive_write_policy,
 )
 from .config import Settings
-from .schemas import ToolAction, ToolExecutionResult
+from .schemas import RunRequest, ToolAction, ToolExecutionResult
+from .spawn import AgentSpawner, SpawnDepthExceeded
 
 
 READ_ONLY_COMMAND_PREFIXES: tuple[tuple[str, ...], ...] = (
@@ -78,6 +79,7 @@ class WorkspaceTools:
 - run_checks(args: paths=[...])
 - create_branch(args: name)
 - git_add(args: paths=[...])
+- spawn_agent(args: task, execution_mode='read_only') [Spawns a sub-agent to handle a subtask and returns its result]
 - git_commit(args: message)
 - git_restore(args: paths=[...])
 
@@ -169,6 +171,8 @@ class WorkspaceTools:
             return self._git_commit(action.args, workspace)
         if action.tool == "git_restore":
             return self._git_restore(action.args, workspace)
+        if action.tool == "spawn_agent":
+            return self._spawn_agent(action.args, workspace, execution_mode)
         raise ValueError(f"Unsupported tool: {action.tool}")
 
     def _list_files(self, args: dict, workspace: Path) -> ToolExecutionResult:
@@ -606,6 +610,57 @@ class WorkspaceTools:
             metadata={"command": list(result.command), "returncode": result.returncode},
             error=None if result.returncode == 0 else result.stderr.strip() or "git restore failed.",
         )
+
+    def _spawn_agent(self, args: dict, workspace: Path, execution_mode: str) -> ToolExecutionResult:
+        """Spawn a sub-agent to handle a subtask synchronously."""
+        task = str(args.get("task", "")).strip()
+        if not task:
+            return ToolExecutionResult(
+                tool="spawn_agent",
+                success=False,
+                error="`spawn_agent` requires a non-empty `task` argument.",
+            )
+
+        child_mode = str(args.get("execution_mode", "read_only"))
+        if child_mode not in ("read_only", "workspace_write"):
+            child_mode = "read_only"
+        # Inherit parent's spawn depth and enforce limits
+        spawn_depth = int(args.get("_spawn_depth", 0))
+        max_spawn_depth = int(args.get("_max_spawn_depth", 3))
+
+        spawner = AgentSpawner(settings=self._settings)
+        try:
+            result = spawner.spawn_sync(
+                task,
+                workspace_path=str(workspace),
+                execution_mode=child_mode,
+                spawn_depth=spawn_depth + 1,
+                max_spawn_depth=max_spawn_depth,
+            )
+            summary = result.final_answer[:3000] if result.final_answer else "(no answer)"
+            return ToolExecutionResult(
+                tool="spawn_agent",
+                success=result.status == "completed",
+                output=f"Sub-agent [{result.status}]: {summary}",
+                metadata={
+                    "status": result.status,
+                    "stop_reason": result.stop_reason,
+                    "task_route": result.task_route,
+                    "model_id": result.model_id,
+                },
+            )
+        except SpawnDepthExceeded as exc:
+            return ToolExecutionResult(
+                tool="spawn_agent",
+                success=False,
+                error=f"Spawn depth limit reached: {exc}",
+            )
+        except Exception as exc:
+            return ToolExecutionResult(
+                tool="spawn_agent",
+                success=False,
+                error=f"Sub-agent failed: {exc}",
+            )
 
     def _assert_writes_enabled(self, execution_mode: str) -> None:
         if execution_mode != "workspace_write":

@@ -119,6 +119,27 @@ class ClosedLoopSupervisor:
     def model_loaded(self) -> bool:
         return self._backend.model_loaded
 
+    def generate_raw(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 512,
+        temperature: float = 0.3,
+    ) -> str:
+        """Low-level model call without the council loop.
+
+        Used by ``AgentTeam`` for task decomposition and synthesis —
+        situations where the full strategist/critic/planner pipeline is
+        unnecessary and a single prompt-response suffices.
+        """
+        return self._ask_model(
+            system_prompt=system,
+            user_prompt=user,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
     def run(
         self,
         request: RunRequest,

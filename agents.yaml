@@ -110,6 +110,23 @@ agents:
       Useful for whole-repository tasks where the full codebase needs to fit
       in the downstream execution model.
 
+  - id: claude_desktop
+    name: "Claude Desktop Control (Anthropic)"
+    type: anthropic
+    model_id: "claude-sonnet-4-20250514"
+    capabilities:
+      - desktop_control
+    max_context_tokens: 200000
+    cost: moderate
+    latency: high
+    requires_env:
+      - ANTHROPIC_API_KEY
+    notes: >
+      Desktop automation agent using Claude Computer Use. Executes OS-level
+      tasks — opening apps, clicking UI elements, filling forms, reading
+      screen content — via screenshot-driven interaction.  Not a code engine;
+      use for tasks that require human-like computer interaction.
+
 routing:
   # Default local agent used when no cloud agent is specified
   default_local: local_gemma
@@ -174,3 +191,11 @@ routing:
       score_if:
         continuation_context: 8
         broad_coding: -4
+
+    desktop_control:
+      base_score: 0
+      score_if:
+        desktop_task: 20
+        broad_coding: -16
+        deterministic_candidate: -18
+        repository_inspection: -18

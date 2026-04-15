@@ -391,6 +391,48 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_job.add_argument("job_id", help="Job ID returned by `daemon submit`.")
     daemon_job.add_argument("--port", type=int, default=8000)
 
+    daemon_install = daemon_subparsers.add_parser("install", help="Install as a launchd service (survives reboots).")
+    daemon_install.add_argument("--port", type=int, default=8000)
+    daemon_install.add_argument("--host", default="127.0.0.1")
+    daemon_install.add_argument("--workspace", default=None, help="Workspace root for the daemon.")
+
+    daemon_subparsers.add_parser("uninstall", help="Remove the launchd service.")
+
+    daemon_sched = daemon_subparsers.add_parser("schedule", help="Manage recurring scheduled tasks.")
+    sched_sub = daemon_sched.add_subparsers(dest="schedule_command", required=True)
+
+    sched_add = sched_sub.add_parser("add", help="Add a recurring task schedule.")
+    sched_add.add_argument("task", help="Task description to run on schedule.")
+    sched_add.add_argument("--cron", required=True, help='Cron expression (5-field), e.g. "0 3 * * *".')
+    sched_add.add_argument("--id", dest="schedule_id", default=None, help="Custom schedule ID.")
+    sched_add.add_argument("--execution-mode", choices=["read_only", "workspace_write"], default="read_only")
+    sched_add.add_argument("--workspace", default=None)
+    sched_add.add_argument("--max-rounds", type=int, default=None)
+
+    sched_sub.add_parser("list", help="List all scheduled tasks.")
+
+    sched_rm = sched_sub.add_parser("remove", help="Remove a scheduled task.")
+    sched_rm.add_argument("schedule_id", help="ID of the schedule to remove.")
+
+    # ------------------------------------------------------------------ team
+    team_parser = subparsers.add_parser(
+        "team",
+        help="Decompose a goal into subtasks and execute with multiple agents.",
+    )
+    team_subparsers = team_parser.add_subparsers(dest="team_command", required=True)
+
+    team_run = team_subparsers.add_parser("run", help="Decompose and execute a goal with a team of agents.")
+    team_run.add_argument("goal", help="High-level goal to accomplish.")
+    team_run.add_argument("--workspace", default=None)
+    team_run.add_argument("--max-rounds", type=int, default=None)
+    team_run.add_argument("--execution-mode", choices=["read_only", "workspace_write"], default="read_only")
+    team_run.add_argument("--max-tasks", type=int, default=12, help="Maximum subtasks to decompose into.")
+
+    team_plan = team_subparsers.add_parser("plan", help="Decompose a goal into subtasks without executing.")
+    team_plan.add_argument("goal", help="High-level goal to decompose.")
+    team_plan.add_argument("--workspace", default=None)
+    team_plan.add_argument("--max-tasks", type=int, default=12)
+
     # ------------------------------------------------------------------ agents
     agents_parser = subparsers.add_parser(
         "agents",
@@ -999,6 +1041,87 @@ def main() -> int:
         if args.daemon_command == "job":
             print(json.dumps(get_daemon_job(args.job_id, port=getattr(args, "port", 8000)), indent=2))
             return 0
+
+        if args.daemon_command == "install":
+            from .daemon import install_launchd
+
+            project_root = Path.cwd().resolve()
+            selection = select_runtime_python(project_root, current_python=Path(sys.executable))
+            result_payload = install_launchd(
+                host=getattr(args, "host", "127.0.0.1"),
+                port=getattr(args, "port", 8000),
+                workspace=getattr(args, "workspace", None),
+                python_executable=selection.selected_python,
+            )
+            print(json.dumps(result_payload, indent=2))
+            return 0 if result_payload.get("status") != "error" else 1
+
+        if args.daemon_command == "uninstall":
+            from .daemon import uninstall_launchd
+
+            print(json.dumps(uninstall_launchd(), indent=2))
+            return 0
+
+        if args.daemon_command == "schedule":
+            from .scheduler import add_schedule, load_schedules, remove_schedule
+
+            if args.schedule_command == "add":
+                try:
+                    entry = add_schedule(
+                        task=args.task,
+                        cron=args.cron,
+                        schedule_id=getattr(args, "schedule_id", None),
+                        execution_mode=getattr(args, "execution_mode", "read_only"),
+                        workspace=getattr(args, "workspace", None),
+                        max_rounds=getattr(args, "max_rounds", None),
+                    )
+                    print(json.dumps(entry.to_dict(), indent=2))
+                except ValueError as exc:
+                    print(json.dumps({"error": str(exc)}, indent=2))
+                    return 1
+                return 0
+
+            if args.schedule_command == "list":
+                entries = load_schedules()
+                print(json.dumps([e.to_dict() for e in entries], indent=2))
+                return 0
+
+            if args.schedule_command == "remove":
+                removed = remove_schedule(args.schedule_id)
+                if removed:
+                    print(json.dumps({"status": "removed", "id": args.schedule_id}, indent=2))
+                else:
+                    print(json.dumps({"error": f"Schedule not found: {args.schedule_id!r}"}, indent=2))
+                    return 1
+                return 0
+
+    if args.command == "team":
+        from .config import Settings
+        from .spawn import AgentTeam
+
+        settings = Settings.from_env()
+
+        def _team_progress(msg: str) -> None:
+            print(f"[teamai:team] {msg}", file=sys.stderr, flush=True)
+
+        team = AgentTeam(
+            settings=settings,
+            progress_callback=_team_progress,
+            max_tasks=getattr(args, "max_tasks", 12),
+        )
+
+        if args.team_command == "plan":
+            plan = team.decompose(args.goal, workspace_path=getattr(args, "workspace", None))
+            print(json.dumps(plan.model_dump(mode="json"), indent=2))
+            return 0
+
+        if args.team_command == "run":
+            plan = team.run(
+                args.goal,
+                workspace_path=getattr(args, "workspace", None),
+            )
+            print(json.dumps(plan.model_dump(mode="json"), indent=2))
+            return 0 if plan.status == "completed" else 1
 
     if args.command == "agents":
         from .agent_registry import AgentRegistry

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -42,6 +42,7 @@ class ToolAction(BaseModel):
         "git_add",
         "git_commit",
         "git_restore",
+        "spawn_agent",
     ]
     reason: str = ""
     args: dict[str, Any] = Field(default_factory=dict)
@@ -237,6 +238,9 @@ class RunRequest(BaseModel):
     handoff_model: str | None = None
     max_handoff_revision_attempts: int | None = None
     continuation_context: dict[str, Any] = Field(default_factory=dict)
+    parent_task_id: str | None = None
+    spawn_depth: int = 0
+    max_spawn_depth: int = 3
 
 
 class CodexHandoffPayload(BaseModel):
@@ -291,3 +295,55 @@ class JobResponse(BaseModel):
     completed_at: datetime | None = None
     result: RunResult | None = None
     error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent spawning & team orchestration
+# ---------------------------------------------------------------------------
+
+class SpawnedTaskRecord(BaseModel):
+    """Tracks a single spawned agent within a team execution."""
+    spawn_id: str
+    parent_id: str | None = None
+    task: str
+    agent_id: str | None = None
+    execution_mode: Literal["read_only", "workspace_write"] = "read_only"
+    depends_on: list[str] = Field(default_factory=list)
+    status: Literal["pending", "running", "completed", "failed", "blocked"] = "pending"
+    job_id: str | None = None
+    result_summary: str | None = None
+    error: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class TeamPlan(BaseModel):
+    """A decomposed task plan: a DAG of subtasks with dependencies."""
+    team_id: str
+    goal: str
+    tasks: list[SpawnedTaskRecord] = Field(default_factory=list)
+    status: Literal["planning", "executing", "synthesizing", "completed", "failed"] = "planning"
+    synthesis: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: datetime | None = None
+    spawn_depth: int = 0
+
+    def ready_tasks(self) -> list[SpawnedTaskRecord]:
+        """Return tasks whose dependencies are all satisfied."""
+        completed_ids = {t.spawn_id for t in self.tasks if t.status == "completed"}
+        return [
+            t for t in self.tasks
+            if t.status == "pending"
+            and all(dep in completed_ids for dep in t.depends_on)
+        ]
+
+    def is_blocked(self) -> bool:
+        """True when no tasks can run and some are still pending."""
+        failed_ids = {t.spawn_id for t in self.tasks if t.status == "failed"}
+        for t in self.tasks:
+            if t.status == "pending" and any(dep in failed_ids for dep in t.depends_on):
+                return True
+        return False
+
+    def all_terminal(self) -> bool:
+        return all(t.status in ("completed", "failed") for t in self.tasks)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,7 +11,14 @@ from fastapi.responses import StreamingResponse
 from .config import ConfigError, Settings
 from .events import render_sse_event
 from .jobs import InMemoryJobStore
-from .schemas import JobResponse, RunEvent, RunRequest, RunResult
+from .scheduler import (
+    ScheduleEntry,
+    TaskScheduler,
+    add_schedule,
+    load_schedules,
+    remove_schedule,
+)
+from .schemas import JobResponse, RunEvent, RunRequest, RunResult, TeamPlan
 from .supervisor import ClosedLoopSupervisor
 
 
@@ -23,10 +32,24 @@ def create_app(
     app_supervisor = supervisor or ClosedLoopSupervisor(app_settings)
     job_store = jobs or InMemoryJobStore()
 
+    # Scheduler is created here so the lifespan can reference it, but
+    # the fire callback is wired up below after route definitions.
+    _scheduler_holder: list[TaskScheduler | None] = [None]
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        sched = _scheduler_holder[0]
+        if sched is not None:
+            sched.start()
+        yield
+        if sched is not None:
+            sched.stop()
+
     app = FastAPI(
         title="teamAI Local Loop",
         version="0.1.0",
         description="Local-first closed-loop orchestration for Apple Silicon using MLX.",
+        lifespan=_lifespan,
     )
 
     @app.get("/healthz")
@@ -133,6 +156,123 @@ def create_app(
                         break
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    # ---------------------------------------------------------------- scheduler
+    def _fire_scheduled_task(entry: ScheduleEntry) -> str | None:
+        """Submit a scheduled task as a background job. Returns job_id."""
+        request = RunRequest(
+            task=entry.task,
+            workspace_path=entry.workspace,
+            execution_mode=entry.execution_mode,  # type: ignore[arg-type]
+            max_rounds=entry.max_rounds,
+        )
+        record = job_store.create(request)
+
+        def _worker() -> None:
+            job_store.mark_running(record.job_id)
+            try:
+                result = app_supervisor.run(
+                    request,
+                    event_callback=lambda event: job_store.append_event(record.job_id, event),
+                )
+                job_store.mark_completed(record.job_id, result)
+            except Exception as exc:
+                job_store.mark_failed(record.job_id, str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return record.job_id
+
+    scheduler = TaskScheduler(fire_callback=_fire_scheduled_task)
+    _scheduler_holder[0] = scheduler
+
+    @app.get("/v1/schedules")
+    def list_schedules() -> list[dict[str, object]]:
+        return [e.to_dict() for e in load_schedules()]
+
+    @app.post("/v1/schedules")
+    def create_schedule(body: dict[str, object]) -> dict[str, object]:
+        task = body.get("task")
+        cron = body.get("cron")
+        if not task or not cron:
+            raise HTTPException(status_code=400, detail="'task' and 'cron' are required.")
+        entry = add_schedule(
+            task=str(task),
+            cron=str(cron),
+            schedule_id=str(body["id"]) if "id" in body else None,
+            execution_mode=str(body.get("execution_mode", "read_only")),
+            workspace=str(body["workspace"]) if "workspace" in body else None,
+            max_rounds=int(body["max_rounds"]) if "max_rounds" in body else None,
+            enabled=bool(body.get("enabled", True)),
+        )
+        return entry.to_dict()
+
+    @app.delete("/v1/schedules/{schedule_id}")
+    def delete_schedule(schedule_id: str) -> dict[str, object]:
+        if not remove_schedule(schedule_id):
+            raise HTTPException(status_code=404, detail="Schedule not found.")
+        return {"status": "removed", "id": schedule_id}
+
+    @app.get("/v1/schedules/log")
+    def schedule_fire_log() -> list[dict[str, object]]:
+        return [
+            {
+                "schedule_id": r.schedule_id,
+                "fired_at": r.fired_at.isoformat(),
+                "job_id": r.job_id,
+                "error": r.error,
+            }
+            for r in scheduler.fire_log
+        ]
+
+    # ------------------------------------------------------------- team
+    _team_store: dict[str, TeamPlan] = {}
+
+    @app.post("/v1/team")
+    def create_team(body: dict[str, object]) -> dict[str, object]:
+        goal = body.get("goal")
+        if not goal:
+            raise HTTPException(status_code=400, detail="'goal' is required.")
+
+        from .spawn import AgentTeam
+
+        team = AgentTeam(
+            settings=app_settings,
+            supervisor=app_supervisor,
+        )
+        plan = team.decompose(
+            str(goal),
+            workspace_path=str(body.get("workspace_path", "")) or None,
+        )
+        _team_store[plan.team_id] = plan
+
+        # Execute in a background thread so the endpoint returns immediately
+        def _run_team() -> None:
+            try:
+                team.execute(
+                    plan,
+                    workspace_path=str(body.get("workspace_path", "")) or None,
+                )
+                team.synthesize(plan)
+            except Exception as exc:
+                plan.status = "failed"
+                plan.synthesis = f"Team execution failed: {exc}"
+
+        threading.Thread(target=_run_team, daemon=True).start()
+        return plan.model_dump(mode="json")
+
+    @app.get("/v1/team/{team_id}")
+    def get_team(team_id: str) -> dict[str, object]:
+        plan = _team_store.get(team_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Team not found.")
+        return plan.model_dump(mode="json")
+
+    @app.get("/v1/team/{team_id}/tasks")
+    def get_team_tasks(team_id: str) -> list[dict[str, object]]:
+        plan = _team_store.get(team_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Team not found.")
+        return [t.model_dump(mode="json") for t in plan.tasks]
 
     return app
 

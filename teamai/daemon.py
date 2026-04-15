@@ -10,11 +10,14 @@ Usage:
     teamai daemon stop
     teamai daemon status
     teamai daemon submit "Inspect this repo" [--workspace .]
+    teamai daemon install [--port 8000] [--workspace .]
+    teamai daemon uninstall
 """
 from __future__ import annotations
 
 import json
 import os
+import plistlib
 import signal
 import subprocess
 import sys
@@ -272,3 +275,139 @@ def _probe_health(port: int) -> dict[str, Any]:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         return {"status": "unreachable", "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# launchd integration (macOS)
+# ---------------------------------------------------------------------------
+
+LAUNCHD_LABEL = "com.teamai.daemon"
+_LAUNCH_AGENTS_DIR = Path("~/Library/LaunchAgents")
+
+
+def _plist_path() -> Path:
+    return _LAUNCH_AGENTS_DIR.expanduser() / f"{LAUNCHD_LABEL}.plist"
+
+
+def _build_plist(
+    *,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    workspace: str | None = None,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build the launchd plist dict for the teamAI daemon."""
+    python = python_executable or sys.executable
+    program_args = [
+        python, "-m", "teamai", "serve",
+        "--host", host,
+        "--port", str(port),
+    ]
+
+    env_vars: dict[str, str] = {
+        "TEAMAI_HOST": host,
+        "TEAMAI_PORT": str(port),
+    }
+    if workspace:
+        env_vars["TEAMAI_WORKSPACE_ROOT"] = workspace
+
+    # Inherit API keys from current environment so the daemon can reach
+    # cloud bridges after reboot without manual re-export.
+    for key in ("OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY", "PATH"):
+        val = os.environ.get(key, "").strip()
+        if val:
+            env_vars[key] = val
+
+    log_dir = _global_state_dir()
+    return {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": program_args,
+        "EnvironmentVariables": env_vars,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_dir / "daemon-launchd.log"),
+        "StandardErrorPath": str(log_dir / "daemon-launchd.log"),
+        "WorkingDirectory": workspace or str(Path.home()),
+    }
+
+
+def install_launchd(
+    *,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    workspace: str | None = None,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Write a launchd plist and load the daemon so it survives reboots.
+
+    Returns a dict describing the outcome with keys:
+        status: "installed" | "already_installed" | "updated" | "error"
+        plist_path: str
+    """
+    if sys.platform != "darwin":
+        return {"status": "error", "error": "launchd is only available on macOS."}
+
+    plist_file = _plist_path()
+    was_installed = plist_file.exists()
+
+    # If already loaded, unload first so we can update cleanly
+    if was_installed:
+        subprocess.run(
+            ["launchctl", "unload", str(plist_file)],
+            capture_output=True,
+        )
+
+    plist_data = _build_plist(
+        host=host,
+        port=port,
+        workspace=workspace,
+        python_executable=python_executable,
+    )
+
+    _global_state_dir().mkdir(parents=True, exist_ok=True)
+    plist_file.parent.mkdir(parents=True, exist_ok=True)
+    with plist_file.open("wb") as f:
+        plistlib.dump(plist_data, f)
+
+    result = subprocess.run(
+        ["launchctl", "load", str(plist_file)],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        return {
+            "status": "error",
+            "error": result.stderr.strip() or f"launchctl load failed (exit {result.returncode})",
+            "plist_path": str(plist_file),
+        }
+
+    return {
+        "status": "updated" if was_installed else "installed",
+        "plist_path": str(plist_file),
+        "host": host,
+        "port": port,
+        "survives_reboot": True,
+    }
+
+
+def uninstall_launchd() -> dict[str, Any]:
+    """Unload and remove the launchd plist."""
+    if sys.platform != "darwin":
+        return {"status": "error", "error": "launchd is only available on macOS."}
+
+    plist_file = _plist_path()
+    if not plist_file.exists():
+        return {"status": "not_installed"}
+
+    subprocess.run(
+        ["launchctl", "unload", str(plist_file)],
+        capture_output=True,
+    )
+    plist_file.unlink(missing_ok=True)
+
+    # Clean up the PID file if present
+    _pid_path().unlink(missing_ok=True)
+
+    return {"status": "uninstalled", "plist_path": str(plist_file)}

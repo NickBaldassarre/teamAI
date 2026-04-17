@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .config import ConfigError, Settings
+from .conversation import ConversationChannel
 from .events import render_sse_event
 from .jobs import InMemoryJobStore
 from .scheduler import (
@@ -20,6 +21,7 @@ from .scheduler import (
 )
 from .schemas import JobResponse, RunEvent, RunRequest, RunResult, TeamPlan
 from .supervisor import ClosedLoopSupervisor
+from .tool_api import create_tool_router
 
 
 def create_app(
@@ -273,6 +275,42 @@ def create_app(
         if plan is None:
             raise HTTPException(status_code=404, detail="Team not found.")
         return [t.model_dump(mode="json") for t in plan.tasks]
+
+    # ------------------------------------------------------------- tool API
+    workspace = app_settings.resolve_workspace(None)
+    tool_router = create_tool_router(settings=app_settings, workspace=workspace)
+    app.include_router(tool_router)
+
+    # ------------------------------------------------------------- conversation
+    conversation = ConversationChannel(workspace)
+
+    @app.post("/v1/conversation/{task_id}/post")
+    def post_turn(task_id: str, body: dict[str, object]) -> dict[str, object]:
+        agent_id = body.get("agent_id")
+        role = body.get("role")
+        content = body.get("content")
+        if not agent_id or not role or not content:
+            raise HTTPException(status_code=400, detail="'agent_id', 'role', and 'content' are required.")
+        metadata = body.get("metadata") or {}
+        return conversation.post(
+            task_id=task_id,
+            agent_id=str(agent_id),
+            role=str(role),
+            content=str(content),
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+
+    @app.get("/v1/conversation/{task_id}")
+    def get_conversation(task_id: str, after_turn: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+        return conversation.read(task_id, after_turn=after_turn, limit=limit)
+
+    @app.get("/v1/conversation/{task_id}/summary")
+    def get_conversation_summary(task_id: str) -> dict[str, object]:
+        return conversation.summary(task_id)
+
+    @app.get("/v1/conversations")
+    def list_conversations() -> list[str]:
+        return conversation.list_conversations()
 
     return app
 

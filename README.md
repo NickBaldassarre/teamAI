@@ -22,11 +22,22 @@ The implementation is tuned for:
   - lazy MLX model loading through `mlx-vlm`
   - default local model: `mlx-community/gemma-4-2b-it-4bit`
 - `teamai/supervisor.py`
+  - main closed-loop orchestrator and route coordinator
   - multi-turn loop with four local personas:
     - Strategist
     - Critic
     - Coder-Planner
     - Verifier
+- `teamai/context_builder.py`
+  - assembles planner and verifier context windows
+  - owns deterministic continuation-probe helpers
+- `teamai/synthesis.py`
+  - builds deterministic repository-inspection and handoff answers
+  - renders approval-required and fallback answers
+- `teamai/task_classifier.py`
+  - centralizes task-shape heuristics for routing
+- `teamai/patch_compiler.py`
+  - deterministic narrow-write compiler for explicit edit requests
 - `teamai/tools.py`
   - local executable tools:
     - file listing
@@ -35,9 +46,19 @@ The implementation is tuned for:
     - allowed shell commands
     - patch approval write tools
 - `teamai/api.py`
-  - FastAPI app with sync and background job endpoints
+  - FastAPI app with run, job, schedule, team, tool, and conversation endpoints
+- `teamai/tool_api.py`
+  - sandboxed workspace tool router for remote or callback-style execution
+- `teamai/conversation.py`
+  - JSONL-backed per-task conversation channel for inter-agent coordination
+- `teamai/spawn.py`
+  - agent spawning plus DAG-style team decomposition/execution
+- `teamai/scheduler.py`
+  - cron-style recurring task scheduler with persistent schedules
+- `teamai/daemon.py`
+  - persistent background service and launchd integration on macOS
 - `teamai/cli.py`
-  - local CLI for direct runs or serving the API
+  - local CLI for direct runs, evals, approvals, daemon control, team orchestration, and agent inspection
 
 ## Why MLX + Gemma 4 2B
 
@@ -284,6 +305,57 @@ Remove stale approval artifacts after the target file has changed:
 teamai approvals prune-stale --workspace .
 ```
 
+Other CLI entry points:
+
+- Runtime probe:
+
+  ```bash
+  teamai doctor
+  ```
+
+- Continue the next queued task from the most recent run:
+
+  ```bash
+  teamai next --workspace .
+  ```
+
+- Send the local semantic skeleton to a configured handoff engine, verify the returned patch in a sandbox, and save the patch for review:
+
+  ```bash
+  teamai execute-handoff "Implement the requested change." --workspace .
+  ```
+
+- Start the persistent daemon, submit a task, and inspect status:
+
+  ```bash
+  teamai daemon start --workspace .
+  teamai daemon submit "Inspect this repository and identify the next engineering tasks." --workspace .
+  teamai daemon status
+  ```
+
+- Manage recurring daemon schedules:
+
+  ```bash
+  teamai daemon schedule add "Run the evaluation suite and save results." \
+    --cron "0 3 * * *" \
+    --workspace .
+  teamai daemon schedule list
+  ```
+
+- Decompose or execute a goal with a team of agents:
+
+  ```bash
+  teamai team plan "Break this feature into subtasks." --workspace .
+  teamai team run "Implement the approved feature." --workspace .
+  ```
+
+- Inspect the agent registry and routing picks:
+
+  ```bash
+  teamai agents list
+  teamai agents pick codex_handoff
+  ```
+
 ## Run As A Local Service
 
 ```bash
@@ -299,6 +371,22 @@ Then call:
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/events`
 - `GET /v1/jobs/{job_id}/events/stream`
+- `GET /v1/schedules`
+- `POST /v1/schedules`
+- `DELETE /v1/schedules/{schedule_id}`
+- `GET /v1/schedules/log`
+- `POST /v1/team`
+- `GET /v1/team/{team_id}`
+- `GET /v1/team/{team_id}/tasks`
+- `GET /v1/tools`
+- `POST /v1/tools/execute`
+- `POST /v1/tools/batch`
+- `POST /v1/conversation/{task_id}/post`
+- `GET /v1/conversation/{task_id}`
+- `GET /v1/conversation/{task_id}/summary`
+- `GET /v1/conversations`
+
+The tool API is localhost-only by default. If you want remote access, set `TEAMAI_TOOL_API_TOKEN` and send a bearer token to the `/v1/tools` endpoints.
 
 Example:
 
@@ -328,6 +416,50 @@ Watch the stored event stream for a background job:
 
 ```bash
 curl -N http://127.0.0.1:8000/v1/jobs/<job_id>/events/stream
+```
+
+Create a recurring scheduled task:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Run the evaluation suite and save results.",
+    "cron": "0 3 * * *",
+    "workspace": ".",
+    "execution_mode": "read_only"
+  }'
+```
+
+Start a multi-agent team run:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/team \
+  -H "Content-Type: application/json" \
+  -d '{
+    "goal": "Break this feature into subtasks and execute them.",
+    "workspace_path": "."
+  }'
+```
+
+List the exposed workspace tools:
+
+```bash
+curl http://127.0.0.1:8000/v1/tools
+```
+
+Post and read inter-agent conversation turns:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/task-demo/post \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "planner",
+    "role": "observation",
+    "content": "Found the highest-signal runtime files."
+  }'
+
+curl http://127.0.0.1:8000/v1/conversation/task-demo/summary
 ```
 
 ## Eval Harness

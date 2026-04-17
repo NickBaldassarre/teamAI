@@ -546,7 +546,7 @@ class AgentTeam:
                 lines.append(f"  - {t.spawn_id}: FAILED — {(t.error or 'unknown')[:100]}")
             plan.synthesis = "\n".join(lines)
 
-        plan.status = "completed" if not failed else "completed"
+        plan.status = "completed" if not failed else "partially_completed"
         plan.completed_at = datetime.now(timezone.utc)
         return plan
 

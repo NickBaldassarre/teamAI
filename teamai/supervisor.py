@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import textwrap
 import hashlib
 import subprocess
 from datetime import datetime, timezone
@@ -32,12 +31,14 @@ from .autonomy import (
     update_run_state_metrics,
 )
 from .config import Settings
+from .context_builder import ContextBuilder
 from .distillation import generate_semantic_skeleton
 from .events import build_run_event
 from .handoff import build_handoff_packet
 from .json_utils import JsonExtractionError, extract_json_object
 from .model_backend import MLXModelBackend, ModelBackendError
 from .memory import WorkspaceMemorySnapshot, WorkspaceMemoryStore
+from .patch_compiler import DeterministicPatchCompiler
 from .patch_utils import extract_patch_targets
 from .prompts import (
     CRITIC_SYSTEM_PROMPT,
@@ -47,7 +48,6 @@ from .prompts import (
     STRATEGIST_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
     VERIFIER_JSON_SCHEMA,
-    build_round_context,
 )
 from .schemas import (
     AutonomousRunState,
@@ -69,6 +69,13 @@ from .schemas import (
     VerifierVerdict,
 )
 from .sandbox import Sandbox
+from .task_classifier import (
+    is_broad_coding_task as _classify_broad_coding,
+    is_desktop_task as _classify_desktop,
+    is_explicit_write_task as _classify_explicit_write,
+    is_repository_inspection_task as _classify_inspection,
+)
+from .synthesis import AnswerSynthesizer
 from .tools import WorkspaceTools
 
 
@@ -79,21 +86,6 @@ _VALID_ROUTES: frozenset[str] = frozenset({
     "codex_handoff",
     "multi_agent_loop",
 })
-
-# Marker prepended to any final answer assembled by deterministic synthesis
-# rather than written by the local model. The marker travels with the answer
-# wherever it is persisted (transcripts, run history, handoff payloads, eval
-# reports) so downstream readers cannot conflate templated text with model
-# reasoning.
-DETERMINISTIC_SYNTHESIS_LABEL = "[deterministic-synthesis]"
-
-# Placeholder rendered in transcripts when a deterministic route does not
-# invoke the model for the strategist/critic step. The on-disk RoundRecord
-# stores empty strings; the transcript renderer substitutes this notice so
-# readers can immediately tell that no model reasoning was generated.
-DETERMINISTIC_PERSONA_TRANSCRIPT_NOTICE = (
-    "(deterministic route — no model strategist/critic was generated for this round)"
-)
 
 
 class ClosedLoopSupervisor:
@@ -107,6 +99,15 @@ class ClosedLoopSupervisor:
         self._registry = AgentRegistry.load()
         self._repo_indexer = RepoIndexer()
         self._context_packager = ContextPackager()
+        self._context_builder = ContextBuilder(
+            context_packager=self._context_packager,
+            normalize_path=self._normalize_path_arg,
+        )
+        self._answer_synthesizer = AnswerSynthesizer(
+            normalize_path=self._normalize_path_arg,
+            extract_candidate_paths=self._extract_candidate_paths,
+        )
+        self._patch_compiler = DeterministicPatchCompiler()
         self._patch_executor = PatchExecutor()
         self._safe_commands = SafeCommandExecutor(timeout_seconds=settings.command_timeout_seconds)
         self._run_state_store = AutonomousRunStateStore()
@@ -1792,54 +1793,22 @@ class ClosedLoopSupervisor:
         prior_failed_repairs: tuple[str, ...] = (),
         current_diff: str = "",
     ) -> str:
-        previous = []
-        for record in previous_rounds[-2:]:
-            previous.append(
-                f"Round {record.round_number}: "
-                f"planner={record.planner.summary}; verifier={record.verifier.summary}"
-            )
-        previous_rounds_text = "\n".join(previous) if previous else "No prior rounds."
-
-        recent_actions = self._render_recent_actions(previous_rounds, workspace)
-        suggested_paths = self._render_suggested_paths(
-            previous_rounds,
-            workspace,
-            task=task,
-            task_route=task_route,
-        )
-
-        latest_observations = "No tool observations yet."
-        if previous_rounds:
-            latest = previous_rounds[-1].tool_results
-            latest_observations = self._render_tool_observations(latest) or latest_observations
-
-        bundle = self._context_packager.build(
+        return self._context_builder.build_context(
             task=task,
             workspace=workspace,
+            round_number=round_number,
+            task_route=task_route,
+            memory_snapshot=memory_snapshot,
+            continuation_context=continuation_context,
+            previous_rounds=previous_rounds,
             repo_index=repo_index,
             task_scopes=task_scopes,
-            observed_paths=self._observed_paths_from_rounds(previous_rounds, workspace),
             changed_paths=changed_paths,
             failure_output=failure_output,
             prior_failed_repairs=prior_failed_repairs,
-        )
-        if current_diff:
-            bundle = self._context_packager.with_diff(bundle, diff_text=current_diff)
-
-        return build_round_context(
-            task=task,
-            workspace=str(workspace),
-            round_number=round_number,
-            continuation_context=self._render_continuation_context(continuation_context),
-            persistent_memory=memory_snapshot.memory_text,
-            persisted_runs=memory_snapshot.recent_runs_text,
-            improvement_notes=memory_snapshot.improvement_notes_text,
-            global_memory=memory_snapshot.global_memory_text,
-            previous_rounds=previous_rounds_text,
-            latest_observations=latest_observations,
-            recent_actions=recent_actions,
-            suggested_paths=suggested_paths,
-            context_package=self._context_packager.render(bundle),
+            current_diff=current_diff,
+            render_recent_actions=self._render_recent_actions,
+            render_suggested_paths=self._render_suggested_paths,
         )
 
     def _build_verifier_context(
@@ -1858,51 +1827,26 @@ class ClosedLoopSupervisor:
         prior_failed_repairs: tuple[str, ...] = (),
         current_diff: str = "",
     ) -> str:
-        bundle = self._context_packager.build(
+        return self._context_builder.build_verifier_context(
             task=task,
             workspace=workspace,
+            strategist=strategist,
+            critic=critic,
+            planner=planner,
+            tool_results=tool_results,
             repo_index=repo_index,
             task_scopes=task_scopes,
-            observed_paths=self._tool_result_paths(tool_results, workspace),
             changed_paths=changed_paths,
             failure_output=failure_output,
             prior_failed_repairs=prior_failed_repairs,
-        )
-        if current_diff:
-            bundle = self._context_packager.with_diff(bundle, diff_text=current_diff)
-        return (
-            f"Task:\n{task}\n\n"
-            f"Workspace:\n{workspace}\n\n"
-            f"Strategist:\n{strategist}\n\n"
-            f"Critic:\n{critic}\n\n"
-            f"Planner summary:\n{planner.summary}\n\n"
-            f"Candidate final answer:\n{planner.final_answer or '(none)'}\n\n"
-            f"Deterministic context package:\n{self._context_packager.render(bundle)}\n\n"
-            f"Tool results:\n{self._render_tool_observations(tool_results)}"
+            current_diff=current_diff,
         )
 
     def _observed_paths_from_rounds(self, rounds: list[RoundRecord], workspace: Path) -> tuple[str, ...]:
-        observed: list[str] = []
-        for record in rounds:
-            for result in record.tool_results:
-                raw_path = str(result.metadata.get("path", "")).strip()
-                if not raw_path:
-                    continue
-                normalized = self._normalize_path_arg(raw_path, workspace)
-                if normalized and normalized not in observed:
-                    observed.append(normalized)
-        return tuple(observed)
+        return self._context_builder.observed_paths_from_rounds(rounds, workspace)
 
     def _tool_result_paths(self, tool_results: list[ToolExecutionResult], workspace: Path) -> tuple[str, ...]:
-        observed: list[str] = []
-        for result in tool_results:
-            raw_path = str(result.metadata.get("path", "")).strip()
-            if not raw_path:
-                continue
-            normalized = self._normalize_path_arg(raw_path, workspace)
-            if normalized and normalized not in observed:
-                observed.append(normalized)
-        return tuple(observed)
+        return self._context_builder.tool_result_paths(tool_results, workspace)
 
     def _build_continuation_probe_round(
         self,
@@ -1910,45 +1854,14 @@ class ClosedLoopSupervisor:
         workspace: Path,
         continuation_context: dict[str, object],
     ) -> RoundRecord | None:
-        actions = self._build_continuation_probe_actions(continuation_context)
-        if not actions:
-            return None
-
-        tool_results = self._tools.execute_actions(
-            actions,
+        return self._context_builder.build_continuation_probe_round(
             workspace=workspace,
-            execution_mode="read_only",
-        )
-        failures = [result for result in tool_results if not result.success]
-        verifier_summary = "Scoped continuation verification collected focused evidence for the resumed task."
-        next_focus = "Continue from the applied patch without recreating it."
-        if failures:
-            verifier_summary = "Scoped continuation verification found an issue that should be addressed before more edits."
-            next_focus = "Review the failing scoped verification result first, then continue the remaining task."
-
-        # Deterministic continuation probe: the strategist/critic step is
-        # intentionally not delegated to the model. Persona fields are blank
-        # and `reasoning_source="deterministic"` labels the round so the
-        # transcript and downstream artifacts cannot conflate this with model
-        # reasoning.
-        return RoundRecord(
-            round_number=0,
-            strategist="",
-            critic="",
-            planner=PlannerTurn(
-                summary="Ran deterministic post-approval verification before continuing.",
-                should_stop=False,
-                final_answer=None,
-                actions=actions,
+            continuation_context=continuation_context,
+            execute_actions=lambda actions, target_workspace, execution_mode: self._tools.execute_actions(
+                actions,
+                workspace=target_workspace,
+                execution_mode=execution_mode,
             ),
-            tool_results=tool_results,
-            verifier=VerifierVerdict(
-                done=False,
-                confidence=0.6 if not failures else 0.3,
-                summary=verifier_summary,
-                next_focus=next_focus,
-            ),
-            reasoning_source="deterministic",
         )
 
     def _maybe_complete_after_continuation_probe(
@@ -1959,199 +1872,55 @@ class ClosedLoopSupervisor:
         continuation_context: dict[str, object],
         probe_round: RoundRecord,
     ) -> tuple[str, str, RunResult["status"]] | None:
-        if any(not result.success for result in probe_round.tool_results):
-            return None
-
-        verification_results = [result for result in probe_round.tool_results if result.tool == "run_command"]
-        if not verification_results or not all(result.success for result in verification_results):
-            return None
-
-        changed_paths = [
-            self._normalize_path_arg(path, workspace)
-            for path in continuation_context.get("changed_paths", [])
-            if str(path).strip()
-        ]
-        if not changed_paths:
-            return None
-
-        original_task = str(continuation_context.get("original_task", "")).strip() or task
-        explicit_targets = self._extract_file_targets(original_task, workspace)
-        if not explicit_targets:
-            return None
-        if not all(target in changed_paths for target in explicit_targets):
-            return None
-
-        verified_commands = []
-        for command in continuation_context.get("suggested_commands", []):
-            if isinstance(command, list) and command:
-                verified_commands.append(" ".join(str(part) for part in command))
-
-        changed_label = ", ".join(changed_paths)
-        command_label = verified_commands[0] if verified_commands else "the directly related verification command"
-        final_answer = (
-            f"Verified the approved patch for {changed_label}. "
-            f"Read the changed files and confirmed `{command_label}` succeeded. "
-            "No remaining work was detected for the approved task."
+        return self._context_builder.maybe_complete_after_continuation_probe(
+            task=task,
+            workspace=workspace,
+            continuation_context=continuation_context,
+            probe_round=probe_round,
+            extract_file_targets=self._extract_file_targets,
         )
-        return final_answer, "verifier_declared_complete", "completed"
 
     @staticmethod
     def _build_continuation_probe_actions(continuation_context: dict[str, object]) -> list[ToolAction]:
-        actions: list[ToolAction] = []
-        seen_paths: set[str] = set()
-        raw_paths = continuation_context.get("suggested_read_paths")
-        if isinstance(raw_paths, list):
-            for value in raw_paths[:2]:
-                path = str(value).strip()
-                if not path or path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                actions.append(
-                    ToolAction(
-                        tool="read_file",
-                        reason="Verify the applied patch landed before continuing the task.",
-                        args={"path": path, "start_line": 1, "end_line": 200},
-                    )
-                )
-
-        raw_commands = continuation_context.get("suggested_commands")
-        if isinstance(raw_commands, list):
-            for value in raw_commands[:1]:
-                if not isinstance(value, list) or not value:
-                    continue
-                actions.append(
-                    ToolAction(
-                        tool="run_command",
-                        reason="Run the most directly related verification command before continuing.",
-                        args={"command": [str(part) for part in value], "cwd": "."},
-                    )
-                )
-
-        return actions
+        return ContextBuilder.build_continuation_probe_actions(continuation_context)
 
     @staticmethod
     def _render_continuation_context(continuation_context: dict[str, object]) -> str:
-        if not continuation_context:
-            return "No continuation context."
-
-        lines: list[str] = []
-        approval_id = str(continuation_context.get("approval_id", "")).strip()
-        if approval_id:
-            lines.append(f"Approval ID: {approval_id}")
-        path = str(continuation_context.get("path", "")).strip()
-        if path:
-            lines.append(f"Changed path: {path}")
-        source_tool = str(continuation_context.get("source_tool", "")).strip()
-        if source_tool:
-            lines.append(f"Source tool: {source_tool}")
-        verification_focus = str(continuation_context.get("verification_focus", "")).strip()
-        if verification_focus:
-            lines.append(f"Verification focus: {verification_focus}")
-
-        commands = continuation_context.get("suggested_commands")
-        rendered_commands: list[str] = []
-        if isinstance(commands, list):
-            for command in commands[:2]:
-                if isinstance(command, list) and command:
-                    rendered_commands.append(" ".join(str(part) for part in command))
-        if rendered_commands:
-            lines.append("Suggested commands:")
-            lines.extend(f"- {command}" for command in rendered_commands)
-
-        return "\n".join(lines) if lines else "No continuation context."
+        return ContextBuilder.render_continuation_context(continuation_context)
 
     @staticmethod
     def _render_tool_observations(tool_results: list[ToolExecutionResult]) -> str:
-        rendered = []
-        for result in tool_results:
-            status = "ok" if result.success else "error"
-            body = result.output or result.error or "(no output)"
-            approval_status = str(result.metadata.get("approval_status", "")).strip()
-            approval_id = str(result.metadata.get("approval_id", "")).strip()
-            if approval_status == "pending" and approval_id:
-                body = (
-                    f"{body}\n"
-                    f"Approval required: pending patch {approval_id}. No file changes were applied yet."
-                )
-            rendered.append(f"[{result.tool} | {status}]\n{body}")
-        return "\n\n".join(rendered)
+        return ContextBuilder.render_tool_observations(tool_results)
 
     @staticmethod
     def _collect_pending_approvals(
         tool_results: list[ToolExecutionResult],
         workspace: Path,
     ) -> list[dict[str, str]]:
-        pending: list[dict[str, str]] = []
-        for result in tool_results:
-            if str(result.metadata.get("approval_status", "")).strip() != "pending":
-                continue
-            approval_id = str(result.metadata.get("approval_id", "")).strip()
-            raw_path = str(result.metadata.get("path", "")).strip()
-            relative_path = raw_path
-            if raw_path:
-                try:
-                    relative_path = str(Path(raw_path).resolve().relative_to(workspace.resolve()))
-                except Exception:
-                    relative_path = raw_path
-            pending.append(
-                {
-                    "approval_id": approval_id,
-                    "path": relative_path or "(unknown path)",
-                    "tool": result.tool,
-                }
-            )
-        return pending
+        return AnswerSynthesizer.collect_pending_approvals(tool_results, workspace)
 
     @staticmethod
     def _build_approval_required_answer(pending_approvals: list[dict[str, str]]) -> str:
-        lines = [
-            "Patch approval required before any proposed file changes can be applied.",
-            "",
-            "Pending approvals:",
-        ]
-        for item in pending_approvals:
-            approval_id = item.get("approval_id", "")
-            path = item.get("path", "(unknown path)")
-            lines.append(f"- {approval_id} | {path}")
-        lines.extend(
-            [
-                "",
-                "No file changes were applied yet.",
-                "Review a patch with `teamai approvals show <approval_id>` and apply it with `teamai approvals apply <approval_id>`.",
-            ]
-        )
-        return "\n".join(lines)
+        return AnswerSynthesizer.build_approval_required_answer(pending_approvals)
 
     @staticmethod
     def _build_fallback_answer(rounds: list[RoundRecord], task: str) -> str:
-        if not rounds:
-            return f"No rounds completed for task: {task}"
-        last_round = rounds[-1]
-        return (
-            f"Stopped before a verified completion. "
-            f"Latest planner summary: {last_round.planner.summary}\n\n"
-            f"Latest verifier summary: {last_round.verifier.summary}"
-        )
+        return AnswerSynthesizer.build_fallback_answer(rounds, task)
 
     @staticmethod
     def _rounds_are_fully_deterministic(rounds: list[RoundRecord]) -> bool:
-        return bool(rounds) and all(record.reasoning_source == "deterministic" for record in rounds)
+        return AnswerSynthesizer.rounds_are_fully_deterministic(rounds)
 
     @staticmethod
     def _label_deterministic_synthesis(text: str) -> str:
-        stripped = text.strip()
-        if not stripped:
-            return text
-        if stripped.startswith(DETERMINISTIC_SYNTHESIS_LABEL):
-            return stripped
-        return f"{DETERMINISTIC_SYNTHESIS_LABEL}\n{stripped}"
+        return AnswerSynthesizer.label_deterministic_synthesis(text)
 
     @staticmethod
     def _render_round_persona_text(text: str, *, reasoning_source: str) -> str:
-        stripped = text.strip()
-        if stripped or reasoning_source != "deterministic":
-            return text
-        return DETERMINISTIC_PERSONA_TRANSCRIPT_NOTICE
+        return AnswerSynthesizer.render_round_persona_text(
+            text,
+            reasoning_source=reasoning_source,
+        )
 
     def _run_deterministic_patch_route(
         self,
@@ -2690,52 +2459,15 @@ class ClosedLoopSupervisor:
 
     @staticmethod
     def _is_repository_inspection_task(task: str) -> bool:
-        text = task.lower()
-        if ClosedLoopSupervisor._is_explicit_write_task(text):
-            return False
-        inspection_markers = ["inspect", "review", "analyze", "understand", "summarize"]
-        repo_markers = ["repository", "repo", "codebase", "project", "workspace"]
-        task_markers = ["engineering task", "implementation step", "next step", "project state"]
-        return (
-            any(marker in text for marker in inspection_markers)
-            and (any(marker in text for marker in repo_markers) or any(marker in text for marker in task_markers))
-        )
+        return _classify_inspection(task)
 
     @staticmethod
     def _is_broad_coding_task(task: str) -> bool:
-        text = task.lower()
-        if ClosedLoopSupervisor._is_explicit_write_task(text):
-            return False
-        if ClosedLoopSupervisor._is_repository_inspection_task(text):
-            return False
-        return bool(
-            re.search(
-                (
-                    r"\b("
-                    r"implement|fix|debug|refactor|build|create|add support|wire up|make .* work|ship|complete|"
-                    r"improve|harden|optimize|extend|upgrade|stabilize|tighten"
-                    r")\b"
-                ),
-                text,
-            )
-        )
+        return _classify_broad_coding(task)
 
     @staticmethod
     def _is_desktop_task(task: str) -> bool:
-        text = task.lower()
-        return any(
-            marker in text
-            for marker in (
-                "desktop",
-                "browser",
-                "screenshot",
-                "click",
-                "open safari",
-                "open chrome",
-                "computer use",
-                "ui automation",
-            )
-        )
+        return _classify_desktop(task)
 
     def _local_drift_reroute_reason(
         self,
@@ -3524,18 +3256,7 @@ class ClosedLoopSupervisor:
 
     @staticmethod
     def _is_explicit_write_task(task: str) -> bool:
-        text = task.lower()
-        has_write_verb = bool(
-            re.search(r"\b(update|edit|modify|replace|rewrite|append|insert|write|add)\b", text)
-        )
-        has_file_target = bool(re.search(r"\b[\w./-]+\.\w+\b", text))
-        write_markers = [
-            "workspace_write",
-            "patch approval",
-            "replace_in_file",
-            "write_file",
-        ]
-        return (has_write_verb and has_file_target) or any(marker in text for marker in write_markers)
+        return _classify_explicit_write(task)
 
     def _supplement_inspection_actions(
         self,
@@ -3780,94 +3501,11 @@ class ClosedLoopSupervisor:
         previous_rounds: list[RoundRecord],
         execution_mode: str,
     ) -> ToolAction | None:
-        if execution_mode != "workspace_write" or not self._is_explicit_write_task(task):
-            return None
-
-        compiled = self._compile_small_write_action_from_task(task=task, workspace=workspace)
-        if compiled is not None:
-            return compiled
-
-        target_path = self._extract_primary_file_target(task, workspace)
-        if target_path is None:
-            return None
-
-        contents = self._collect_read_file_outputs(previous_rounds, workspace)
-        raw_file_text = contents.get(target_path)
-        if not raw_file_text:
-            return None
-
-        file_text = self._strip_read_file_line_numbers(raw_file_text)
-        sentence = self._extract_task_sentence(task)
-        anchor = self._extract_task_anchor(task)
-        if not sentence or not anchor:
-            return None
-
-        paragraph = self._find_paragraph_starting_with(file_text, anchor)
-        if paragraph is None or sentence in paragraph or sentence in file_text:
-            return None
-
-        return ToolAction(
-            tool="replace_in_file",
-            reason="Propose the explicitly requested patch approval for the target file.",
-            args={
-                "path": target_path,
-                "old_text": paragraph,
-                "new_text": f"{paragraph}\n\n{sentence}",
-                "replace_all": False,
-            },
-        )
-
-    def _compile_python_function_and_unittest_bundle_action(
-        self,
-        *,
-        task: str,
-        workspace: Path,
-    ) -> ToolAction | None:
-        targets = self._extract_file_targets(task, workspace)
-        if len(targets) < 2:
-            return None
-
-        source_path = next((path for path in targets if path.endswith(".py") and "test" not in Path(path).name.lower()), None)
-        test_path = next((path for path in targets if path.endswith(".py") and "test" in path.lower()), None)
-        if source_path is None or test_path is None:
-            return None
-
-        function_name = self._extract_function_update_target(task)
-        return_template = self._extract_python_string_normalizer_template(task)
-        expectation = self._extract_unittest_io_expectation(task)
-        if function_name is None or return_template is None or expectation is None:
-            return None
-
-        try:
-            source_text = (workspace / source_path).read_text(encoding="utf-8")
-            test_text = (workspace / test_path).read_text(encoding="utf-8")
-        except Exception:
-            return None
-
-        updated_source = self._build_python_function_return_update(
-            file_text=source_text,
-            function_name=function_name,
-            return_template=return_template,
-        )
-        updated_test = self._build_python_unittest_expectation_update(
-            file_text=test_text,
-            function_name=function_name,
-            input_value=expectation[0],
-            output_value=expectation[1],
-        )
-
-        changes: list[dict[str, str]] = []
-        if updated_source is not None:
-            changes.append({"path": source_path, "content": updated_source})
-        if updated_test is not None:
-            changes.append({"path": test_path, "content": updated_test})
-        if not changes:
-            return None
-
-        return ToolAction(
-            tool="write_file",
-            reason="Compile the explicit multi-file code-and-test request into a bundled patch approval.",
-            args={"changes": changes},
+        return self._patch_compiler.heuristic_write_action(
+            task=task,
+            workspace=workspace,
+            previous_rounds=previous_rounds,
+            execution_mode=execution_mode,
         )
 
     def _compile_small_write_action_from_task(
@@ -3876,277 +3514,7 @@ class ClosedLoopSupervisor:
         task: str,
         workspace: Path,
     ) -> ToolAction | None:
-        bundled = self._compile_python_function_and_unittest_bundle_action(task=task, workspace=workspace)
-        if bundled is not None:
-            return bundled
-
-        target_path = self._extract_primary_file_target(task, workspace)
-        if target_path is None:
-            return None
-
-        target = (workspace / target_path).resolve()
-        try:
-            file_text = target.read_text(encoding="utf-8")
-        except Exception:
-            return None
-
-        for compiler in (
-            self._compile_paragraph_insert_action,
-            self._compile_assignment_update_action,
-            self._compile_import_insert_action,
-            self._compile_test_method_insert_action,
-            self._compile_replace_all_action,
-            self._compile_exact_replace_action,
-            self._compile_anchor_insert_action,
-            self._compile_append_action,
-        ):
-            compiled = compiler(task=task, target_path=target_path, file_text=file_text)
-            if compiled is not None:
-                return compiled
-        return None
-
-    def _compile_paragraph_insert_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        if "paragraph" not in task.lower():
-            return None
-
-        payload = self._extract_task_payload(task)
-        anchor = self._extract_task_anchor(task)
-        if payload is None or anchor is None:
-            return None
-
-        _, inserted_text = payload
-        paragraph = self._find_paragraph_starting_with(file_text, anchor)
-        if paragraph is None:
-            return None
-
-        updated_paragraph = f"{paragraph}\n\n{inserted_text}"
-        if updated_paragraph in file_text or inserted_text in paragraph:
-            return None
-
-        return ToolAction(
-            tool="replace_in_file",
-            reason="Compile the explicit paragraph insertion into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "old_text": paragraph,
-                "new_text": updated_paragraph,
-                "replace_all": False,
-            },
-        )
-
-    def _compile_assignment_update_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        assignment = self._extract_assignment_update_values(task)
-        if assignment is None:
-            return None
-
-        key, raw_value = assignment
-        updated_text = self._build_assignment_updated_file_text(
-            file_text=file_text,
-            target_path=target_path,
-            key=key,
-            raw_value=raw_value,
-        )
-        if updated_text is None or updated_text == file_text:
-            return None
-
-        return ToolAction(
-            tool="write_file",
-            reason="Compile the explicit assignment update into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "content": updated_text,
-            },
-        )
-
-    def _compile_import_insert_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        if not target_path.endswith(".py"):
-            return None
-
-        import_statement = self._extract_import_statement(task)
-        if import_statement is None:
-            return None
-
-        updated_text = self._build_python_import_inserted_text(
-            file_text=file_text,
-            import_statement=import_statement,
-        )
-        if updated_text is None or updated_text == file_text:
-            return None
-
-        return ToolAction(
-            tool="write_file",
-            reason="Compile the explicit import insertion into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "content": updated_text,
-            },
-        )
-
-    def _compile_test_method_insert_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        if not target_path.endswith(".py"):
-            return None
-
-        class_insert = self._extract_class_block_insert_values(task)
-        if class_insert is None:
-            return None
-
-        class_name, block_text = class_insert
-        updated_text = self._build_class_block_inserted_text(
-            file_text=file_text,
-            class_name=class_name,
-            block_text=block_text,
-        )
-        if updated_text is None or updated_text == file_text:
-            return None
-
-        return ToolAction(
-            tool="write_file",
-            reason="Compile the explicit test-class insertion into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "content": updated_text,
-            },
-        )
-
-    def _compile_exact_replace_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        replace_values = self._extract_task_replace_values(task)
-        if replace_values is None:
-            return None
-
-        old_text, new_text, replace_all = replace_values
-        if replace_all or not old_text or old_text == new_text or old_text not in file_text:
-            return None
-
-        return ToolAction(
-            tool="replace_in_file",
-            reason="Compile the explicit replace request into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "old_text": old_text,
-                "new_text": new_text,
-                "replace_all": False,
-            },
-        )
-
-    def _compile_replace_all_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        replace_values = self._extract_task_replace_values(task)
-        if replace_values is None:
-            return None
-
-        old_text, new_text, replace_all = replace_values
-        if not replace_all or not old_text or old_text == new_text:
-            return None
-
-        occurrences = file_text.count(old_text)
-        if occurrences < 1:
-            return None
-
-        return ToolAction(
-            tool="replace_in_file",
-            reason="Compile the explicit replace-all request into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "old_text": old_text,
-                "new_text": new_text,
-                "replace_all": True,
-            },
-        )
-
-    def _compile_anchor_insert_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        anchor_insert = self._extract_anchor_insert_values(task)
-        if anchor_insert is None:
-            return None
-
-        kind, inserted_text, position, anchor = anchor_insert
-        if anchor not in file_text:
-            return None
-
-        delimiter = self._insertion_delimiter(kind, inserted_text)
-        if position == "before":
-            replacement = f"{inserted_text}{delimiter}{anchor}"
-        else:
-            replacement = f"{anchor}{delimiter}{inserted_text}"
-
-        if replacement in file_text:
-            return None
-
-        return ToolAction(
-            tool="replace_in_file",
-            reason="Compile the explicit anchored insertion into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "old_text": anchor,
-                "new_text": replacement,
-                "replace_all": False,
-            },
-        )
-
-    def _compile_append_action(
-        self,
-        *,
-        task: str,
-        target_path: str,
-        file_text: str,
-    ) -> ToolAction | None:
-        append_values = self._extract_append_values(task)
-        if append_values is None:
-            return None
-
-        kind, appended_text = append_values
-        updated_text = self._build_appended_file_text(file_text=file_text, appended_text=appended_text, kind=kind)
-        if updated_text is None or updated_text == file_text:
-            return None
-
-        return ToolAction(
-            tool="write_file",
-            reason="Compile the explicit append request into a deterministic patch approval.",
-            args={
-                "path": target_path,
-                "content": updated_text,
-            },
-        )
+        return self._patch_compiler.compile(task=task, workspace=workspace)
 
     def _action_matches_explicit_write_task(
         self,
@@ -4155,70 +3523,9 @@ class ClosedLoopSupervisor:
         task: str,
         workspace: Path,
     ) -> bool:
-        if action.tool not in {"write_file", "replace_in_file"}:
-            return False
-
-        expected_action = self._compile_small_write_action_from_task(task=task, workspace=workspace)
-        if expected_action is not None:
-            return self._write_actions_match(action, expected_action, workspace)
-
-        target_path = self._extract_primary_file_target(task, workspace)
-        normalized_path = self._normalize_path_arg(action.args.get("path", "."), workspace)
-        if target_path is not None and normalized_path != target_path:
-            return False
-
-        sentence = self._extract_task_sentence(task)
-        if not sentence:
-            return True
-
-        if action.tool == "write_file":
-            return sentence in str(action.args.get("content", ""))
-
-        new_text = str(action.args.get("new_text", ""))
-        return sentence in new_text
-
-    def _write_actions_match(
-        self,
-        action: ToolAction,
-        expected_action: ToolAction,
-        workspace: Path,
-    ) -> bool:
-        if action.tool != expected_action.tool:
-            return False
-
-        actual_path = self._normalize_path_arg(action.args.get("path", "."), workspace)
-        expected_path = self._normalize_path_arg(expected_action.args.get("path", "."), workspace)
-        if actual_path != expected_path:
-            return False
-
-        if action.tool == "write_file":
-            expected_bundle = self._normalize_write_bundle(expected_action.args, workspace)
-            actual_bundle = self._normalize_write_bundle(action.args, workspace)
-            if expected_bundle is not None or actual_bundle is not None:
-                return actual_bundle == expected_bundle
-            return str(action.args.get("content", "")) == str(expected_action.args.get("content", ""))
-
-        return (
-            str(action.args.get("old_text", "")) == str(expected_action.args.get("old_text", ""))
-            and str(action.args.get("new_text", "")) == str(expected_action.args.get("new_text", ""))
-            and bool(action.args.get("replace_all", False)) == bool(expected_action.args.get("replace_all", False))
+        return self._patch_compiler.action_matches_explicit_write_task(
+            action, task=task, workspace=workspace,
         )
-
-    def _normalize_write_bundle(
-        self,
-        args: dict[str, object],
-        workspace: Path,
-    ) -> list[tuple[str, str]] | None:
-        raw_changes = args.get("changes")
-        if not isinstance(raw_changes, list):
-            return None
-        normalized: list[tuple[str, str]] = []
-        for entry in raw_changes:
-            if not isinstance(entry, dict):
-                continue
-            path = self._normalize_path_arg(entry.get("path", "."), workspace)
-            normalized.append((path, str(entry.get("content", ""))))
-        return normalized
 
     def _extract_file_targets(self, task: str, workspace: Path) -> list[str]:
         targets: list[str] = []
@@ -4233,548 +3540,6 @@ class ClosedLoopSupervisor:
         targets = self._extract_file_targets(task, workspace)
         return targets[0] if targets else None
 
-    @staticmethod
-    def _extract_function_update_target(task: str) -> str | None:
-        match = re.search(r"\bupdate\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+so it\b", task, flags=re.IGNORECASE)
-        if match:
-            return match.group("name").strip()
-        return None
-
-    @staticmethod
-    def _extract_python_string_normalizer_template(task: str) -> str | None:
-        lowered = task.lower()
-        trims_whitespace = (
-            "trim whitespace" in lowered
-            or "trims whitespace" in lowered
-            or "trim surrounding whitespace" in lowered
-        )
-        title_cases = (
-            "title-cases each word" in lowered
-            or "title-case each word" in lowered
-            or "title cases each word" in lowered
-            or "title case each word" in lowered
-        )
-        if trims_whitespace and title_cases:
-            return '" ".join(part.capitalize() for part in {param}.split())'
-        return None
-
-    @staticmethod
-    def _extract_unittest_io_expectation(task: str) -> tuple[str, str] | None:
-        match = re.search(
-            r"proves?\s+(?P<input_quote>['\"`])(?P<input>.+?)(?P=input_quote)\s+becomes\s+"
-            r"(?P<output_quote>['\"`])(?P<output>.+?)(?P=output_quote)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return match.group("input"), match.group("output")
-        return None
-
-    @staticmethod
-    def _build_python_function_return_update(
-        *,
-        file_text: str,
-        function_name: str,
-        return_template: str,
-    ) -> str | None:
-        lines = file_text.splitlines(keepends=True)
-        function_pattern = re.compile(
-            rf"^(?P<indent>\s*)def\s+{re.escape(function_name)}\s*\((?P<params>[^)]*)\)\s*(?:->\s*[^:]+)?:\s*$"
-        )
-        for index, line in enumerate(lines):
-            match = function_pattern.match(line.rstrip("\n"))
-            if not match:
-                continue
-            indent = match.group("indent")
-            params = match.group("params")
-            first_param = params.split(",", 1)[0].strip() if params.strip() else "value"
-            param_name = first_param.split(":", 1)[0].split("=", 1)[0].strip() or "value"
-            body_start = index + 1
-            body_end = len(lines)
-            for candidate_index in range(body_start, len(lines)):
-                stripped = lines[candidate_index].strip()
-                if not stripped:
-                    continue
-                current_indent = len(lines[candidate_index]) - len(lines[candidate_index].lstrip(" "))
-                if current_indent <= len(indent):
-                    body_end = candidate_index
-                    break
-            body_indent = f"{indent}    "
-            new_body_line = f"{body_indent}return {return_template.format(param=param_name)}\n"
-            existing_body = "".join(lines[body_start:body_end]).strip()
-            if existing_body == new_body_line.strip():
-                return None
-            return "".join([*lines[:body_start], new_body_line, *lines[body_end:]])
-        return None
-
-    def _build_python_unittest_expectation_update(
-        self,
-        *,
-        file_text: str,
-        function_name: str,
-        input_value: str,
-        output_value: str,
-    ) -> str | None:
-        assertion = f"self.assertEqual({function_name}({input_value!r}), {output_value!r})"
-        if assertion in file_text:
-            return None
-
-        class_match = re.search(
-            r"^class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\((?:.*\.)?TestCase\):\s*$",
-            file_text,
-            flags=re.MULTILINE,
-        )
-        if class_match is None:
-            return None
-
-        method_name = f"test_{function_name}_normalizes_whitespace_and_title_case"
-        block_text = (
-            f"def {method_name}(self) -> None:\n"
-            f"    {assertion}"
-        )
-        return self._build_class_block_inserted_text(
-            file_text=file_text,
-            class_name=class_match.group("name"),
-            block_text=block_text,
-        )
-
-    @staticmethod
-    def _strip_read_file_line_numbers(text: str) -> str:
-        return "\n".join(re.sub(r"^\d{4}:\s?", "", line) for line in text.splitlines())
-
-    @staticmethod
-    def _extract_task_sentence(task: str) -> str | None:
-        match = re.search(r"(?:sentence|line|text)\s+['\"]([^'\"]+)['\"]", task, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    @staticmethod
-    def _extract_task_payload(task: str) -> tuple[str, str] | None:
-        fenced_block = ClosedLoopSupervisor._extract_task_fenced_block(task)
-        if fenced_block is not None:
-            return "block", fenced_block
-
-        match = re.search(
-            r"(sentence|line|text)\s+(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return match.group(1).lower(), match.group("payload").strip()
-
-        match = re.search(
-            r"(?:append|insert|add)\s+(?:the\s+)?(?:exact\s+|literal\s+|verbatim\s+)?"
-            r"(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return "text", match.group("payload").strip()
-        return None
-
-    @staticmethod
-    def _extract_task_replace_values(task: str) -> tuple[str, str, bool] | None:
-        match = re.search(
-            r"replace(?P<all>\s+all(?:\s+occurrences?)?\s+of|\s+every\s+occurrence\s+of)?(?:\s+the\s+(?:text|line|sentence))?\s+"
-            r"(?P<old_quote>['\"`])(?P<old>.+?)(?P=old_quote)\s+with\s+"
-            r"(?P<new_quote>['\"`])(?P<new>.+?)(?P=new_quote)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return (
-                match.group("old").strip(),
-                match.group("new").strip(),
-                bool(match.group("all")),
-            )
-        return None
-
-    @staticmethod
-    def _extract_import_statement(task: str) -> str | None:
-        match = re.search(
-            r"(?:add|insert)\s+(?:the\s+)?(?:(?:import|statement)\s+)?"
-            r"(?P<quote>['\"`])(?P<statement>(?:from\s+[^\n]+?\s+import\s+[^\n]+?|import\s+[^\n]+?))(?P=quote)\s+"
-            r"(?:to|into)\b",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return match.group("statement").strip()
-        return None
-
-    @staticmethod
-    def _extract_assignment_update_values(task: str) -> tuple[str, str] | None:
-        match = re.search(
-            r"\b(?:set|change|update)\s+(?P<name>[A-Za-z_][\w.-]*)\s*(?:=|to)\s*(?P<value>.+?)\s+(?:in|inside)\s+[\w./-]+\b",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return None
-        value = match.group("value").strip().rstrip(".,")
-        return match.group("name").strip(), value
-
-    @staticmethod
-    def _extract_anchor_insert_values(task: str) -> tuple[str, str, str, str] | None:
-        fenced_block = ClosedLoopSupervisor._extract_task_fenced_block(task)
-        if fenced_block is not None:
-            match = re.search(
-                r"(?:insert|add)\s+(?:the\s+)?(?:following\s+)?block\s+"
-                r"(?:immediately\s+)?(?P<position>before|after)\s+(?:the\s+)?"
-                r"(?:(?:sentence|line|text|block)\s+)?(?P<anchor_quote>['\"`])(?P<anchor>.+?)(?P=anchor_quote)",
-                task,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if match:
-                return (
-                    "block",
-                    fenced_block,
-                    match.group("position").lower(),
-                    match.group("anchor").strip(),
-                )
-
-        match = re.search(
-            r"(?:insert|add)\s+(?:the\s+)?(?:(?P<kind>sentence|line|text)\s+)?"
-            r"(?P<payload_quote>['\"`])(?P<payload>.+?)(?P=payload_quote)\s+"
-            r"(?:immediately\s+)?(?P<position>before|after)\s+(?:the\s+)?"
-            r"(?:(?:sentence|line|text)\s+)?(?P<anchor_quote>['\"`])(?P<anchor>.+?)(?P=anchor_quote)",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            kind = (match.group("kind") or "text").lower()
-            return (
-                kind,
-                match.group("payload").strip(),
-                match.group("position").lower(),
-                match.group("anchor").strip(),
-            )
-        return None
-
-    @staticmethod
-    def _extract_class_block_insert_values(task: str) -> tuple[str, str] | None:
-        fenced_block = ClosedLoopSupervisor._extract_task_fenced_block(task)
-        if fenced_block is None:
-            return None
-
-        match = re.search(
-            r"(?:add|insert)\s+(?:the\s+)?(?:following\s+)?(?:test|method|block)\s+to\s+class\s+(?P<class_name>[A-Za-z_][A-Za-z0-9_]*)\b",
-            task,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            return match.group("class_name").strip(), fenced_block
-        return None
-
-    @staticmethod
-    def _extract_append_values(task: str) -> tuple[str, str] | None:
-        fenced_block = ClosedLoopSupervisor._extract_task_fenced_block(task)
-        if fenced_block is not None:
-            match = re.search(
-                r"append\s+(?:the\s+)?(?:following\s+)?block\s+(?:to|at\s+the\s+end\s+of)\b",
-                task,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if match:
-                return "block", fenced_block
-
-        match = re.search(
-            r"append\s+(?:the\s+)?(?:exact\s+|literal\s+|verbatim\s+)?(?:(?P<kind>sentence|line|text)\s+)?"
-            r"(?P<quote>['\"`])(?P<payload>.+?)(?P=quote)\s+"
-            r"(?:to|at\s+the\s+end\s+of)\b",
-            task,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            return (match.group("kind") or "text").lower(), match.group("payload").strip()
-        return None
-
-    @staticmethod
-    def _extract_task_fenced_block(task: str) -> str | None:
-        match = re.search(
-            r"```(?:[\w.+-]+)?\n(?P<block>[\s\S]+?)```",
-            task,
-            flags=re.MULTILINE,
-        )
-        if match:
-            return match.group("block").rstrip("\n")
-        return None
-
-    @staticmethod
-    def _insertion_delimiter(kind: str, inserted_text: str) -> str:
-        if "\n" in inserted_text or kind == "block":
-            return "\n"
-        if kind == "line":
-            return "\n"
-        if kind == "sentence":
-            return " "
-        return ""
-
-    @staticmethod
-    def _build_appended_file_text(
-        *,
-        file_text: str,
-        appended_text: str,
-        kind: str,
-    ) -> str | None:
-        if kind == "block":
-            normalized_appended = appended_text.rstrip("\n")
-            if normalized_appended and normalized_appended in file_text:
-                return None
-            separator = ""
-            if file_text and not file_text.endswith("\n"):
-                separator = "\n"
-            elif file_text and not file_text.endswith("\n\n"):
-                separator = "\n"
-            updated = f"{file_text}{separator}{normalized_appended}"
-            return updated if updated.endswith("\n") else f"{updated}\n"
-
-        if kind == "line":
-            if file_text.rstrip("\n").endswith(appended_text):
-                return None
-            prefix = "" if not file_text or file_text.endswith("\n") else "\n"
-            updated = f"{file_text}{prefix}{appended_text}"
-            return updated if updated.endswith("\n") else f"{updated}\n"
-
-        if kind == "sentence":
-            if file_text.rstrip().endswith(appended_text):
-                return None
-            if not file_text:
-                return appended_text
-            separator = "\n" if file_text.endswith("\n") else " "
-            return f"{file_text}{separator}{appended_text}"
-
-        if file_text.endswith(appended_text):
-            return None
-        return f"{file_text}{appended_text}"
-
-    @staticmethod
-    def _build_python_import_inserted_text(
-        *,
-        file_text: str,
-        import_statement: str,
-    ) -> str | None:
-        lines = file_text.splitlines(keepends=True)
-        normalized_statement = import_statement.strip()
-        existing_lines = {line.strip() for line in lines}
-        if normalized_statement in existing_lines:
-            return None
-
-        insert_at = 0
-        if insert_at < len(lines) and lines[insert_at].startswith("#!"):
-            insert_at += 1
-        if insert_at < len(lines) and re.search(r"coding[:=]", lines[insert_at]):
-            insert_at += 1
-
-        while insert_at < len(lines) and not lines[insert_at].strip():
-            insert_at += 1
-
-        if insert_at < len(lines):
-            stripped = lines[insert_at].lstrip()
-            if stripped.startswith('"""') or stripped.startswith("'''"):
-                quote = stripped[:3]
-                insert_at += 1
-                if quote not in stripped[3:]:
-                    while insert_at < len(lines):
-                        if quote in lines[insert_at]:
-                            insert_at += 1
-                            break
-                        insert_at += 1
-                while insert_at < len(lines) and not lines[insert_at].strip():
-                    insert_at += 1
-
-        import_insert_at: int | None = None
-        last_import = -1
-        scan_index = insert_at
-        while scan_index < len(lines):
-            stripped = lines[scan_index].strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                last_import = scan_index
-                scan_index += 1
-                continue
-            if last_import >= 0 and (not stripped or stripped.startswith("#")):
-                scan_index += 1
-                continue
-            break
-        if last_import >= 0:
-            import_insert_at = last_import + 1
-
-        insertion_index = import_insert_at if import_insert_at is not None else insert_at
-        inserted_lines = [f"{normalized_statement}\n"]
-        if import_insert_at is None and insertion_index < len(lines) and lines[insertion_index].strip():
-            inserted_lines.append("\n")
-
-        return "".join(lines[:insertion_index] + inserted_lines + lines[insertion_index:])
-
-    @staticmethod
-    def _build_assignment_updated_file_text(
-        *,
-        file_text: str,
-        target_path: str,
-        key: str,
-        raw_value: str,
-    ) -> str | None:
-        suffix = Path(target_path).suffix.lower()
-        is_env_style = target_path.startswith(".env") or suffix == ".env"
-        if is_env_style:
-            separators = ["="]
-        elif suffix in {".yaml", ".yml"}:
-            separators = [":"]
-        else:
-            separators = ["=", ":"]
-
-        lines = file_text.splitlines(keepends=True)
-        for index, line in enumerate(lines):
-            line_without_newline = line.rstrip("\n")
-            for separator in separators:
-                pattern = re.compile(
-                    rf"^(?P<prefix>\s*{re.escape(key)}\s*{re.escape(separator)}\s*)(?P<value>.*?)(?P<comment>\s+#.*)?$"
-                )
-                match = pattern.match(line_without_newline)
-                if not match:
-                    continue
-                existing_value = match.group("value").rstrip()
-                replacement_value = ClosedLoopSupervisor._normalize_assignment_value(
-                    raw_value=raw_value,
-                    existing_value=existing_value,
-                    separator=separator,
-                    target_path=target_path,
-                )
-                updated_line = f"{match.group('prefix')}{replacement_value}{match.group('comment') or ''}"
-                newline = "\n" if line.endswith("\n") else ""
-                new_lines = lines[:]
-                new_lines[index] = f"{updated_line}{newline}"
-                return "".join(new_lines)
-
-        if is_env_style:
-            replacement_value = ClosedLoopSupervisor._normalize_assignment_value(
-                raw_value=raw_value,
-                existing_value="",
-                separator="=",
-                target_path=target_path,
-            )
-            appended_line = f"{key}={replacement_value}"
-            existing_lines = {line.strip() for line in file_text.splitlines()}
-            if appended_line in existing_lines:
-                return None
-            separator = "" if not file_text or file_text.endswith("\n") else "\n"
-            updated_text = f"{file_text}{separator}{appended_line}"
-            return updated_text if updated_text.endswith("\n") else f"{updated_text}\n"
-        return None
-
-    @staticmethod
-    def _normalize_assignment_value(
-        *,
-        raw_value: str,
-        existing_value: str,
-        separator: str,
-        target_path: str,
-    ) -> str:
-        candidate = raw_value.strip()
-        if not candidate:
-            return candidate
-
-        if (
-            (candidate.startswith('"') and candidate.endswith('"'))
-            or (candidate.startswith("'") and candidate.endswith("'"))
-        ):
-            return candidate
-
-        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", candidate):
-            return candidate
-
-        lowered = candidate.lower()
-        if lowered in {"true", "false", "none", "null"}:
-            if separator == "=" and target_path.endswith(".py"):
-                return lowered.capitalize() if lowered in {"true", "false", "none"} else "None"
-            return lowered
-
-        if existing_value[:1] in {'"', "'"} and existing_value[-1:] == existing_value[:1]:
-            quote = existing_value[:1]
-            return f"{quote}{candidate}{quote}"
-
-        return candidate
-
-    @staticmethod
-    def _build_class_block_inserted_text(
-        *,
-        file_text: str,
-        class_name: str,
-        block_text: str,
-    ) -> str | None:
-        lines = file_text.splitlines(keepends=True)
-        class_pattern = re.compile(rf"^(?P<indent>\s*)class\s+{re.escape(class_name)}\b.*:\s*$")
-
-        class_index = -1
-        class_indent = ""
-        for index, line in enumerate(lines):
-            match = class_pattern.match(line.rstrip("\n"))
-            if match:
-                class_index = index
-                class_indent = match.group("indent")
-                break
-        if class_index < 0:
-            return None
-
-        class_end = len(lines)
-        for index in range(class_index + 1, len(lines)):
-            stripped = lines[index].strip()
-            if not stripped:
-                continue
-            current_indent = len(lines[index]) - len(lines[index].lstrip(" "))
-            if current_indent <= len(class_indent):
-                class_end = index
-                break
-
-        dedented_block = textwrap.dedent(block_text).strip("\n")
-        if not dedented_block:
-            return None
-
-        body_indent = f"{class_indent}    "
-        normalized_lines = []
-        for line in dedented_block.splitlines():
-            if line.strip():
-                normalized_lines.append(f"{body_indent}{line.rstrip()}\n")
-            else:
-                normalized_lines.append("\n")
-        normalized_block = "".join(normalized_lines).rstrip("\n")
-        class_slice = "".join(lines[class_index:class_end])
-        if normalized_block in class_slice:
-            return None
-
-        prefix = "".join(lines[:class_end])
-        suffix = "".join(lines[class_end:])
-        separator_before = ""
-        if prefix and not prefix.endswith("\n\n"):
-            separator_before = "\n" if prefix.endswith("\n") else "\n\n"
-        separator_after = ""
-        if suffix and not suffix.startswith("\n"):
-            separator_after = "\n"
-
-        return f"{prefix}{separator_before}{normalized_block}\n{separator_after}{suffix}"
-
-    @staticmethod
-    def _extract_task_anchor(task: str) -> str | None:
-        match = re.search(r"(?:starts|begins)\s+with\s+['\"]([^'\"]+)['\"]", task, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    @staticmethod
-    def _find_paragraph_starting_with(text: str, anchor: str) -> str | None:
-        normalized_anchor = ClosedLoopSupervisor._normalize_paragraph_anchor(anchor)
-        for paragraph in re.split(r"\n\s*\n", text):
-            candidate = paragraph.strip()
-            if ClosedLoopSupervisor._normalize_paragraph_anchor(candidate).startswith(normalized_anchor):
-                return candidate
-        return None
-
-    @staticmethod
-    def _normalize_paragraph_anchor(text: str) -> str:
-        collapsed = re.sub(r"\s+", " ", text.replace("`", " ").strip().lower())
-        return collapsed.strip()
-
     def _maybe_synthesize_repository_answer(
         self,
         *,
@@ -4783,110 +3548,13 @@ class ClosedLoopSupervisor:
         workspace: Path,
         allow_partial: bool = False,
     ) -> str | None:
-        if not self._is_repository_inspection_task(task):
-            return None
-
-        successful = self._successful_action_signatures(rounds, workspace)
-        has_readme = "read_file:README.md" in successful
-        has_package_listing = "list_files:teamai" in successful
-        has_config = "read_file:teamai/config.py" in successful
-        has_runtime_anchor = "read_file:teamai/cli.py" in successful or "read_file:teamai/supervisor.py" in successful
-
-        strict_ready = has_readme and has_package_listing and has_config and has_runtime_anchor
-        partial_ready = has_readme and has_runtime_anchor and (has_package_listing or has_config)
-        if not strict_ready:
-            if not allow_partial or not partial_ready:
-                return None
-
-        contents = self._collect_read_file_outputs(rounds, workspace)
-        readme_text = contents.get("README.md", "")
-        pyproject_text = contents.get("pyproject.toml", "")
-        memory_text = contents.get("PROJECT_MEMORY.md", "")
-        combined_text = "\n".join([readme_text, pyproject_text, memory_text]).lower()
-        implemented = self._implemented_feature_flags(workspace, contents)
-
-        current_state_parts: list[str] = []
-        if has_readme and pyproject_text:
-            current_state_parts.append(
-                "The repo is already packaged as a local-first Python application for MLX-based orchestration."
-            )
-        if "teamai/supervisor.py" in contents:
-            current_state_parts.append(
-                "The core strategist/critic/planner/verifier loop is implemented in the supervisor."
-            )
-        if "teamai/model_backend.py" in contents:
-            current_state_parts.append(
-                "The MLX backend is wired in with lazy model loading and explicit load/generation error handling."
-            )
-        if "teamai/tools.py" in contents:
-            current_state_parts.append(
-                "Workspace inspection tools and write restrictions are already scaffolded behind a sandboxed tool layer."
-            )
-        if "teamai/config.py" in contents:
-            current_state_parts.append(
-                "Runtime settings are centralized with environment validation, workspace scoping, and safety limits."
-            )
-        if implemented["persistent_memory"]:
-            current_state_parts.append(
-                "Persistent run history and cross-run workspace memory are already implemented through `.teamai/` state files and prompt injection."
-            )
-
-        tasks: list[str] = []
-        if (
-            any(keyword in combined_text for keyword in ["persistent memory", "persistent run history", "run history"])
-            and not implemented["persistent_memory"]
-        ):
-            tasks.append(
-                "Add persistent run history and memory so the loop can carry useful context across rounds and across separate runs."
-            )
-
-        if any(
-            keyword in combined_text
-            for keyword in [
-                "patch-oriented editing tools",
-                "safer patch-oriented write tools",
-                "approval checkpoints",
-                "before destructive changes",
-            ]
-        ):
-            tasks.append(
-                "Replace the coarse write path with patch-oriented editing tools and approval checkpoints before destructive changes."
-            )
-
-        if any(keyword in combined_text for keyword in ["streaming events", "streaming event output", "streaming output"]):
-            tasks.append(
-                "Add streaming event output across the CLI, API, and job flow so long runs expose persona and tool progress in real time."
-            )
-
-        if "teamai/model_backend.py" in contents:
-            tasks.append(
-                "Harden the MLX backend around model load, generation failures, and clearer operator-facing recovery guidance."
-            )
-
-        if any(keyword in combined_text for keyword in ["json planning / verification", "json planning", "verification"]):
-            tasks.append(
-                "Keep hardening structured planner and verifier outputs so longer inspection and execution runs stay reliable."
-            )
-
-        if not tasks:
-            tasks.append(
-                "Inspect and tighten `teamai/supervisor.py`, since it appears to be the main coordination point for the closed-loop behavior."
-            )
-            tasks.append(
-                "Inspect and harden `teamai/model_backend.py`, since the MLX integration is the highest-risk runtime dependency after the CLI/config layer."
-            )
-            tasks.append(
-                "Add higher-level tests for full repository-inspection runs so the system proves it can reach actionable next steps."
-            )
-
-        deduped_tasks: list[str] = []
-        for task_item in tasks:
-            if task_item not in deduped_tasks:
-                deduped_tasks.append(task_item)
-
-        current_state = " ".join(current_state_parts) if current_state_parts else "The repo structure and core runtime pieces are in place."
-        tasks_section = "\n".join(f"- {task_item}" for task_item in deduped_tasks[:4])
-        return f"Current state: {current_state}\n\nNext engineering tasks:\n{tasks_section}"
+        return self._answer_synthesizer.maybe_synthesize_repository_answer(
+            task=task,
+            rounds=rounds,
+            workspace=workspace,
+            allow_partial=allow_partial,
+            successful_signatures=self._successful_action_signatures(rounds, workspace),
+        )
 
     def _maybe_synthesize_codex_handoff_answer(
         self,
@@ -4896,204 +3564,16 @@ class ClosedLoopSupervisor:
         workspace: Path,
         task_route: str,
     ) -> str | None:
-        if task_route != "codex_handoff":
-            return None
-
-        raw_key_paths: list[str] = []
-        seen_paths: set[str] = set()
-        next_focuses: list[str] = []
-        seen_focuses: set[str] = set()
-        evidence_count = 0
-
-        for record in rounds:
-            for result in record.tool_results:
-                if not result.success:
-                    continue
-                evidence_count += 1
-                raw_path = str(result.metadata.get("path", "")).strip()
-                if raw_path:
-                    normalized = self._normalize_path_arg(raw_path, workspace)
-                    if normalized not in seen_paths:
-                        seen_paths.add(normalized)
-                        raw_key_paths.append(normalized)
-            next_focus = (record.verifier.next_focus or "").strip()
-            if next_focus and next_focus not in seen_focuses:
-                seen_focuses.add(next_focus)
-                next_focuses.append(next_focus.rstrip("."))
-
-        if len(raw_key_paths) < 2:
-            fallback_paths = self._rank_codex_handoff_paths(
-                task=task,
-                paths=self._task_relevant_candidates(task, workspace),
-            )
-            for candidate in fallback_paths:
-                if candidate in seen_paths:
-                    continue
-                seen_paths.add(candidate)
-                raw_key_paths.append(candidate)
-                if len(raw_key_paths) >= 8:
-                    break
-
-        key_paths = self._rank_codex_handoff_paths(task=task, paths=raw_key_paths)
-        if len(key_paths) < 2:
-            for candidate in self._rank_codex_handoff_paths(
-                task=task,
-                paths=self._task_relevant_candidates(task, workspace),
-            ):
-                if candidate in key_paths:
-                    continue
-                key_paths.append(candidate)
-                if len(key_paths) >= 4:
-                    break
-        lead_task = None
-        for focus in next_focuses:
-            normalized_focus = self._normalize_codex_handoff_focus(focus, workspace=workspace)
-            if normalized_focus:
-                lead_task = normalized_focus
-                break
-
-        if evidence_count < 2 and not (key_paths or lead_task):
-            return None
-
-        lines = [
-            "Current state: The local run treated this as a broad coding task and gathered reconnaissance instead of attempting autonomous implementation.",
-            "",
-            "Next engineering tasks:",
-        ]
-        if lead_task:
-            lines.append(f"- {self._ensure_sentence(lead_task)}")
-        if key_paths and not self._lead_task_covers_paths(lead_task, key_paths[:2]):
-            lines.append(f"- Inspect the most relevant paths first: {', '.join(key_paths[:4])}.")
-        lines.append(f"- Implement the requested change in Codex after verifying the scoped plan for: {task}")
-        return "\n".join(lines)
-
-    def _normalize_codex_handoff_focus(
-        self,
-        focus: str,
-        *,
-        workspace: Path,
-    ) -> str | None:
-        compact = " ".join(focus.split()).strip().rstrip(".")
-        if not compact:
-            return None
-
-        lowered = compact.lower()
-        normalized_paths: list[str] = []
-        seen_paths: set[str] = set()
-        for candidate in self._extract_candidate_paths(compact):
-            normalized = self._normalize_path_arg(candidate, workspace)
-            resolved = (workspace / normalized).resolve()
-            if not resolved.exists() or normalized in seen_paths:
-                continue
-            seen_paths.add(normalized)
-            normalized_paths.append(normalized)
-
-        if normalized_paths:
-            if len(normalized_paths) == 1:
-                return f"Inspect {normalized_paths[0]} before implementing the requested change"
-            if len(normalized_paths) == 2:
-                return (
-                    f"Inspect {normalized_paths[0]} and {normalized_paths[1]} "
-                    "before implementing the requested change"
-                )
-            return f"Inspect the most relevant paths first: {', '.join(normalized_paths[:4])}"
-
-        if lowered.startswith(("inspect ", "review ", "read ", "trace ", "verify ", "map ", "compare ", "reproduce ")):
-            return compact
-        if lowered.startswith(("implement ", "fix ", "debug ", "update ")):
-            return compact
-        return None
-
-    @staticmethod
-    def _ensure_sentence(text: str) -> str:
-        stripped = text.strip()
-        if stripped.endswith((".", "!", "?")):
-            return stripped
-        return f"{stripped}."
-
-    @staticmethod
-    def _lead_task_covers_paths(lead_task: str | None, paths: list[str]) -> bool:
-        if not lead_task:
-            return False
-        lowered = lead_task.lower()
-        return all(path.lower() in lowered for path in paths if path)
+        return self._answer_synthesizer.maybe_synthesize_codex_handoff_answer(
+            task=task,
+            rounds=rounds,
+            workspace=workspace,
+            task_route=task_route,
+            task_relevant_candidates=self._task_relevant_candidates(task, workspace),
+        )
 
     def _rank_codex_handoff_paths(self, *, task: str, paths: list[str]) -> list[str]:
-        task_lower = task.lower()
-        unique_paths: list[str] = []
-        seen: set[str] = set()
-        for path in paths:
-            normalized = path.rstrip("/")
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            unique_paths.append(normalized)
-
-        file_paths = [path for path in unique_paths if path not in {".", "teamai", "tests"} and "." in Path(path).name]
-        preferred_pool = file_paths or [path for path in unique_paths if path != "."]
-
-        ranked = sorted(
-            preferred_pool,
-            key=lambda path: (-self._score_handoff_path(task_lower=task_lower, path=path), unique_paths.index(path)),
-        )
-        return ranked[:12]
-
-    @staticmethod
-    def _score_handoff_path(*, task_lower: str, path: str) -> int:
-        path_lower = path.lower()
-        score = 0
-        if any(marker in task_lower for marker in ["inspect", "explore", "identify", "next tasks", "broad"]):
-            if path_lower == "readme.md":
-                score += 10
-            elif path_lower == "teamai/config.py":
-                score += 8
-            elif path_lower == "project_memory.md":
-                score += 6
-        if any(marker in task_lower for marker in ["bridge", "handoff", "terminal"]) and any(
-            marker in path_lower for marker in ["bridge.py", "handoff.py", "test_bridge.py", "test_handoff.py"]
-        ):
-            score += 6
-        if any(marker in task_lower for marker in ["memory", "history", "persist", "cross-run"]) and any(
-            marker in path_lower for marker in ["memory.py", "test_memory.py", "prompts.py"]
-        ):
-            score += 6
-        if any(
-            marker in task_lower
-            for marker in [
-                "learned-note",
-                "learned note",
-                "improvement note",
-                "self-improvement",
-                "self improvement",
-                "decay",
-                "prune",
-                "pruning",
-                "stale lesson",
-                "stale note",
-            ]
-        ):
-            if path_lower.endswith("teamai/memory.py"):
-                score += 10
-            elif path_lower.endswith("tests/test_memory.py"):
-                score += 8
-            elif any(
-                marker in path_lower
-                for marker in ["prompts.py", "handoff.py", "bridge.py", "supervisor.py"]
-            ):
-                score += 4
-        if any(marker in task_lower for marker in ["stream", "streaming", "event output", "progress output"]) and any(
-            marker in path_lower for marker in ["cli.py", "api.py", "jobs.py", "schemas.py", "supervisor.py"]
-        ):
-            score += 6
-        if any(marker in task_lower for marker in ["approval", "patch", "write path", "workspace_write", "deterministic"]) and any(
-            marker in path_lower for marker in ["tools.py", "approvals.py", "supervisor.py", "test_tools.py", "test_approvals.py", "test_supervisor.py"]
-        ):
-            score += 6
-        if any(marker in task_lower for marker in ["json", "planner", "verifier", "prompt", "structured output"]) and any(
-            marker in path_lower for marker in ["prompts.py", "schemas.py", "supervisor.py", "test_supervisor.py"]
-        ):
-            score += 5
-        return score
+        return self._answer_synthesizer.rank_codex_handoff_paths(task=task, paths=paths)
 
     def _build_local_drift_handoff_answer(
         self,
@@ -5103,91 +3583,13 @@ class ClosedLoopSupervisor:
         workspace: Path,
         reroute_reason: str,
     ) -> str:
-        synthesized = self._maybe_synthesize_codex_handoff_answer(
+        return self._answer_synthesizer.build_local_drift_handoff_answer(
             task=task,
             rounds=rounds,
             workspace=workspace,
-            task_route="codex_handoff",
+            reroute_reason=reroute_reason,
+            task_relevant_candidates=self._task_relevant_candidates(task, workspace),
         )
-        if synthesized:
-            return synthesized.replace(
-                "Current state: The local run treated this as a broad coding task and gathered reconnaissance instead of attempting autonomous implementation.",
-                "Current state: The local run started locally, gathered partial evidence, and then rerouted after it started drifting beyond the reliable local path.",
-            )
-
-        relevant_paths = self._task_relevant_candidates(task, workspace)
-        lines = [
-            "Current state: The local run started locally but rerouted after it stopped making reliable scoped progress.",
-            "",
-            "Next engineering tasks:",
-            f"- {reroute_reason}",
-        ]
-        if relevant_paths:
-            lines.append(f"- Inspect the most relevant paths first: {', '.join(relevant_paths[:4])}.")
-        lines.append(f"- Continue the requested change in Codex after verifying the scoped plan for: {task}")
-        return "\n".join(lines)
-
-    def _implemented_feature_flags(
-        self,
-        workspace: Path,
-        contents: dict[str, str],
-    ) -> dict[str, bool]:
-        return {
-            "persistent_memory": (
-                self._workspace_text_contains(
-                    workspace,
-                    contents,
-                    "teamai/memory.py",
-                    ["WorkspaceMemoryStore", "RUN_HISTORY_FILE_NAME", "MEMORY_FILE_NAME"],
-                )
-                and self._workspace_text_contains(
-                    workspace,
-                    contents,
-                    "teamai/supervisor.py",
-                    ["WorkspaceMemoryStore", "load_snapshot", "persist_run"],
-                )
-                and self._workspace_text_contains(
-                    workspace,
-                    contents,
-                    "teamai/prompts.py",
-                    ["Persistent workspace memory:", "Recent persisted runs:"],
-                )
-            ),
-        }
-
-    def _collect_read_file_outputs(
-        self,
-        rounds: list[RoundRecord],
-        workspace: Path,
-    ) -> dict[str, str]:
-        outputs: dict[str, str] = {}
-        for record in rounds:
-            for action, result in zip(record.planner.actions, record.tool_results):
-                if action.tool != "read_file" or not result.success:
-                    continue
-                path = self._normalize_path_arg(action.args.get("path", "."), workspace)
-                outputs[path] = result.output
-        return outputs
-
-    @staticmethod
-    def _workspace_text_contains(
-        workspace: Path,
-        contents: dict[str, str],
-        path: str,
-        needles: list[str],
-    ) -> bool:
-        text = contents.get(path)
-        if text is not None and all(needle in text for needle in needles):
-            return True
-
-        candidate = workspace / path
-        if not candidate.exists() or not candidate.is_file():
-            return False
-        try:
-            file_text = candidate.read_text(encoding="utf-8")
-        except Exception:
-            return False
-        return all(needle in file_text for needle in needles)
 
     @staticmethod
     def _extract_candidate_paths(text: str) -> list[str]:
@@ -5287,6 +3689,7 @@ class ClosedLoopSupervisor:
         if ": " in candidate:
             return False
         return True
+
     def _log_telemetry(self, rounds: list[RoundRecord], task_route: str) -> None:
         if os.getenv("TEAMAI_TELEMETRY") != "1":
             return

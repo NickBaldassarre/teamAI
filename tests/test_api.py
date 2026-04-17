@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -52,6 +54,13 @@ class APIStreamingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp_dir.name)
+        self.tool_api_token = "test-token"
+        self.tool_api_env = patch.dict(
+            os.environ,
+            {"TEAMAI_TOOL_API_TOKEN": self.tool_api_token},
+            clear=False,
+        )
+        self.tool_api_env.start()
         self.settings = Settings(
             model_id="dummy",
             model_revision=None,
@@ -76,6 +85,7 @@ class APIStreamingTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.client.close()
+        self.tool_api_env.stop()
         self.temp_dir.cleanup()
 
     def test_run_stream_endpoint_emits_events_and_final_result(self) -> None:
@@ -119,6 +129,69 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(stream_response.status_code, 200)
         self.assertIn("event: run_event", stream_response.text)
         self.assertIn('"kind": "job_completed"', stream_response.text)
+
+    def test_tool_catalogue_and_execute_endpoint_require_bearer_token(self) -> None:
+        (self.workspace / "README.md").write_text("# demo\n", encoding="utf-8")
+
+        unauthorized = self.client.get("/v1/tools")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        headers = {"Authorization": f"Bearer {self.tool_api_token}"}
+        catalogue = self.client.get("/v1/tools", headers=headers)
+        self.assertEqual(catalogue.status_code, 200)
+        tool_names = [tool["name"] for tool in catalogue.json()["tools"]]
+        self.assertIn("list_files", tool_names)
+        self.assertIn("spawn_agent", tool_names)
+
+        execute = self.client.post(
+            "/v1/tools/execute",
+            headers=headers,
+            json={
+                "task_id": "task-demo",
+                "execution_mode": "read_only",
+                "tool_action": {
+                    "tool": "list_files",
+                    "reason": "Inspect the workspace root.",
+                    "args": {"path": ".", "max_entries": 20},
+                },
+            },
+        )
+        self.assertEqual(execute.status_code, 200)
+        result = execute.json()["result"]
+        self.assertTrue(result["success"])
+        self.assertIn("README.md", result["output"])
+
+    def test_conversation_endpoints_store_and_summarize_turns(self) -> None:
+        post_response = self.client.post(
+            "/v1/conversation/task-demo/post",
+            json={
+                "agent_id": "planner",
+                "role": "observation",
+                "content": "Found the highest-signal runtime files.",
+                "metadata": {"round": 1},
+            },
+        )
+        self.assertEqual(post_response.status_code, 200)
+        created = post_response.json()
+        self.assertEqual(created["task_id"], "task-demo")
+        self.assertEqual(created["agent_id"], "planner")
+
+        turns_response = self.client.get("/v1/conversation/task-demo")
+        self.assertEqual(turns_response.status_code, 200)
+        turns = turns_response.json()
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["content"], "Found the highest-signal runtime files.")
+
+        summary_response = self.client.get("/v1/conversation/task-demo/summary")
+        self.assertEqual(summary_response.status_code, 200)
+        summary = summary_response.json()
+        self.assertEqual(summary["task_id"], "task-demo")
+        self.assertEqual(summary["turn_count"], 1)
+        self.assertEqual(summary["agents"], ["planner"])
+
+        list_response = self.client.get("/v1/conversations")
+        self.assertEqual(list_response.status_code, 200)
+        self.assertIn("task-demo", list_response.json())
 
 
 if __name__ == "__main__":

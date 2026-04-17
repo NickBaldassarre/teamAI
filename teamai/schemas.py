@@ -358,7 +358,7 @@ class TeamPlan(BaseModel):
     team_id: str
     goal: str
     tasks: list[SpawnedTaskRecord] = Field(default_factory=list)
-    status: Literal["planning", "executing", "synthesizing", "completed", "failed"] = "planning"
+    status: Literal["planning", "executing", "synthesizing", "completed", "partially_completed", "failed"] = "planning"
     synthesis: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None

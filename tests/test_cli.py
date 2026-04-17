@@ -191,6 +191,47 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertIn("autopilot", payload)
             self.assertEqual(payload["autopilot"]["status"], "completed")
 
+    def test_dashboard_command_starts_service_without_opening_browser_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            settings = Settings(
+                model_id="dummy",
+                model_revision=None,
+                force_download=False,
+                trust_remote_code=False,
+                enable_thinking=False,
+                workspace_root=workspace,
+                max_rounds=2,
+                max_actions_per_round=2,
+                max_tokens_per_turn=64,
+                temperature=0.3,
+                allow_shell=False,
+                allow_writes=False,
+                command_timeout_seconds=5,
+                max_file_bytes=10_000,
+                max_command_output_chars=10_000,
+                host="127.0.0.1",
+                port=8123,
+            )
+
+            stderr = io.StringIO()
+            with patch("teamai.config.Settings.from_env", return_value=settings), patch(
+                "teamai.api.create_app",
+                return_value="app",
+            ) as create_app, patch("uvicorn.run") as uvicorn_run, patch(
+                "teamai.cli._schedule_dashboard_open"
+            ) as schedule_open, patch(
+                "sys.argv",
+                ["teamai", "dashboard", "--no-open-browser"],
+            ), redirect_stderr(stderr):
+                exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            create_app.assert_called_once_with(settings)
+            uvicorn_run.assert_called_once_with("app", host="127.0.0.1", port=8123, reload=False)
+            schedule_open.assert_not_called()
+            self.assertIn("http://127.0.0.1:8123/dashboard", stderr.getvalue())
+
     def test_run_autopilot_workflow_completes_after_verified_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

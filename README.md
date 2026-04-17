@@ -47,6 +47,8 @@ The implementation is tuned for:
     - patch approval write tools
 - `teamai/api.py`
   - FastAPI app with run, job, schedule, team, tool, and conversation endpoints
+- `teamai/dashboard.py`
+  - built-in browser control dashboard for runs, jobs, schedules, team plans, and conversations
 - `teamai/tool_api.py`
   - sandboxed workspace tool router for remote or callback-style execution
 - `teamai/conversation.py`
@@ -362,9 +364,25 @@ Other CLI entry points:
 teamai serve
 ```
 
+Open the browser control room directly:
+
+```bash
+teamai dashboard
+```
+
+That command starts the same local FastAPI service and opens `http://127.0.0.1:8000/dashboard` by default, giving you an OpenClaw-style control surface for:
+
+- queueing new runs
+- watching recent jobs and event trails
+- checking recurring schedules
+- inspecting multi-agent team plans
+- browsing the inter-agent conversation inbox
+
 Then call:
 
+- `GET /dashboard`
 - `GET /healthz`
+- `GET /v1/dashboard/summary`
 - `POST /v1/run`
 - `POST /v1/run/stream`
 - `POST /v1/jobs`

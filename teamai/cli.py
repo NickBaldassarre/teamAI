@@ -190,6 +190,19 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--reload", action="store_true")
 
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Run the local service and open the browser control dashboard.",
+    )
+    dashboard_parser.add_argument("--host", default=None)
+    dashboard_parser.add_argument("--port", type=int, default=None)
+    dashboard_parser.add_argument("--reload", action="store_true")
+    dashboard_parser.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help="Start the dashboard server without launching a browser tab.",
+    )
+
     bridge_launch_parser = subparsers.add_parser(
         "bridge-launch",
         help="Launch a local Terminal.app run that writes a Codex handoff artifact.",
@@ -760,6 +773,30 @@ def main() -> int:
         )
         return 0
 
+    if args.command == "dashboard":
+        from .api import create_app
+        from .config import Settings
+        import uvicorn
+
+        settings = Settings.from_env()
+        host = args.host or settings.host
+        port = args.port or settings.port
+        dashboard_url = _dashboard_url(host, port)
+        print(
+            f"[teamai] Dashboard available at {dashboard_url}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not args.no_open_browser:
+            _schedule_dashboard_open(dashboard_url)
+        uvicorn.run(
+            create_app(settings),
+            host=host,
+            port=port,
+            reload=args.reload,
+        )
+        return 0
+
     if args.command == "bridge-launch":
         from .bridge import BridgeArtifacts, BridgeLaunchConfig, BridgePreflightError, launch_bridge
         from .runtime import select_runtime_python
@@ -1176,6 +1213,22 @@ def main() -> int:
 def _resolve_cli_path(project_root: Path, raw_path: str) -> Path:
     path = Path(raw_path).expanduser()
     return path if path.is_absolute() else project_root / path
+
+
+def _dashboard_url(host: str, port: int) -> str:
+    browser_host = host.strip() or "127.0.0.1"
+    if browser_host in {"0.0.0.0", "::"}:
+        browser_host = "127.0.0.1"
+    return f"http://{browser_host}:{port}/dashboard"
+
+
+def _schedule_dashboard_open(url: str) -> None:
+    import threading
+    import webbrowser
+
+    timer = threading.Timer(0.8, lambda: webbrowser.open(url))
+    timer.daemon = True
+    timer.start()
 
 
 def _write_cli_output(*, rendered_output: str, output_file: str | None) -> None:

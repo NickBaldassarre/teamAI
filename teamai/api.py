@@ -4,13 +4,15 @@ import json
 import queue
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from .config import ConfigError, Settings
 from .conversation import ConversationChannel
+from .dashboard import render_dashboard_html
 from .events import render_sse_event
 from .jobs import InMemoryJobStore
 from .scheduler import (
@@ -65,6 +67,14 @@ def create_app(
         lifespan=_lifespan,
     )
 
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        return RedirectResponse(url="/dashboard")
+
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(render_dashboard_html())
+
     @app.get("/healthz")
     def healthz() -> dict[str, object]:
         return {
@@ -72,6 +82,62 @@ def create_app(
             "model_id": app_settings.model_id,
             "model_loaded": getattr(supervisor_template, "model_loaded", False),
             "workspace_root": str(app_settings.workspace_root),
+        }
+
+    @app.get("/v1/dashboard/summary")
+    def dashboard_summary(limit: int = 8) -> dict[str, object]:
+        job_limit = max(1, min(limit, 25))
+        recent_jobs = [job.model_dump(mode="json") for job in job_store.list_recent(limit=job_limit)]
+        schedules = [entry.to_dict() for entry in load_schedules()]
+        team_items = [
+            {
+                "team_id": plan.team_id,
+                "goal": plan.goal,
+                "status": plan.status,
+                "task_count": len(plan.tasks),
+                "completed_tasks": sum(1 for task in plan.tasks if task.status == "completed"),
+                "created_at": plan.created_at.isoformat(),
+                "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,
+            }
+            for plan in sorted(
+                _team_store.values(),
+                key=lambda item: item.created_at,
+                reverse=True,
+            )[:job_limit]
+        ]
+        conversation_ids = conversation.list_conversations()
+        conversation_items = [
+            conversation.summary(task_id)
+            for task_id in sorted(
+                conversation_ids,
+                key=lambda task_id: conversation.summary(task_id).get("latest_timestamp") or "",
+                reverse=True,
+            )[:job_limit]
+        ]
+        return {
+            "health": {
+                "status": "ok",
+                "model_id": app_settings.model_id,
+                "model_loaded": getattr(supervisor_template, "model_loaded", False),
+                "workspace_root": str(app_settings.workspace_root),
+                "server_time": datetime.now(timezone.utc).isoformat(),
+            },
+            "jobs": {
+                "counts": job_store.status_counts(),
+                "recent": recent_jobs,
+            },
+            "schedules": {
+                "count": len(schedules),
+                "items": schedules[:job_limit],
+            },
+            "teams": {
+                "count": len(_team_store),
+                "items": team_items,
+            },
+            "conversations": {
+                "count": len(conversation_ids),
+                "items": conversation_items,
+            },
         }
 
     @app.post("/v1/run", response_model=RunResult)

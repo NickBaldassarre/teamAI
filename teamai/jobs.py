@@ -107,6 +107,28 @@ class InMemoryJobStore:
         with self._lock:
             return self._to_response(self._records[job_id])
 
+    def list_recent(self, *, limit: int = 10) -> list[JobResponse]:
+        with self._lock:
+            records = sorted(
+                self._records.values(),
+                key=lambda record: record.created_at,
+                reverse=True,
+            )
+            return [self._to_response(record) for record in records[:limit]]
+
+    def status_counts(self) -> dict[str, int]:
+        with self._lock:
+            counts = {
+                "queued": 0,
+                "running": 0,
+                "completed": 0,
+                "failed": 0,
+            }
+            for record in self._records.values():
+                if record.status in counts:
+                    counts[record.status] += 1
+            return counts
+
     def append_event(self, job_id: str, event: RunEvent) -> None:
         with self._condition:
             record = self._records[job_id]

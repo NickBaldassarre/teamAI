@@ -226,6 +226,45 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(list_response.status_code, 200)
         self.assertIn("task-demo", list_response.json())
 
+    def test_dashboard_endpoints_render_control_surface_and_summary(self) -> None:
+        dashboard_response = self.client.get("/dashboard")
+        self.assertEqual(dashboard_response.status_code, 200)
+        self.assertIn("teamAI Control", dashboard_response.text)
+
+        self.client.post(
+            "/v1/conversation/task-dashboard/post",
+            json={
+                "agent_id": "planner",
+                "role": "status_update",
+                "content": "Dashboard inbox seeded.",
+            },
+        )
+        create_response = self.client.post(
+            "/v1/jobs",
+            json={"task": "Inspect repo.", "workspace_path": ".", "execution_mode": "read_only"},
+        )
+        self.assertEqual(create_response.status_code, 200)
+        job_id = create_response.json()["job_id"]
+
+        for _ in range(50):
+            job_response = self.client.get(f"/v1/jobs/{job_id}")
+            if job_response.json()["status"] == "completed":
+                break
+            time.sleep(0.01)
+        else:  # pragma: no cover - defensive timeout
+            self.fail("job did not complete in time")
+
+        with patch("teamai.api.load_schedules", return_value=[]):
+            summary_response = self.client.get("/v1/dashboard/summary")
+
+        self.assertEqual(summary_response.status_code, 200)
+        payload = summary_response.json()
+        self.assertEqual(payload["health"]["status"], "ok")
+        self.assertGreaterEqual(payload["jobs"]["counts"]["completed"], 1)
+        self.assertTrue(any(item["job_id"] == job_id for item in payload["jobs"]["recent"]))
+        self.assertEqual(payload["conversations"]["count"], 1)
+        self.assertEqual(payload["conversations"]["items"][0]["task_id"], "task-dashboard")
+
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()
         template = _TemplateSupervisor()

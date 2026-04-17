@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 from contextlib import asynccontextmanager
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -24,14 +25,24 @@ from .supervisor import ClosedLoopSupervisor
 from .tool_api import create_tool_router
 
 
+def _build_supervisor_factory(
+    settings: Settings,
+    supervisor: Any | None,
+) -> tuple[Callable[[], Any], Any]:
+    template = supervisor or ClosedLoopSupervisor(settings)
+    if hasattr(template, "isolated_copy"):
+        return lambda: template.isolated_copy(), template
+    return lambda: template, template
+
+
 def create_app(
     settings: Settings | None = None,
     *,
-    supervisor: ClosedLoopSupervisor | None = None,
+    supervisor: Any | None = None,
     jobs: InMemoryJobStore | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings.from_env()
-    app_supervisor = supervisor or ClosedLoopSupervisor(app_settings)
+    build_supervisor, supervisor_template = _build_supervisor_factory(app_settings, supervisor)
     job_store = jobs or InMemoryJobStore()
 
     # Scheduler is created here so the lifespan can reference it, but
@@ -59,14 +70,14 @@ def create_app(
         return {
             "status": "ok",
             "model_id": app_settings.model_id,
-            "model_loaded": app_supervisor.model_loaded,
+            "model_loaded": getattr(supervisor_template, "model_loaded", False),
             "workspace_root": str(app_settings.workspace_root),
         }
 
     @app.post("/v1/run", response_model=RunResult)
     def run_once(request: RunRequest) -> RunResult:
         try:
-            return app_supervisor.run(request)
+            return build_supervisor().run(request)
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -76,7 +87,7 @@ def create_app(
 
         def _worker() -> None:
             try:
-                result = app_supervisor.run(
+                result = build_supervisor().run(
                     request,
                     event_callback=lambda event: event_queue.put(("run_event", event.model_dump(mode="json"))),
                 )
@@ -107,7 +118,7 @@ def create_app(
         def _worker() -> None:
             job_store.mark_running(record.job_id)
             try:
-                result = app_supervisor.run(
+                result = build_supervisor().run(
                     request,
                     event_callback=lambda event: job_store.append_event(record.job_id, event),
                 )
@@ -173,7 +184,7 @@ def create_app(
         def _worker() -> None:
             job_store.mark_running(record.job_id)
             try:
-                result = app_supervisor.run(
+                result = build_supervisor().run(
                     request,
                     event_callback=lambda event: job_store.append_event(record.job_id, event),
                 )
@@ -239,7 +250,7 @@ def create_app(
 
         team = AgentTeam(
             settings=app_settings,
-            supervisor=app_supervisor,
+            supervisor_factory=build_supervisor,
         )
         plan = team.decompose(
             str(goal),

@@ -162,6 +162,13 @@ def stop_daemon() -> dict[str, Any]:
         if not _pid_is_alive(pid):
             break
 
+    if _pid_is_alive(pid):
+        return {
+            "status": "stop_timeout",
+            "pid": pid,
+            "pid_file": str(pid_file),
+        }
+
     pid_file.unlink(missing_ok=True)
     return {"status": "stopped", "pid": pid}
 
@@ -313,8 +320,15 @@ def _build_plist(
 
     # Inherit API keys from current environment so the daemon can reach
     # cloud bridges after reboot without manual re-export.
-    for key in ("OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY",
-                "GEMINI_API_KEY", "PATH"):
+    for key in (
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "XAI_API_KEY",
+        "GROK_API_KEY",
+        "PATH",
+    ):
         val = os.environ.get(key, "").strip()
         if val:
             env_vars[key] = val

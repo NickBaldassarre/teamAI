@@ -50,6 +50,39 @@ class _FakeSupervisor:
         )
 
 
+class _TemplateSupervisor:
+    def __init__(self) -> None:
+        self.model_loaded = False
+        self.clone_count = 0
+
+    def isolated_copy(self):  # noqa: ANN202
+        self.clone_count += 1
+        return _IsolatedSupervisor(self.clone_count)
+
+    def run(self, request, progress_callback=None, event_callback=None):  # noqa: ANN001
+        raise AssertionError("template supervisor should not execute runs directly")
+
+
+class _IsolatedSupervisor:
+    def __init__(self, clone_id: int) -> None:
+        self._clone_id = clone_id
+        self.model_loaded = False
+
+    def run(self, request, progress_callback=None, event_callback=None):  # noqa: ANN001
+        return RunResult(
+            status="completed",
+            model_id=f"child-{self._clone_id}",
+            workspace="/tmp/demo",
+            execution_mode=request.execution_mode,
+            stop_reason="verifier_declared_complete",
+            final_answer=f"child-{self._clone_id}",
+            transcript="demo transcript",
+            warnings=[],
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+
+
 class APIStreamingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -192,6 +225,26 @@ class APIStreamingTest(unittest.TestCase):
         list_response = self.client.get("/v1/conversations")
         self.assertEqual(list_response.status_code, 200)
         self.assertIn("task-demo", list_response.json())
+
+    def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
+        self.client.close()
+        template = _TemplateSupervisor()
+        self.client = TestClient(create_app(self.settings, supervisor=template, jobs=self.jobs))
+
+        first = self.client.post(
+            "/v1/run",
+            json={"task": "Inspect repo.", "workspace_path": ".", "execution_mode": "read_only"},
+        )
+        second = self.client.post(
+            "/v1/run",
+            json={"task": "Inspect repo again.", "workspace_path": ".", "execution_mode": "read_only"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["final_answer"], "child-1")
+        self.assertEqual(second.json()["final_answer"], "child-2")
+        self.assertEqual(template.clone_count, 2)
 
 
 if __name__ == "__main__":

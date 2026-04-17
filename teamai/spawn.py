@@ -99,10 +99,12 @@ class AgentSpawner:
         *,
         settings: Any | None = None,
         supervisor: Any | None = None,
+        supervisor_factory: Callable[[], Any] | None = None,
         event_callback: Callable | None = None,
     ) -> None:
         self._settings = settings
         self._supervisor = supervisor
+        self._supervisor_factory = supervisor_factory
         self._event_callback = event_callback
         self._lock = threading.Lock()
         self._results: dict[str, RunResult | None] = {}
@@ -110,12 +112,20 @@ class AgentSpawner:
         self._events: dict[str, threading.Event] = {}
 
     def _get_supervisor(self) -> Any:
+        if self._supervisor_factory is not None:
+            return self._supervisor_factory()
         if self._supervisor is not None:
+            if hasattr(self._supervisor, "isolated_copy"):
+                return self._supervisor.isolated_copy()
             return self._supervisor
         from .config import Settings
         from .supervisor import ClosedLoopSupervisor
-        settings = self._settings or Settings.from_env()
-        self._supervisor = ClosedLoopSupervisor(settings)
+        with self._lock:
+            if self._supervisor is None:
+                settings = self._settings or Settings.from_env()
+                self._supervisor = ClosedLoopSupervisor(settings)
+        if hasattr(self._supervisor, "isolated_copy"):
+            return self._supervisor.isolated_copy()
         return self._supervisor
 
     # ---- synchronous spawn ----
@@ -236,12 +246,14 @@ class AgentTeam:
         *,
         settings: Any | None = None,
         supervisor: Any | None = None,
+        supervisor_factory: Callable[[], Any] | None = None,
         progress_callback: Callable[[str], None] | None = None,
         max_tasks: int = MAX_TEAM_TASKS,
         max_workers: int = _TEAM_WORKER_THREADS,
     ) -> None:
         self._settings = settings
         self._supervisor = supervisor
+        self._supervisor_factory = supervisor_factory
         self._progress = progress_callback or (lambda msg: None)
         self._max_tasks = max_tasks
         self._max_workers = max_workers
@@ -264,17 +276,24 @@ class AgentTeam:
         return self._settings
 
     def _get_supervisor(self) -> Any:
+        if self._supervisor_factory is not None:
+            return self._supervisor_factory()
         if self._supervisor is not None:
+            if hasattr(self._supervisor, "isolated_copy"):
+                return self._supervisor.isolated_copy()
             return self._supervisor
         from .supervisor import ClosedLoopSupervisor
-        self._supervisor = ClosedLoopSupervisor(self._get_settings())
+        if self._supervisor is None:
+            self._supervisor = ClosedLoopSupervisor(self._get_settings())
+        if hasattr(self._supervisor, "isolated_copy"):
+            return self._supervisor.isolated_copy()
         return self._supervisor
 
     def _get_spawner(self) -> AgentSpawner:
         if self._spawner is None:
             self._spawner = AgentSpawner(
                 settings=self._get_settings(),
-                supervisor=self._get_supervisor(),
+                supervisor_factory=self._get_supervisor,
             )
         return self._spawner
 
@@ -322,16 +341,15 @@ class AgentTeam:
         subtasks_json = self._call_model_for_decomposition(goal, workspace_path)
         if subtasks_json is None:
             # Model couldn't decompose — create a single-task plan
-            plan.tasks = [
-                SpawnedTaskRecord(
-                    spawn_id="t1",
-                    task=goal,
-                    execution_mode="read_only",
-                ),
-            ]
+            plan.tasks = self._single_task_records(goal)
             self._progress("Could not decompose; running as single task.")
         else:
-            plan.tasks = self._parse_decomposition(subtasks_json, team_id)
+            parsed_tasks = self._parse_decomposition(subtasks_json, team_id)
+            if not parsed_tasks:
+                plan.tasks = self._single_task_records(goal)
+                self._progress("Decomposition produced no runnable subtasks; running as single task.")
+            else:
+                plan.tasks = parsed_tasks
             task_count = len(plan.tasks)
             parallel = sum(1 for t in plan.tasks if not t.depends_on)
             self._progress(
@@ -366,6 +384,16 @@ class AgentTeam:
         except Exception:
             logger.exception("Decomposition model call failed")
             return None
+
+    @staticmethod
+    def _single_task_records(goal: str) -> list[SpawnedTaskRecord]:
+        return [
+            SpawnedTaskRecord(
+                spawn_id="t1",
+                task=goal,
+                execution_mode="read_only",
+            ),
+        ]
 
     def _parse_decomposition(
         self,

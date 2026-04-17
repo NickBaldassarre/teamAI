@@ -121,6 +121,13 @@ class ClosedLoopSupervisor:
     def model_loaded(self) -> bool:
         return self._backend.model_loaded
 
+    def isolated_copy(self) -> "ClosedLoopSupervisor":
+        """Return a fresh supervisor that shares loaded backends, not run state."""
+        clone = ClosedLoopSupervisor(self._settings, backend=self._backend)
+        clone._backend_by_model = dict(self._backend_by_model)
+        clone._backend = clone._backend_by_model.get(self._settings.model_id, clone._backend)
+        return clone
+
     def generate_raw(
         self,
         *,

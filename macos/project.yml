@@ -1,0 +1,49 @@
+name: TeamAI
+options:
+  bundleIdPrefix: com.teamai
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    PRODUCT_NAME: TeamAI
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+
+targets:
+  TeamAI:
+    type: application
+    platform: macOS
+    sources:
+      - path: TeamAI
+    info:
+      path: TeamAI/Info.plist
+      properties:
+        LSUIElement: true
+        CFBundleName: TeamAI
+        CFBundleDisplayName: TeamAI
+        CFBundleIdentifier: com.teamai.app
+        CFBundleExecutable: TeamAI
+        CFBundleDevelopmentRegion: en
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        NSHumanReadableCopyright: "© 2026 teamAI"
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        LSMinimumSystemVersion: "13.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.teamai.app
+        CODE_SIGN_ENTITLEMENTS: TeamAI/TeamAI.entitlements
+        INFOPLIST_FILE: TeamAI/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_EMIT_LOC_STRINGS: NO

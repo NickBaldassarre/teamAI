@@ -10,6 +10,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
+from .approvals import PatchApprovalStore
 from .config import ConfigError, Settings
 from .conversation import ConversationChannel
 from .dashboard import render_dashboard_html
@@ -114,6 +115,7 @@ def create_app(
                 reverse=True,
             )[:job_limit]
         ]
+        pending_approvals = _list_pending_approvals(limit=job_limit)
         return {
             "health": {
                 "status": "ok",
@@ -121,6 +123,11 @@ def create_app(
                 "model_loaded": getattr(supervisor_template, "model_loaded", False),
                 "workspace_root": str(app_settings.workspace_root),
                 "server_time": datetime.now(timezone.utc).isoformat(),
+            },
+            "safety": {
+                "allow_writes": bool(app_settings.allow_writes),
+                "allow_shell": bool(app_settings.allow_shell),
+                "posture": "writes_enabled" if app_settings.allow_writes else "read_only",
             },
             "jobs": {
                 "counts": job_store.status_counts(),
@@ -137,6 +144,10 @@ def create_app(
             "conversations": {
                 "count": len(conversation_ids),
                 "items": conversation_items,
+            },
+            "approvals": {
+                "count": len(pending_approvals),
+                "items": pending_approvals,
             },
         }
 
@@ -357,6 +368,16 @@ def create_app(
     workspace = app_settings.resolve_workspace(None)
     tool_router = create_tool_router(settings=app_settings, workspace=workspace)
     app.include_router(tool_router)
+
+    approval_store = PatchApprovalStore()
+
+    def _list_pending_approvals(*, limit: int) -> list[dict[str, object]]:
+        try:
+            records = approval_store.list(workspace=workspace, include_all=False)
+        except Exception:  # pragma: no cover - defensive: corrupt approval files
+            return []
+        summaries = [approval_store.summarize(record) for record in records[:limit]]
+        return summaries
 
     # ------------------------------------------------------------- conversation
     conversation = ConversationChannel(workspace)

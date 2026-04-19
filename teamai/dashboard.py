@@ -7,7 +7,7 @@ def render_dashboard_html() -> str:
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>teamAI Control</title>
+    <title>teamAI Console</title>
     <style>
       :root {
         --bg: #0f1720;
@@ -457,21 +457,22 @@ def render_dashboard_html() -> str:
   <body>
     <main class="shell">
       <section class="hero">
-        <div class="eyebrow">teamAI gateway control</div>
-        <h1>Turn the loop into a control room.</h1>
+        <div class="eyebrow">teamAI workspace console</div>
+        <h1>Run your local agent system from one place.</h1>
         <p>
-          OpenClaw feels like a product because it gives you a place to drive the agent:
-          health, runs, schedules, teams, and conversations in one browser surface. This
-          dashboard gives teamAI that same immediate, operator-friendly entry point.
+          teamAI Console brings runtime health, task execution, automation, team plans,
+          and agent conversations into a single workspace surface so you can launch work,
+          monitor progress, and steer the system without bouncing between raw endpoints.
         </p>
         <div class="hero-meta" id="hero-meta">
           <span class="pill mono" id="hero-model">Loading model...</span>
           <span class="pill mono" id="hero-workspace">Loading workspace...</span>
           <span class="status" id="hero-status" data-tone="warn">Connecting...</span>
+          <span class="status" id="hero-writes" data-tone="ok" title="Write safety posture from TEAMAI_ALLOW_WRITES">writes: read-only</span>
         </div>
         <div class="tiles">
           <div class="tile">
-            <div class="tile-label">Recent Jobs</div>
+            <div class="tile-label">Recent Runs</div>
             <div class="tile-value" id="stat-jobs">0</div>
           </div>
           <div class="tile">
@@ -479,12 +480,12 @@ def render_dashboard_html() -> str:
             <div class="tile-value" id="stat-running">0</div>
           </div>
           <div class="tile">
-            <div class="tile-label">Schedules</div>
-            <div class="tile-value" id="stat-schedules">0</div>
+            <div class="tile-label">Pending Approvals</div>
+            <div class="tile-value" id="stat-approvals">0</div>
           </div>
           <div class="tile">
-            <div class="tile-label">Conversations</div>
-            <div class="tile-value" id="stat-conversations">0</div>
+            <div class="tile-label">Automation</div>
+            <div class="tile-value" id="stat-schedules">0</div>
           </div>
         </div>
       </section>
@@ -494,8 +495,8 @@ def render_dashboard_html() -> str:
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Launch A Run</h2>
-                <div class="panel-copy">Queue a task without leaving the browser.</div>
+                <h2>New Run</h2>
+                <div class="panel-copy">Submit a task directly from the dashboard.</div>
               </div>
               <button class="button secondary" id="refresh-button" type="button">Refresh</button>
             </div>
@@ -528,35 +529,35 @@ def render_dashboard_html() -> str:
                 </label>
               </div>
               <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                <button type="submit">Queue Job</button>
-                <span class="muted">Runs are submitted to the existing background job API.</span>
+                <button type="submit">Start Run</button>
+                <span class="muted">Runs are queued through the local background job service.</span>
               </div>
             </form>
-            <div class="banner" id="submit-banner">Waiting for your next task.</div>
+            <div class="banner" id="submit-banner">Ready for the next task.</div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Recent Jobs</h2>
-                <div class="panel-copy">Select a run to inspect its live event trail.</div>
+                <h2>Recent Runs</h2>
+                <div class="panel-copy">Select a run to inspect its execution timeline.</div>
               </div>
             </div>
             <div class="list" id="jobs-list">
-              <div class="empty">No jobs yet.</div>
+              <div class="empty">No runs yet.</div>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Job Activity</h2>
-                <div class="panel-copy">Event stream for the selected run.</div>
+                <h2>Run Activity</h2>
+                <div class="panel-copy">Execution events for the selected run.</div>
               </div>
-              <div class="pill mono" id="selected-job-pill">No job selected</div>
+              <div class="pill mono" id="selected-job-pill">No run selected</div>
             </div>
             <div class="events" id="events-list">
-              <div class="empty">Pick a job to inspect its progress events.</div>
+              <div class="empty">Select a run to inspect its execution events.</div>
             </div>
           </section>
         </div>
@@ -565,32 +566,44 @@ def render_dashboard_html() -> str:
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Schedules</h2>
-                <div class="panel-copy">Recurring prompts currently configured for the gateway.</div>
+                <h2>Pending Approvals</h2>
+                <div class="panel-copy">Proposed patches waiting for human review before any file is written.</div>
               </div>
             </div>
-            <div class="list" id="schedules-list">
-              <div class="empty">No schedules configured.</div>
+            <div class="list" id="approvals-list">
+              <div class="empty">No approvals pending. Patch proposals will appear here for review before any file is written.</div>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Team Runs</h2>
+                <h2>Automation</h2>
+                <div class="panel-copy">Recurring tasks currently configured for this workspace.</div>
+              </div>
+            </div>
+            <div class="list" id="schedules-list">
+              <div class="empty">No automation configured. Add a schedule with `teamai daemon schedule add` or POST /v1/schedules.</div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Team Plans</h2>
                 <div class="panel-copy">Multi-agent plans and current execution state.</div>
               </div>
             </div>
             <div class="list" id="teams-list">
-              <div class="empty">No active team plans.</div>
+              <div class="empty">No active team plans. Start one with `teamai team run` or POST /v1/team.</div>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>Conversation Inbox</h2>
-                <div class="panel-copy">Persistent inter-agent task channels inside the workspace.</div>
+                <h2>Conversations</h2>
+                <div class="panel-copy">Persistent task channels shared across agents in the workspace.</div>
               </div>
             </div>
             <div class="list" id="conversations-list">
@@ -654,12 +667,14 @@ def render_dashboard_html() -> str:
       function renderJobs(items) {
         const container = document.getElementById("jobs-list");
         if (!items.length) {
-          container.innerHTML = '<div class="empty">No jobs yet.</div>';
+          container.innerHTML = '<div class="empty">No runs yet. Submit a task above to see it appear here.</div>';
           return;
         }
         container.innerHTML = items.map((job) => {
           const active = job.job_id === state.selectedJobId;
           const stopReason = job.result?.stop_reason ? `<span class="tag mono">${escapeHtml(job.result.stop_reason)}</span>` : "";
+          const taskRoute = job.result?.task_route ? `<span class="tag mono">${escapeHtml(job.result.task_route)}</span>` : "";
+          const mode = job.request?.execution_mode ? `<span class="tag mono">${escapeHtml(job.request.execution_mode)}</span>` : "";
           return `
             <button
               type="button"
@@ -674,6 +689,8 @@ def render_dashboard_html() -> str:
               </div>
               <div class="meta-row">
                 <span>${formatDate(job.created_at)}</span>
+                ${mode}
+                ${taskRoute}
                 ${stopReason}
               </div>
             </button>
@@ -681,10 +698,40 @@ def render_dashboard_html() -> str:
         }).join("");
       }
 
+      function renderApprovals(items) {
+        const container = document.getElementById("approvals-list");
+        if (!items.length) {
+          container.innerHTML = '<div class="empty">No approvals pending. Patch proposals will appear here for review before any file is written.</div>';
+          return;
+        }
+        container.innerHTML = items.map((item) => {
+          const approvalId = escapeHtml(item.approval_id || "?");
+          const changeCount = Number(item.change_count || 0);
+          const scope = changeCount > 1 ? `${changeCount} files` : item.path || "1 file";
+          const tool = item.source_tool ? `<span class="tag mono">${escapeHtml(item.source_tool)}</span>` : "";
+          const reason = item.reason ? `<div class="meta-row">${escapeHtml(item.reason)}</div>` : "";
+          return `
+            <div class="list-item">
+              <div class="list-title">
+                <strong class="mono">${approvalId}</strong>
+                ${statusMarkup("pending")}
+              </div>
+              <div class="meta-row">
+                <span class="mono">${escapeHtml(String(scope))}</span>
+                ${tool}
+                <span>${formatDate(item.created_at)}</span>
+              </div>
+              ${reason}
+              <div class="meta-row muted">Apply with <span class="mono">teamai approvals apply ${approvalId}</span></div>
+            </div>
+          `;
+        }).join("");
+      }
+
       function renderSchedules(items) {
         const container = document.getElementById("schedules-list");
         if (!items.length) {
-          container.innerHTML = '<div class="empty">No schedules configured.</div>';
+          container.innerHTML = '<div class="empty">No automation configured. Add a schedule with <span class="mono">teamai daemon schedule add</span> or POST /v1/schedules.</div>';
           return;
         }
         container.innerHTML = items.map((item) => `
@@ -705,7 +752,7 @@ def render_dashboard_html() -> str:
       function renderTeams(items) {
         const container = document.getElementById("teams-list");
         if (!items.length) {
-          container.innerHTML = '<div class="empty">No active team plans.</div>';
+          container.innerHTML = '<div class="empty">No active team plans. Start one with <span class="mono">teamai team run</span> or POST /v1/team.</div>';
           return;
         }
         container.innerHTML = items.map((item) => `
@@ -745,8 +792,8 @@ def render_dashboard_html() -> str:
 
       async function loadJobEvents(jobId) {
         if (!jobId) {
-          document.getElementById("selected-job-pill").textContent = "No job selected";
-          document.getElementById("events-list").innerHTML = '<div class="empty">Pick a job to inspect its progress events.</div>';
+          document.getElementById("selected-job-pill").textContent = "No run selected";
+          document.getElementById("events-list").innerHTML = '<div class="empty">Select a run to inspect its execution events.</div>';
           return;
         }
         state.loadingEventsFor = jobId;
@@ -758,7 +805,7 @@ def render_dashboard_html() -> str:
           }
           const container = document.getElementById("events-list");
           if (!items.length) {
-            container.innerHTML = '<div class="empty">No events recorded for this job yet.</div>';
+            container.innerHTML = '<div class="empty">No events recorded for this run yet.</div>';
             return;
           }
           container.innerHTML = items.slice(-12).reverse().map((event) => `
@@ -776,10 +823,12 @@ def render_dashboard_html() -> str:
         try {
           const payload = await fetchJson("/v1/dashboard/summary?limit=8");
           const health = payload.health || {};
+          const safety = payload.safety || {};
           const jobs = payload.jobs || { recent: [], counts: {} };
           const schedules = payload.schedules || { items: [] };
           const teams = payload.teams || { items: [] };
           const conversations = payload.conversations || { items: [] };
+          const approvals = payload.approvals || { items: [], count: 0 };
 
           document.getElementById("hero-model").textContent = health.model_id || "Unknown model";
           document.getElementById("hero-workspace").textContent = health.workspace_root || "Unknown workspace";
@@ -787,16 +836,25 @@ def render_dashboard_html() -> str:
           statusElement.textContent = health.status || "unknown";
           statusElement.dataset.tone = statusTone(health.status);
 
+          const writesElement = document.getElementById("hero-writes");
+          const writesEnabled = Boolean(safety.allow_writes);
+          writesElement.textContent = writesEnabled ? "writes: enabled" : "writes: read-only";
+          writesElement.dataset.tone = writesEnabled ? "warn" : "ok";
+          writesElement.title = writesEnabled
+            ? "TEAMAI_ALLOW_WRITES=true — approved patches can be applied to the workspace."
+            : "TEAMAI_ALLOW_WRITES=false — runs stay read-only. Set it true to enable approved writes.";
+
           document.getElementById("stat-jobs").textContent = String((jobs.recent || []).length);
           document.getElementById("stat-running").textContent = String((jobs.counts || {}).running || 0);
           document.getElementById("stat-schedules").textContent = String((schedules.items || []).length);
-          document.getElementById("stat-conversations").textContent = String((conversations.items || []).length);
+          document.getElementById("stat-approvals").textContent = String(approvals.count || (approvals.items || []).length || 0);
 
           if (!state.selectedJobId && (jobs.recent || []).length) {
             state.selectedJobId = jobs.recent[0].job_id;
           }
 
           renderJobs(jobs.recent || []);
+          renderApprovals(approvals.items || []);
           renderSchedules(schedules.items || []);
           renderTeams(teams.items || []);
           renderConversations(conversations.items || []);
@@ -837,7 +895,7 @@ def render_dashboard_html() -> str:
         }
 
         const banner = document.getElementById("submit-banner");
-        banner.textContent = "Queueing job...";
+        banner.textContent = "Queueing run...";
         banner.dataset.tone = "";
 
         try {
@@ -847,7 +905,7 @@ def render_dashboard_html() -> str:
             body: JSON.stringify(payload),
           });
           state.selectedJobId = response.job_id;
-          banner.textContent = `Queued ${response.job_id}`;
+          banner.textContent = `Run queued as ${response.job_id}`;
           banner.dataset.tone = "ok";
           await loadSummary();
         } catch (error) {

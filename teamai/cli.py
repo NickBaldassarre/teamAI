@@ -192,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard_parser = subparsers.add_parser(
         "dashboard",
-        help="Run the local service and open the browser control dashboard.",
+        help="Run the local service and open the teamAI browser dashboard.",
     )
     dashboard_parser.add_argument("--host", default=None)
     dashboard_parser.add_argument("--port", type=int, default=None)

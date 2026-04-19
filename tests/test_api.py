@@ -229,7 +229,9 @@ class APIStreamingTest(unittest.TestCase):
     def test_dashboard_endpoints_render_control_surface_and_summary(self) -> None:
         dashboard_response = self.client.get("/dashboard")
         self.assertEqual(dashboard_response.status_code, 200)
-        self.assertIn("teamAI Control", dashboard_response.text)
+        self.assertIn("teamAI Console", dashboard_response.text)
+        self.assertIn("Pending Approvals", dashboard_response.text)
+        self.assertIn("writes: read-only", dashboard_response.text)
 
         self.client.post(
             "/v1/conversation/task-dashboard/post",
@@ -264,6 +266,41 @@ class APIStreamingTest(unittest.TestCase):
         self.assertTrue(any(item["job_id"] == job_id for item in payload["jobs"]["recent"]))
         self.assertEqual(payload["conversations"]["count"], 1)
         self.assertEqual(payload["conversations"]["items"][0]["task_id"], "task-dashboard")
+        self.assertIn("safety", payload)
+        self.assertEqual(payload["safety"]["allow_writes"], False)
+        self.assertEqual(payload["safety"]["posture"], "read_only")
+        self.assertIn("approvals", payload)
+        self.assertEqual(payload["approvals"]["count"], 0)
+        self.assertEqual(payload["approvals"]["items"], [])
+
+    def test_dashboard_summary_surfaces_pending_approvals(self) -> None:
+        from teamai.approvals import PatchApprovalStore
+
+        store = PatchApprovalStore()
+        workspace = self.workspace
+        target = workspace / "note.md"
+        target.write_text("before\n", encoding="utf-8")
+        store.create(
+            workspace=workspace,
+            path=target,
+            before_text="before\n",
+            after_text="after\n",
+            before_exists=True,
+            reason="Smoke-test approval visibility.",
+            source_tool="patch_compiler",
+        )
+
+        with patch("teamai.api.load_schedules", return_value=[]):
+            summary_response = self.client.get("/v1/dashboard/summary")
+
+        self.assertEqual(summary_response.status_code, 200)
+        payload = summary_response.json()
+        self.assertEqual(payload["approvals"]["count"], 1)
+        approval_item = payload["approvals"]["items"][0]
+        self.assertEqual(approval_item["status"], "pending")
+        self.assertEqual(approval_item["source_tool"], "patch_compiler")
+        self.assertEqual(approval_item["change_count"], 1)
+        self.assertEqual(approval_item["reason"], "Smoke-test approval visibility.")
 
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()

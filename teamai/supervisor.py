@@ -1683,9 +1683,18 @@ class ClosedLoopSupervisor:
                 execution_mode=execution_mode,
                 task_route=effective_route,
             )
-            if fallback.actions:
+            fallback_has_write = any(
+                action.tool in {"write_file", "replace_in_file"}
+                for action in fallback.actions
+            )
+            if fallback.actions and fallback_has_write:
                 warnings.append("Explicit write task required a concrete patch action; used heuristic write fallback.")
                 planner = fallback
+            elif fallback.actions:
+                warnings.append(
+                    "Explicit write task could not be compiled into a concrete patch; "
+                    "keeping planner's actions without substituting a read-only fallback."
+                )
 
         if not planner.should_stop and not planner.actions:
             fallback = self._heuristic_plan_from_context(

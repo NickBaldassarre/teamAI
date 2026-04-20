@@ -25,6 +25,7 @@ Usage::
 """
 from __future__ import annotations
 
+import ast
 import re
 import textwrap
 from pathlib import Path
@@ -67,6 +68,7 @@ class DeterministicPatchCompiler:
             self._compile_paragraph_insert_action,
             self._compile_assignment_update_action,
             self._compile_import_insert_action,
+            self._compile_module_docstring_action,
             self._compile_test_method_insert_action,
             self._compile_replace_all_action,
             self._compile_exact_replace_action,
@@ -292,6 +294,43 @@ class DeterministicPatchCompiler:
         return ToolAction(
             tool="write_file",
             reason="Compile the explicit test-class insertion into a deterministic patch approval.",
+            args={"path": target_path, "content": updated_text},
+        )
+
+    def _compile_module_docstring_action(
+        self, *, task: str, target_path: str, file_text: str,
+    ) -> ToolAction | None:
+        if not target_path.endswith(".py"):
+            return None
+        lowered = task.lower()
+        if "docstring" not in lowered:
+            return None
+        if any(scope in lowered for scope in (
+            "function docstring", "method docstring", "class docstring",
+            "docstring to function", "docstring to method", "docstring to class",
+            "docstring for function", "docstring for method", "docstring for class",
+        )):
+            return None
+        try:
+            tree = ast.parse(file_text)
+        except SyntaxError:
+            return None
+        if ast.get_docstring(tree) is not None:
+            return None
+        content = self._extract_docstring_content(task)
+        if content is None:
+            stem = Path(target_path).with_suffix("").as_posix().replace("/", ".")
+            content = f"{stem} module."
+        if '"""' in content:
+            return None
+        updated_text = self._build_module_docstring_inserted_text(
+            file_text=file_text, content=content,
+        )
+        if updated_text is None or updated_text == file_text:
+            return None
+        return ToolAction(
+            tool="write_file",
+            reason="Compile the explicit module-docstring insertion into a deterministic patch approval.",
             args={"path": target_path, "content": updated_text},
         )
 
@@ -626,6 +665,33 @@ class DeterministicPatchCompiler:
         return match.group("block").rstrip("\n") if match else None
 
     @staticmethod
+    def _extract_docstring_content(task: str) -> str | None:
+        fenced = DeterministicPatchCompiler._extract_task_fenced_block(task)
+        if fenced:
+            return fenced.strip()
+        match = re.search(
+            r"docstring\s+(?:saying|that\s+says|with\s+(?:text|content)|reading)\s+"
+            r"(?P<quote>['\"`])(?P<content>.+?)(?P=quote)",
+            task, flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group("content").strip()
+        match = re.search(
+            r"(?:saying|that\s+says|reading|with\s+(?:text|content))\s+"
+            r"(?P<quote>['\"`])(?P<content>.+?)(?P=quote)",
+            task, flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group("content").strip()
+        match = re.search(
+            r"docstring\s+(?P<quote>['\"`])(?P<content>.+?)(?P=quote)",
+            task, flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group("content").strip()
+        return None
+
+    @staticmethod
     def _extract_task_anchor(task: str) -> str | None:
         match = re.search(r"(?:starts|begins)\s+with\s+['\"]([^'\"]+)['\"]", task, flags=re.IGNORECASE)
         return match.group(1).strip() if match else None
@@ -715,6 +781,42 @@ class DeterministicPatchCompiler:
         if file_text.endswith(appended_text):
             return None
         return f"{file_text}{appended_text}"
+
+    @staticmethod
+    def _build_module_docstring_inserted_text(*, file_text: str, content: str) -> str | None:
+        if not content:
+            return None
+        if "\n" in content:
+            body = content.strip("\n").rstrip()
+            docstring = f'"""\n{body}\n"""'
+        else:
+            docstring = f'"""{content}"""'
+
+        lines = file_text.splitlines(keepends=True)
+        insert_at = 0
+        if insert_at < len(lines) and lines[insert_at].startswith("#!"):
+            insert_at += 1
+        if insert_at < len(lines) and re.search(r"coding[:=]", lines[insert_at]):
+            insert_at += 1
+
+        prefix_lines = lines[:insert_at]
+        while prefix_lines and not prefix_lines[-1].strip():
+            prefix_lines.pop()
+
+        trailing = lines[len(prefix_lines):]
+        suffix_start = 0
+        while suffix_start < len(trailing) and not trailing[suffix_start].strip():
+            suffix_start += 1
+        suffix_lines = trailing[suffix_start:]
+
+        prefix = "".join(prefix_lines)
+        if prefix and not prefix.endswith("\n"):
+            prefix = f"{prefix}\n"
+        suffix = "".join(suffix_lines)
+
+        if suffix:
+            return f"{prefix}{docstring}\n\n{suffix}"
+        return f"{prefix}{docstring}\n"
 
     @staticmethod
     def _build_python_import_inserted_text(*, file_text: str, import_statement: str) -> str | None:

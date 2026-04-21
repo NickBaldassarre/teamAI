@@ -379,6 +379,58 @@ def create_app(
         summaries = [approval_store.summarize(record) for record in records[:limit]]
         return summaries
 
+    @app.post("/v1/approvals/{approval_id}/apply")
+    def apply_approval(approval_id: str) -> dict[str, object]:
+        if not app_settings.allow_writes:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Applying approvals is disabled because TEAMAI_ALLOW_WRITES is false. "
+                    "Set TEAMAI_ALLOW_WRITES=true to permit approved patches to touch the workspace."
+                ),
+            )
+        try:
+            payload = approval_store.apply(workspace=workspace, approval_id=approval_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "status": "applied",
+            "approval": approval_store.summarize(payload),
+        }
+
+    @app.post("/v1/approvals/{approval_id}/reject")
+    def reject_approval(approval_id: str, body: dict[str, object] | None = None) -> dict[str, object]:
+        reason_raw = (body or {}).get("reason") if isinstance(body, dict) else None
+        reason = str(reason_raw).strip() if isinstance(reason_raw, str) else None
+        try:
+            payload = approval_store.reject(
+                workspace=workspace,
+                approval_id=approval_id,
+                reason=reason,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "status": "rejected",
+            "approval": approval_store.summarize(payload),
+        }
+
+    @app.post("/v1/approvals/prune-stale")
+    def prune_stale_approvals() -> dict[str, object]:
+        try:
+            pruned = approval_store.prune_stale(workspace=workspace)
+        except Exception as exc:  # pragma: no cover - defensive: corrupt approval files
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
+            "status": "pruned",
+            "count": len(pruned),
+            "approvals": [approval_store.summarize(record) for record in pruned],
+        }
+
     # ------------------------------------------------------------- conversation
     conversation = ConversationChannel(workspace)
 

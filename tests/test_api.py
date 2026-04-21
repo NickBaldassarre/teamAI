@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -301,6 +302,126 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(approval_item["source_tool"], "patch_compiler")
         self.assertEqual(approval_item["change_count"], 1)
         self.assertEqual(approval_item["reason"], "Smoke-test approval visibility.")
+
+    def _build_client_with_settings(self, *, allow_writes: bool) -> TestClient:
+        self.client.close()
+        settings = dataclasses.replace(self.settings, allow_writes=allow_writes)
+        client = TestClient(create_app(settings, supervisor=_FakeSupervisor(), jobs=self.jobs))
+        self.client = client
+        return client
+
+    def _seed_pending_approval(self) -> str:
+        from teamai.approvals import PatchApprovalStore
+
+        store = PatchApprovalStore()
+        target = self.workspace / "note.md"
+        target.write_text("before\n", encoding="utf-8")
+        payload = store.create(
+            workspace=self.workspace,
+            path=target,
+            before_text="before\n",
+            after_text="after\n",
+            before_exists=True,
+            reason="Dashboard action test.",
+            source_tool="patch_compiler",
+        )
+        return str(payload["approval_id"])
+
+    def test_approval_apply_endpoint_writes_target_when_writes_enabled(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        approval_id = self._seed_pending_approval()
+
+        response = self.client.post(f"/v1/approvals/{approval_id}/apply")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "applied")
+        self.assertEqual(body["approval"]["status"], "applied")
+        self.assertEqual((self.workspace / "note.md").read_text(encoding="utf-8"), "after\n")
+
+    def test_approval_apply_endpoint_returns_403_when_writes_disabled(self) -> None:
+        approval_id = self._seed_pending_approval()
+
+        response = self.client.post(f"/v1/approvals/{approval_id}/apply")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("TEAMAI_ALLOW_WRITES", response.json()["detail"])
+        # Workspace file must remain untouched by a blocked apply.
+        self.assertEqual((self.workspace / "note.md").read_text(encoding="utf-8"), "before\n")
+
+    def test_approval_apply_endpoint_returns_404_when_missing(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+
+        response = self.client.post("/v1/approvals/does-not-exist/apply")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_approval_apply_endpoint_returns_409_when_stale(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        approval_id = self._seed_pending_approval()
+        # Mutate the target so apply() detects drift and marks it stale.
+        (self.workspace / "note.md").write_text("drifted\n", encoding="utf-8")
+
+        response = self.client.post(f"/v1/approvals/{approval_id}/apply")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("stale", response.json()["detail"])
+
+    def test_approval_reject_endpoint_marks_rejected(self) -> None:
+        approval_id = self._seed_pending_approval()
+
+        response = self.client.post(
+            f"/v1/approvals/{approval_id}/reject",
+            json={"reason": "not needed"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "rejected")
+        self.assertEqual(body["approval"]["status"], "rejected")
+        # Target untouched by reject.
+        self.assertEqual((self.workspace / "note.md").read_text(encoding="utf-8"), "before\n")
+
+    def test_approval_reject_endpoint_returns_404_when_missing(self) -> None:
+        response = self.client.post(
+            "/v1/approvals/does-not-exist/reject",
+            json={"reason": "never existed"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_approval_prune_stale_endpoint_removes_stale_records(self) -> None:
+        from teamai.approvals import PatchApprovalStore
+
+        store = PatchApprovalStore()
+        approval_id = self._seed_pending_approval()
+
+        # Flip the record to `stale` directly (mirroring what apply() does on drift).
+        approval_path = self.workspace / ".teamai" / "approvals" / f"{approval_id}.json"
+        payload = json.loads(approval_path.read_text(encoding="utf-8"))
+        payload["status"] = "stale"
+        payload["stale_reason"] = "Synthetic drift for test."
+        approval_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        response = self.client.post("/v1/approvals/prune-stale")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "pruned")
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(approval_path.exists())
+        # Listing confirms the record is gone.
+        self.assertEqual(store.list(workspace=self.workspace, include_all=True), [])
+
+    def test_approval_prune_stale_endpoint_noop_when_nothing_stale(self) -> None:
+        self._seed_pending_approval()
+
+        response = self.client.post("/v1/approvals/prune-stale")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["approvals"], [])
 
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()

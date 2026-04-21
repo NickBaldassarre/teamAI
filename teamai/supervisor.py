@@ -1220,6 +1220,7 @@ class ClosedLoopSupervisor:
                     auto_push=request.auto_push,
                     push_remote=request.push_remote,
                     push_branch_name=request.push_branch_name,
+                    verify_before_commit=request.verify_before_commit,
                 )
                 warnings.extend(merged.get("warnings", []))
                 commit_metadata = merged.get("commit_metadata", {})
@@ -1361,6 +1362,7 @@ class ClosedLoopSupervisor:
         auto_push: bool,
         push_remote: str,
         push_branch_name: str | None,
+        verify_before_commit: bool = False,
     ) -> dict[str, object]:
         changes = collect_workspace_changes(source_root=workspace, modified_root=sandbox_workspace)
         if not changes:
@@ -1374,6 +1376,27 @@ class ClosedLoopSupervisor:
             [output.confidence for output in run_state.verifier_outputs if output.passed] or [0.0]
         )
         latest_checks_green = self._latest_check_batch_passed(run_state.checks_run)
+        if verify_before_commit and auto_commit and not latest_checks_green:
+            self._append_routing_trace(
+                run_state,
+                stage="verify_gate",
+                capability="autonomous_merge",
+                model_id=self._active_model_id,
+                complexity=run_state.complexity,
+                outcome="verification_failed",
+            )
+            return {
+                "applied": False,
+                "stop_reason": "verification_failed",
+                "final_answer": (
+                    "Autonomous run produced changes in the sandbox, but verification was not green. "
+                    "verify_before_commit is set, so the changes were not propagated to the primary workspace."
+                ),
+                "warnings": [
+                    "Autonomous commit skipped because verify_before_commit is set and verification is not green; "
+                    "sandbox changes were not propagated to the primary workspace."
+                ],
+            }
         receipt = self._patch_executor.execute_bundle(
             workspace=workspace,
             changes=changes,
@@ -1683,9 +1706,18 @@ class ClosedLoopSupervisor:
                 execution_mode=execution_mode,
                 task_route=effective_route,
             )
-            if fallback.actions:
+            fallback_has_write = any(
+                action.tool in {"write_file", "replace_in_file"}
+                for action in fallback.actions
+            )
+            if fallback.actions and fallback_has_write:
                 warnings.append("Explicit write task required a concrete patch action; used heuristic write fallback.")
                 planner = fallback
+            elif fallback.actions:
+                warnings.append(
+                    "Explicit write task could not be compiled into a concrete patch; "
+                    "keeping planner's actions without substituting a read-only fallback."
+                )
 
         if not planner.should_stop and not planner.actions:
             fallback = self._heuristic_plan_from_context(

@@ -148,7 +148,14 @@ class HandoffRevisionRequest(BaseModel):
 
 
 class RoutingTraceEntry(BaseModel):
-    stage: Literal["initial_route", "inline_escalation", "verified_handoff", "merge", "push"]
+    stage: Literal[
+        "initial_route",
+        "inline_escalation",
+        "verified_handoff",
+        "merge",
+        "push",
+        "verify_gate",
+    ]
     capability: str
     model_id: str
     agent_id: str | None = None
@@ -270,6 +277,7 @@ class RunRequest(BaseModel):
     auto_push: bool = False
     push_remote: str = "origin"
     push_branch_name: str | None = None
+    verify_before_commit: bool = False
     handoff_engine: Literal["codex", "gemini", "grok", "local"] | None = None
     handoff_model: str | None = None
     max_handoff_revision_attempts: int | None = None

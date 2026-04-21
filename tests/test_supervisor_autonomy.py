@@ -537,3 +537,169 @@ class AutonomousSupervisorTest(unittest.TestCase):
         assert result.run_state is not None
         self.assertIsNone(result.run_state.pushed_branch)
         self.assertTrue(any("protected" in warning.lower() for warning in result.warnings))
+
+    # ------------------------------------------------------------------ verify_before_commit
+
+    def _prepare_verify_gate_sandbox(self) -> tuple[Path, Path]:
+        """Create a git-backed workspace and a sandbox with a pending calc.py change.
+
+        Returns (workspace, sandbox_workspace) for direct ``_merge_autonomous_changes``
+        testing — bypasses the supervisor loop so we can drive check-state precisely.
+        """
+        self._create_python_fixture()
+        self._init_git_repo()
+        sandbox_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(sandbox_dir.cleanup)
+        sandbox_workspace = Path(sandbox_dir.name)
+        (sandbox_workspace / "calc.py").write_text(
+            "def answer():\n    return 99\n", encoding="utf-8"
+        )
+        (sandbox_workspace / "tests").mkdir(exist_ok=True)
+        (sandbox_workspace / "tests" / "test_calc.py").write_text(
+            (self.workspace / "tests" / "test_calc.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return self.workspace, sandbox_workspace
+
+    def test_verify_before_commit_blocks_merge_when_checks_not_green(self) -> None:
+        """With no green checks recorded, verify_before_commit short-circuits the merge.
+
+        The primary workspace is never touched (no patch application, no approval created,
+        no commit).  stop_reason flags the verification failure so callers can act on it.
+        """
+        workspace, sandbox_workspace = self._prepare_verify_gate_sandbox()
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([], repeat_last=True))
+        run_state = new_run_state(workspace=workspace, policy="auto_apply_low_risk")
+        run_state.files_changed = ["calc.py"]
+        # No checks_run entries → latest_checks_green resolves to False, tripping the gate.
+
+        merged = supervisor._merge_autonomous_changes(  # noqa: SLF001
+            workspace=workspace,
+            sandbox_workspace=sandbox_workspace,
+            task="Verify-gate: mutate calc.py without running the checks.",
+            run_state=run_state,
+            write_policy="auto_apply_low_risk",
+            allowed_scopes=(),
+            auto_commit=True,
+            auto_push=False,
+            push_remote="origin",
+            push_branch_name=None,
+            verify_before_commit=True,
+        )
+
+        self.assertFalse(merged["applied"])
+        self.assertEqual(merged["stop_reason"], "verification_failed")
+        self.assertTrue(
+            any("verify_before_commit" in warning for warning in merged["warnings"]),
+            f"Expected a verify_before_commit warning, got: {merged['warnings']!r}",
+        )
+        # Primary workspace was never touched: calc.py still has its pre-run content.
+        self.assertEqual(
+            (workspace / "calc.py").read_text(encoding="utf-8"),
+            "def answer():\n    return 1\n",
+        )
+        # No feature branch was created.
+        current_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertNotIn("teamai/", current_branch)
+        # No second commit — history still has only the init commit.
+        commit_count = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(commit_count, "1")
+        # A verify_gate entry landed in the routing trace for observability.
+        verify_entries = [entry for entry in run_state.routing_trace if entry.stage == "verify_gate"]
+        self.assertEqual(len(verify_entries), 1)
+        self.assertEqual(verify_entries[0].outcome, "verification_failed")
+
+    def test_verify_before_commit_permits_merge_when_checks_passed(self) -> None:
+        """A green check lets the gate pass; normal merge proceeds."""
+        workspace, sandbox_workspace = self._prepare_verify_gate_sandbox()
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([], repeat_last=True))
+        run_state = new_run_state(workspace=workspace, policy="auto_apply_low_risk")
+        run_state.files_changed = ["calc.py"]
+        run_state.checks_run = [
+            CheckExecution(
+                command=["python3", "-m", "unittest", "discover", "-s", "tests"],
+                scope="repo",
+                returncode=0,
+                stdout="OK\n",
+                stderr="",
+            )
+        ]
+        # Push verifier confidence past the auto_apply_low_risk threshold (0.55) so the
+        # merge auto-applies rather than stopping at an approval gate.
+        run_state.verifier_outputs = [
+            VerifierOutput(
+                source="model",
+                passed=True,
+                confidence=0.9,
+                summary="Scoped checks passed.",
+                failure_types=[],
+                mismatches=[],
+                next_focus="none",
+            )
+        ]
+
+        merged = supervisor._merge_autonomous_changes(  # noqa: SLF001
+            workspace=workspace,
+            sandbox_workspace=sandbox_workspace,
+            task="Verify-gate: mutate calc.py with a green check recorded.",
+            run_state=run_state,
+            write_policy="auto_apply_low_risk",
+            allowed_scopes=(),
+            auto_commit=True,
+            auto_push=False,
+            push_remote="origin",
+            push_branch_name=None,
+            verify_before_commit=True,
+        )
+
+        self.assertTrue(merged["applied"])
+        self.assertNotEqual(merged["stop_reason"], "verification_failed")
+        self.assertTrue(merged.get("commit_metadata"))
+        self.assertEqual(
+            (workspace / "calc.py").read_text(encoding="utf-8"),
+            "def answer():\n    return 99\n",
+        )
+
+    def test_verify_before_commit_default_false_does_not_block_merge(self) -> None:
+        """Regression guard: the flag is opt-in, so default behavior is unchanged.
+
+        Without verify_before_commit, the merge proceeds through the policy as before —
+        an approval may be created for risk reasons, but the stop_reason is never
+        ``verification_failed``.
+        """
+        workspace, sandbox_workspace = self._prepare_verify_gate_sandbox()
+        supervisor = ClosedLoopSupervisor(self.settings, backend=FakeBackend([], repeat_last=True))
+        run_state = new_run_state(workspace=workspace, policy="auto_apply_low_risk")
+        run_state.files_changed = ["calc.py"]
+
+        merged = supervisor._merge_autonomous_changes(  # noqa: SLF001
+            workspace=workspace,
+            sandbox_workspace=sandbox_workspace,
+            task="Verify-gate default: mutate calc.py without the new flag set.",
+            run_state=run_state,
+            write_policy="auto_apply_low_risk",
+            allowed_scopes=(),
+            auto_commit=True,
+            auto_push=False,
+            push_remote="origin",
+            push_branch_name=None,
+        )
+
+        self.assertNotEqual(merged["stop_reason"], "verification_failed")
+        # No verify_gate routing entry when the flag is off.
+        self.assertFalse(
+            [entry for entry in run_state.routing_trace if entry.stage == "verify_gate"],
+            "verify_gate routing entry should only appear when the flag is on.",
+        )

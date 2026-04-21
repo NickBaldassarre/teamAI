@@ -7,9 +7,29 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .autonomy import derive_write_policy
 from .schemas import RunEvent, RunResult
+
+
+def _build_self_branch_name(task: str) -> str:
+    """Derive a feature-branch name for a `teamai self` run.
+
+    Produces ``teamai/self-<slug>-<8-hex>`` where ``<slug>`` is a conservative
+    lowercase/dash/alphanumeric excerpt of the task (max 40 chars) and
+    ``<8-hex>`` is a random uniqueness suffix so parallel self-runs do not
+    collide.  Protected branch names are never produced because the slug is
+    always wrapped in the ``teamai/self-`` prefix.
+    """
+    base = task.strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    if not slug:
+        slug = "task"
+    if len(slug) > 40:
+        slug = slug[:40].rstrip("-") or "task"
+    suffix = uuid4().hex[:8]
+    return f"teamai/self-{slug}-{suffix}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -465,6 +485,41 @@ def build_parser() -> argparse.ArgumentParser:
     agents_pick.add_argument("capability", help="Task route capability (e.g. codex_handoff, multi_agent_loop).")
     agents_pick.add_argument("--prefer-local", action="store_true")
     agents_pick.add_argument("--no-env-check", action="store_true", help="Skip env var availability check.")
+
+    # ------------------------------------------------------------------ self
+    self_parser = subparsers.add_parser(
+        "self",
+        help=(
+            "Run an autonomous closed-loop task against the teamAI source tree with auto-commit on a "
+            "feature branch, gated by a verification pass."
+        ),
+    )
+    self_parser.add_argument("task", help="Task description for the autonomous self-hosting run.")
+    self_parser.add_argument("--workspace", default=None, help="Workspace path (defaults to current directory).")
+    self_parser.add_argument("--max-rounds", type=int, default=None)
+    self_parser.add_argument("--max-actions", type=int, default=None)
+    self_parser.add_argument("--max-tokens", type=int, default=None)
+    self_parser.add_argument("--temperature", type=float, default=None)
+    self_parser.add_argument(
+        "--allow-push",
+        action="store_true",
+        help="Push the review branch to origin after the commit (requires TEAMAI_ALLOW_GIT_PUSH=true).",
+    )
+    self_parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip the verification gate; commit even if the autonomy checks were not green.",
+    )
+    self_parser.add_argument(
+        "--push-branch",
+        default=None,
+        help="Override the generated feature branch name (default: teamai/self-<slug>-<id>).",
+    )
+    self_parser.add_argument(
+        "--stream-format",
+        choices=["text", "jsonl"],
+        default="text",
+    )
 
     return parser
 
@@ -1033,6 +1088,63 @@ def main() -> int:
             if result.status != "completed":
                 break
         return 0
+
+    if args.command == "self":
+        from .config import Settings
+        from .schemas import RunRequest
+        from .supervisor import ClosedLoopSupervisor
+
+        settings = Settings.from_env()
+        branch_name = args.push_branch or _build_self_branch_name(args.task)
+        request = RunRequest(
+            task=args.task,
+            workspace_path=args.workspace,
+            max_rounds=args.max_rounds,
+            max_actions_per_round=args.max_actions,
+            max_tokens_per_turn=args.max_tokens,
+            temperature=args.temperature,
+            execution_mode="workspace_write",
+            write_policy=derive_write_policy(
+                execution_mode="workspace_write",
+                requested_policy="auto_apply_low_risk",
+            ),
+            auto_commit=True,
+            auto_push=bool(args.allow_push),
+            push_remote="origin",
+            push_branch_name=branch_name,
+            verify_before_commit=not bool(args.no_verify),
+        )
+        progress_callback, event_callback, close_event_stream = _build_run_stream_handlers(
+            project_root=Path.cwd().resolve(),
+            stream_format=args.stream_format,
+            event_log_file=None,
+        )
+        try:
+            result = ClosedLoopSupervisor(settings).run(
+                request,
+                progress_callback=progress_callback,
+                event_callback=event_callback,
+            )
+        finally:
+            close_event_stream()
+
+        summary: dict[str, Any] = {
+            "status": result.status,
+            "stop_reason": result.stop_reason,
+            "branch": branch_name,
+            "commit_metadata": result.commit_metadata,
+            "warnings": result.warnings,
+            "final_answer": result.final_answer,
+        }
+        print(json.dumps(summary, indent=2, default=str))
+        if result.status == "completed" and result.stop_reason not in {
+            "verification_failed",
+            "policy_violation",
+            "approval_required",
+            "no_changes_detected",
+        }:
+            return 0
+        return 1
 
     if args.command == "daemon":
         from .daemon import (

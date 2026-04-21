@@ -2120,6 +2120,215 @@ class SupervisorStructuredOutputTest(unittest.TestCase):
         self.assertEqual((self.workspace / "app.py").read_text(encoding="utf-8"), "def normalize_name(value: str) -> str:\n    return \" \".join(part.capitalize() for part in value.split())\n")
         self.assertIn("self.assertEqual(normalize_name('  jAnE   DOE  '), 'Jane Doe')", (tests_dir / "test_app.py").read_text(encoding="utf-8"))
 
+    def test_explicit_write_fallback_rejects_read_only_substitution(self) -> None:
+        notes_file = self.workspace / "notes.md"
+        notes_file.write_text("# notes\n\ntodo.\n", encoding="utf-8")
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=1,
+            max_actions_per_round=2,
+            max_tokens_per_turn=64,
+            temperature=0.3,
+            allow_shell=False,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=10_000,
+            max_command_output_chars=10_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+        backend = FakeBackend(
+            [
+                (
+                    '{"summary":"Read notes.md first.","should_stop":false,"final_answer":null,"actions":['
+                    '{"tool":"read_file","reason":"Inspect notes before changing them.",'
+                    '"args":{"path":"notes.md","start_line":1,"end_line":40}}]}'
+                ),
+            ]
+        )
+        supervisor = ClosedLoopSupervisor(writable_settings, backend=backend)
+        warnings: list[str] = []
+
+        planner = supervisor._plan(  # noqa: SLF001
+            task="Use workspace_write mode. Please update notes.md with something new.",
+            user_prompt="Plan the next action for the explicit write request.",
+            workspace=self.workspace,
+            previous_rounds=[],
+            execution_mode="workspace_write",
+            max_actions=2,
+            max_tokens=128,
+            temperature=0.3,
+            warnings=warnings,
+        )
+
+        self.assertEqual(planner.actions[0].tool, "read_file")
+        self.assertEqual(planner.actions[0].args["path"], "notes.md")
+        self.assertTrue(
+            any("keeping planner's actions" in warning.lower() for warning in warnings),
+            msg=f"Expected keep-planner warning; got {warnings!r}",
+        )
+        self.assertFalse(
+            any("used heuristic write fallback" in warning.lower() for warning in warnings),
+            msg=f"Should not mis-label read-only fallback as heuristic write fallback; got {warnings!r}",
+        )
+
+    def test_module_docstring_compiler_synthesizes_from_path_when_content_unspecified(self) -> None:
+        target = self.workspace / "teamai" / "jobs.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "from __future__ import annotations\n\nimport threading\n\n\nclass JobStore:\n    pass\n",
+            encoding="utf-8",
+        )
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=1,
+            max_actions_per_round=2,
+            max_tokens_per_turn=64,
+            temperature=0.3,
+            allow_shell=False,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=10_000,
+            max_command_output_chars=10_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+
+        result = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task="Use workspace_write mode. Add a module docstring to teamai/jobs.py.",
+                workspace_path=".",
+                execution_mode="workspace_write",
+                write_policy="propose_only",
+            ),
+        )
+
+        self.assertEqual(result.task_route, "deterministic_patch")
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.stop_reason, "approval_required")
+        approval_files = sorted((self.workspace / ".teamai" / "approvals").glob("*.json"))
+        self.assertEqual(len(approval_files), 1)
+        import json as _json
+        payload = _json.loads(approval_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["source_tool"], "write_file")
+        self.assertIn('"""teamai.jobs module."""', payload["after_text"])
+        self.assertTrue(payload["after_text"].startswith('"""teamai.jobs module."""\n\n'))
+
+    def test_module_docstring_compiler_uses_explicit_quoted_content(self) -> None:
+        target = self.workspace / "teamai" / "jobs.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "from __future__ import annotations\n\nimport threading\n",
+            encoding="utf-8",
+        )
+        writable_settings = Settings(
+            model_id="dummy",
+            model_revision=None,
+            force_download=False,
+            trust_remote_code=False,
+            enable_thinking=False,
+            workspace_root=self.workspace,
+            max_rounds=1,
+            max_actions_per_round=2,
+            max_tokens_per_turn=64,
+            temperature=0.3,
+            allow_shell=False,
+            allow_writes=True,
+            command_timeout_seconds=5,
+            max_file_bytes=10_000,
+            max_command_output_chars=10_000,
+            host="127.0.0.1",
+            port=8000,
+        )
+
+        result = ClosedLoopSupervisor(writable_settings, backend=FakeBackend([])).run(
+            RunRequest(
+                task=(
+                    "Use workspace_write mode. Add a module docstring saying "
+                    "'Handles job lifecycle state.' to teamai/jobs.py."
+                ),
+                workspace_path=".",
+                execution_mode="workspace_write",
+                write_policy="propose_only",
+            ),
+        )
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.stop_reason, "approval_required")
+        approval_files = sorted((self.workspace / ".teamai" / "approvals").glob("*.json"))
+        self.assertEqual(len(approval_files), 1)
+        import json as _json
+        payload = _json.loads(approval_files[0].read_text(encoding="utf-8"))
+        self.assertIn('"""Handles job lifecycle state."""', payload["after_text"])
+
+    def test_module_docstring_compiler_skips_when_docstring_already_present(self) -> None:
+        from teamai.patch_compiler import DeterministicPatchCompiler
+
+        target = self.workspace / "jobs.py"
+        target.write_text(
+            '"""Existing docstring."""\nfrom __future__ import annotations\n',
+            encoding="utf-8",
+        )
+        compiler = DeterministicPatchCompiler()
+
+        action = compiler.compile(
+            task="Use workspace_write mode. Add a module docstring to jobs.py.",
+            workspace=self.workspace,
+        )
+
+        self.assertIsNone(action)
+
+    def test_module_docstring_compiler_skips_function_scope_requests(self) -> None:
+        from teamai.patch_compiler import DeterministicPatchCompiler
+
+        target = self.workspace / "jobs.py"
+        target.write_text(
+            "def foo() -> None:\n    pass\n",
+            encoding="utf-8",
+        )
+        compiler = DeterministicPatchCompiler()
+
+        action = compiler.compile(
+            task="Use workspace_write mode. Add a function docstring to foo in jobs.py.",
+            workspace=self.workspace,
+        )
+
+        self.assertIsNone(action)
+
+    def test_module_docstring_compiler_inserts_before_future_import(self) -> None:
+        from teamai.patch_compiler import DeterministicPatchCompiler
+
+        target = self.workspace / "teamai" / "jobs.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "from __future__ import annotations\n\nimport threading\n",
+            encoding="utf-8",
+        )
+        compiler = DeterministicPatchCompiler()
+
+        action = compiler.compile(
+            task="Use workspace_write mode. Add a module docstring to teamai/jobs.py.",
+            workspace=self.workspace,
+        )
+
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.tool, "write_file")
+        content = action.args["content"]
+        docstring_index = content.index('"""teamai.jobs module."""')
+        future_index = content.index("from __future__ import annotations")
+        self.assertLess(docstring_index, future_index)
+
 
 if __name__ == "__main__":
     unittest.main()

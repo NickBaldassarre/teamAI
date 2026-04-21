@@ -775,5 +775,68 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertEqual(failure_log.read_text(encoding="utf-8"), "tests failed\n")
 
 
+class CLISelfSubcommandTest(unittest.TestCase):
+    """Smoke-level coverage for the `teamai self` CLI surface."""
+
+    def test_build_self_branch_name_slugifies_task(self) -> None:
+        from teamai.cli import _build_self_branch_name
+
+        branch = _build_self_branch_name("Add a docstring to teamai/jobs.py")
+        self.assertTrue(branch.startswith("teamai/self-add-a-docstring-to-teamai-jobs-py-"))
+        # Suffix is a lowercase 8-hex token — keeps parallel self-runs on distinct branches.
+        suffix = branch.rsplit("-", 1)[-1]
+        self.assertEqual(len(suffix), 8)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in suffix))
+
+    def test_build_self_branch_name_collapses_punctuation_and_caps_length(self) -> None:
+        from teamai.cli import _build_self_branch_name
+
+        task = "Refactor: !! extract $$$$$ the validate_rectangle() helper from supervisor.py into its own module"
+        branch = _build_self_branch_name(task)
+        slug_with_suffix = branch[len("teamai/self-"):]
+        slug = slug_with_suffix.rsplit("-", 1)[0]
+        self.assertNotIn("!", slug)
+        self.assertNotIn("$", slug)
+        self.assertNotIn("(", slug)
+        self.assertNotIn(":", slug)
+        self.assertLessEqual(len(slug), 40)
+
+    def test_build_self_branch_name_falls_back_to_task_on_empty_slug(self) -> None:
+        from teamai.cli import _build_self_branch_name
+
+        branch = _build_self_branch_name("!!!   @@@")
+        self.assertTrue(branch.startswith("teamai/self-task-"))
+
+    def test_self_subparser_defaults_to_verify_and_no_push(self) -> None:
+        from teamai.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["self", "add docstring to teamai/jobs.py"])
+        self.assertEqual(args.command, "self")
+        self.assertEqual(args.task, "add docstring to teamai/jobs.py")
+        self.assertFalse(args.allow_push)
+        self.assertFalse(args.no_verify)
+        self.assertIsNone(args.push_branch)
+        self.assertEqual(args.stream_format, "text")
+
+    def test_self_subparser_accepts_allow_push_and_no_verify_overrides(self) -> None:
+        from teamai.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "self",
+                "refactor teamai/foo.py",
+                "--allow-push",
+                "--no-verify",
+                "--push-branch",
+                "teamai/self-custom-branch",
+            ]
+        )
+        self.assertTrue(args.allow_push)
+        self.assertTrue(args.no_verify)
+        self.assertEqual(args.push_branch, "teamai/self-custom-branch")
+
+
 if __name__ == "__main__":
     unittest.main()

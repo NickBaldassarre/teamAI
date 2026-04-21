@@ -327,6 +327,27 @@ class APIStreamingTest(unittest.TestCase):
         )
         return str(payload["approval_id"])
 
+    def test_approval_get_endpoint_returns_summary_with_unified_diff(self) -> None:
+        approval_id = self._seed_pending_approval()
+
+        response = self.client.get(f"/v1/approvals/{approval_id}")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["approval_id"], approval_id)
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["source_tool"], "patch_compiler")
+        diff = body.get("diff", "")
+        self.assertIn("--- a/", diff)
+        self.assertIn("+++ b/", diff)
+        self.assertIn("-before", diff)
+        self.assertIn("+after", diff)
+
+    def test_approval_get_endpoint_returns_404_when_missing(self) -> None:
+        response = self.client.get("/v1/approvals/does-not-exist")
+
+        self.assertEqual(response.status_code, 404)
+
     def test_approval_apply_endpoint_writes_target_when_writes_enabled(self) -> None:
         self._build_client_with_settings(allow_writes=True)
         approval_id = self._seed_pending_approval()

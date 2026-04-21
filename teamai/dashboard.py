@@ -257,6 +257,28 @@ def render_dashboard_html() -> str:
         border: 1px solid rgba(255, 255, 255, 0.08);
       }
 
+      .button:disabled,
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+        transform: none;
+        box-shadow: none;
+      }
+
+      .action-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .action-button {
+        padding: 7px 12px;
+        font-size: 0.86rem;
+        border-radius: 10px;
+        box-shadow: none;
+      }
+
       form {
         display: grid;
         gap: 14px;
@@ -569,10 +591,12 @@ def render_dashboard_html() -> str:
                 <h2>Pending Approvals</h2>
                 <div class="panel-copy">Proposed patches waiting for human review before any file is written.</div>
               </div>
+              <button class="button secondary" id="prune-stale-button" type="button">Prune Stale</button>
             </div>
             <div class="list" id="approvals-list">
               <div class="empty">No approvals pending. Patch proposals will appear here for review before any file is written.</div>
             </div>
+            <div class="banner" id="approvals-banner">Approve or reject proposed patches here.</div>
           </section>
 
           <section class="panel">
@@ -618,6 +642,7 @@ def render_dashboard_html() -> str:
       const state = {
         selectedJobId: null,
         loadingEventsFor: null,
+        writesEnabled: false,
       };
 
       function escapeHtml(value) {
@@ -704,14 +729,19 @@ def render_dashboard_html() -> str:
           container.innerHTML = '<div class="empty">No approvals pending. Patch proposals will appear here for review before any file is written.</div>';
           return;
         }
+        const applyDisabled = !state.writesEnabled;
+        const applyTitle = applyDisabled
+          ? "Applying approvals is disabled because TEAMAI_ALLOW_WRITES is false."
+          : "Apply this approved patch to the workspace.";
         container.innerHTML = items.map((item) => {
-          const approvalId = escapeHtml(item.approval_id || "?");
+          const approvalIdRaw = item.approval_id || "";
+          const approvalId = escapeHtml(approvalIdRaw);
           const changeCount = Number(item.change_count || 0);
           const scope = changeCount > 1 ? `${changeCount} files` : item.path || "1 file";
           const tool = item.source_tool ? `<span class="tag mono">${escapeHtml(item.source_tool)}</span>` : "";
           const reason = item.reason ? `<div class="meta-row">${escapeHtml(item.reason)}</div>` : "";
           return `
-            <div class="list-item">
+            <div class="list-item" data-approval-id="${approvalId}">
               <div class="list-title">
                 <strong class="mono">${approvalId}</strong>
                 ${statusMarkup("pending")}
@@ -722,10 +752,83 @@ def render_dashboard_html() -> str:
                 <span>${formatDate(item.created_at)}</span>
               </div>
               ${reason}
-              <div class="meta-row muted">Apply with <span class="mono">teamai approvals apply ${approvalId}</span></div>
+              <div class="action-row">
+                <button
+                  type="button"
+                  class="button action-button"
+                  data-approval-action="apply"
+                  data-approval-id="${approvalId}"
+                  ${applyDisabled ? "disabled" : ""}
+                  title="${escapeHtml(applyTitle)}"
+                >Apply</button>
+                <button
+                  type="button"
+                  class="button secondary action-button"
+                  data-approval-action="reject"
+                  data-approval-id="${approvalId}"
+                  title="Mark this approval rejected without touching the workspace."
+                >Reject</button>
+              </div>
             </div>
           `;
         }).join("");
+      }
+
+      function setApprovalsBanner(message, tone) {
+        const banner = document.getElementById("approvals-banner");
+        if (!banner) {
+          return;
+        }
+        banner.textContent = message;
+        banner.dataset.tone = tone || "";
+      }
+
+      async function handleApprovalAction(approvalId, action) {
+        if (!approvalId || !action) {
+          return;
+        }
+        if (action === "apply" && !state.writesEnabled) {
+          setApprovalsBanner(
+            "Applying approvals is disabled because TEAMAI_ALLOW_WRITES is false.",
+            "fail",
+          );
+          return;
+        }
+        const label = action === "apply" ? "Applying" : "Rejecting";
+        setApprovalsBanner(`${label} approval ${approvalId}...`, "");
+        try {
+          const body = action === "reject" ? { reason: "Rejected from dashboard." } : {};
+          await fetchJson(`/v1/approvals/${encodeURIComponent(approvalId)}/${action}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const verb = action === "apply" ? "applied" : "rejected";
+          setApprovalsBanner(`Approval ${approvalId} ${verb}.`, "ok");
+        } catch (error) {
+          setApprovalsBanner(error.message || String(error), "fail");
+        }
+        await loadSummary();
+      }
+
+      async function handlePruneStale() {
+        setApprovalsBanner("Pruning stale approvals...", "");
+        try {
+          const response = await fetchJson("/v1/approvals/prune-stale", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          const count = Number(response.count || 0);
+          if (count === 0) {
+            setApprovalsBanner("No stale approvals to prune.", "");
+          } else {
+            setApprovalsBanner(`Pruned ${count} stale approval${count === 1 ? "" : "s"}.`, "ok");
+          }
+        } catch (error) {
+          setApprovalsBanner(error.message || String(error), "fail");
+        }
+        await loadSummary();
       }
 
       function renderSchedules(items) {
@@ -838,6 +941,7 @@ def render_dashboard_html() -> str:
 
           const writesElement = document.getElementById("hero-writes");
           const writesEnabled = Boolean(safety.allow_writes);
+          state.writesEnabled = writesEnabled;
           writesElement.textContent = writesEnabled ? "writes: enabled" : "writes: read-only";
           writesElement.dataset.tone = writesEnabled ? "warn" : "ok";
           writesElement.title = writesEnabled
@@ -924,6 +1028,16 @@ def render_dashboard_html() -> str:
         state.selectedJobId = button.dataset.jobId;
         loadSummary();
       });
+      document.getElementById("approvals-list").addEventListener("click", (event) => {
+        const button = event.target.closest("[data-approval-action]");
+        if (!button || button.disabled) {
+          return;
+        }
+        const approvalId = button.dataset.approvalId;
+        const action = button.dataset.approvalAction;
+        handleApprovalAction(approvalId, action);
+      });
+      document.getElementById("prune-stale-button").addEventListener("click", handlePruneStale);
 
       loadSummary();
       setInterval(loadSummary, 5000);

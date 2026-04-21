@@ -281,26 +281,69 @@ def create_app(
 
     @app.post("/v1/schedules")
     def create_schedule(body: dict[str, object]) -> dict[str, object]:
+        if not app_settings.allow_writes:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Creating or updating schedules is disabled because TEAMAI_ALLOW_WRITES is false. "
+                    "Set TEAMAI_ALLOW_WRITES=true to manage scheduled automation."
+                ),
+            )
         task = body.get("task")
         cron = body.get("cron")
         if not task or not cron:
             raise HTTPException(status_code=400, detail="'task' and 'cron' are required.")
-        entry = add_schedule(
-            task=str(task),
-            cron=str(cron),
-            schedule_id=str(body["id"]) if "id" in body else None,
-            execution_mode=str(body.get("execution_mode", "read_only")),
-            workspace=str(body["workspace"]) if "workspace" in body else None,
-            max_rounds=int(body["max_rounds"]) if "max_rounds" in body else None,
-            enabled=bool(body.get("enabled", True)),
-        )
+        try:
+            entry = add_schedule(
+                task=str(task),
+                cron=str(cron),
+                schedule_id=str(body["id"]) if "id" in body else None,
+                execution_mode=str(body.get("execution_mode", "read_only")),
+                workspace=str(body["workspace"]) if "workspace" in body else None,
+                max_rounds=int(body["max_rounds"]) if "max_rounds" in body else None,
+                enabled=bool(body.get("enabled", True)),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid schedule: {exc}") from exc
         return entry.to_dict()
 
     @app.delete("/v1/schedules/{schedule_id}")
     def delete_schedule(schedule_id: str) -> dict[str, object]:
+        if not app_settings.allow_writes:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Deleting schedules is disabled because TEAMAI_ALLOW_WRITES is false. "
+                    "Set TEAMAI_ALLOW_WRITES=true to manage scheduled automation."
+                ),
+            )
         if not remove_schedule(schedule_id):
             raise HTTPException(status_code=404, detail="Schedule not found.")
         return {"status": "removed", "id": schedule_id}
+
+    @app.post("/v1/schedules/{schedule_id}/toggle")
+    def toggle_schedule(schedule_id: str) -> dict[str, object]:
+        if not app_settings.allow_writes:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Toggling schedules is disabled because TEAMAI_ALLOW_WRITES is false. "
+                    "Set TEAMAI_ALLOW_WRITES=true to manage scheduled automation."
+                ),
+            )
+        existing = next((e for e in load_schedules() if e.id == schedule_id), None)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Schedule not found.")
+        updated = add_schedule(
+            task=existing.task,
+            cron=existing.cron,
+            schedule_id=existing.id,
+            execution_mode=existing.execution_mode,
+            workspace=existing.workspace,
+            max_rounds=existing.max_rounds,
+            enabled=not existing.enabled,
+        )
+        return {"status": "toggled", "schedule": updated.to_dict()}
 
     @app.get("/v1/schedules/log")
     def schedule_fire_log() -> list[dict[str, object]]:

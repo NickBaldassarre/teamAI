@@ -422,6 +422,14 @@ def create_app(
         summaries = [approval_store.summarize(record) for record in records[:limit]]
         return summaries
 
+    @app.get("/v1/approvals/{approval_id}")
+    def get_approval(approval_id: str) -> dict[str, object]:
+        try:
+            payload = approval_store.get(workspace=workspace, approval_id=approval_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return approval_store.summarize(payload, include_diff=True)
+
     @app.post("/v1/approvals/{approval_id}/apply")
     def apply_approval(approval_id: str) -> dict[str, object]:
         if not app_settings.allow_writes:

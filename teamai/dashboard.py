@@ -359,6 +359,41 @@ def render_dashboard_html() -> str:
         font-size: 0.9rem;
       }
 
+      .diff {
+        margin-top: 10px;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(5, 11, 17, 0.55);
+        color: var(--text);
+        white-space: pre;
+        overflow-x: auto;
+        max-height: 360px;
+        line-height: 1.45;
+      }
+
+      .diff .diff-add {
+        color: var(--ok);
+        background: rgba(118, 211, 155, 0.08);
+        display: block;
+      }
+
+      .diff .diff-del {
+        color: var(--fail);
+        background: rgba(255, 125, 103, 0.08);
+        display: block;
+      }
+
+      .diff .diff-hunk {
+        color: var(--teal);
+        display: block;
+      }
+
+      .diff .diff-meta {
+        color: var(--muted);
+        display: block;
+      }
+
       .meta-row {
         display: flex;
         flex-wrap: wrap;
@@ -682,6 +717,8 @@ def render_dashboard_html() -> str:
         loadingEventsFor: null,
         writesEnabled: false,
         schedules: [],
+        approvalDiffs: {},
+        openApprovalDiffs: new Set(),
       };
 
       function escapeHtml(value) {
@@ -779,6 +816,11 @@ def render_dashboard_html() -> str:
           const scope = changeCount > 1 ? `${changeCount} files` : item.path || "1 file";
           const tool = item.source_tool ? `<span class="tag mono">${escapeHtml(item.source_tool)}</span>` : "";
           const reason = item.reason ? `<div class="meta-row">${escapeHtml(item.reason)}</div>` : "";
+          const diffOpen = state.openApprovalDiffs.has(approvalIdRaw);
+          const inspectLabel = diffOpen ? "Hide Diff" : "Show Diff";
+          const diffPane = diffOpen
+            ? `<pre class="mono diff" data-approval-diff-for="${approvalId}">${renderDiffBody(state.approvalDiffs[approvalIdRaw])}</pre>`
+            : "";
           return `
             <div class="list-item" data-approval-id="${approvalId}">
               <div class="list-title">
@@ -807,10 +849,64 @@ def render_dashboard_html() -> str:
                   data-approval-id="${approvalId}"
                   title="Mark this approval rejected without touching the workspace."
                 >Reject</button>
+                <button
+                  type="button"
+                  class="button secondary action-button"
+                  data-approval-action="inspect"
+                  data-approval-id="${approvalId}"
+                  title="Show the proposed unified diff for this patch."
+                >${inspectLabel}</button>
               </div>
+              ${diffPane}
             </div>
           `;
         }).join("");
+      }
+
+      function renderDiffBody(diffText) {
+        if (diffText === undefined) {
+          return '<span class="diff-meta">Loading diff...</span>';
+        }
+        const text = String(diffText || "").trim();
+        if (!text) {
+          return '<span class="diff-meta">(no textual diff)</span>';
+        }
+        return text.split("\n").map((line) => {
+          let className = "diff-meta";
+          if (line.startsWith("+++") || line.startsWith("---")) {
+            className = "diff-meta";
+          } else if (line.startsWith("@@")) {
+            className = "diff-hunk";
+          } else if (line.startsWith("+")) {
+            className = "diff-add";
+          } else if (line.startsWith("-")) {
+            className = "diff-del";
+          }
+          return `<span class="${className}">${escapeHtml(line || " ")}</span>`;
+        }).join("");
+      }
+
+      async function handleApprovalInspect(approvalId) {
+        if (!approvalId) {
+          return;
+        }
+        if (state.openApprovalDiffs.has(approvalId)) {
+          state.openApprovalDiffs.delete(approvalId);
+          await loadSummary();
+          return;
+        }
+        state.openApprovalDiffs.add(approvalId);
+        if (state.approvalDiffs[approvalId] === undefined) {
+          await loadSummary();
+          try {
+            const payload = await fetchJson(`/v1/approvals/${encodeURIComponent(approvalId)}`);
+            state.approvalDiffs[approvalId] = String(payload.diff || "");
+          } catch (error) {
+            state.approvalDiffs[approvalId] = "";
+            setApprovalsBanner(error.message || String(error), "fail");
+          }
+        }
+        await loadSummary();
       }
 
       function setApprovalsBanner(message, tone) {
@@ -1274,6 +1370,10 @@ def render_dashboard_html() -> str:
         }
         const approvalId = button.dataset.approvalId;
         const action = button.dataset.approvalAction;
+        if (action === "inspect") {
+          handleApprovalInspect(approvalId);
+          return;
+        }
         handleApprovalAction(approvalId, action);
       });
       document.getElementById("prune-stale-button").addEventListener("click", handlePruneStale);

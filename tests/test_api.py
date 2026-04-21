@@ -423,6 +423,153 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(body["count"], 0)
         self.assertEqual(body["approvals"], [])
 
+    def _isolated_schedules_path(self) -> Path:
+        return self.workspace / "schedules.json"
+
+    def test_schedule_create_endpoint_returns_403_when_writes_disabled(self) -> None:
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post(
+                "/v1/schedules",
+                json={"task": "Run evals", "cron": "0 3 * * *"},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("TEAMAI_ALLOW_WRITES", response.json()["detail"])
+        self.assertFalse(self._isolated_schedules_path().exists())
+
+    def test_schedule_create_endpoint_persists_entry_when_writes_enabled(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post(
+                "/v1/schedules",
+                json={
+                    "task": "Run evals",
+                    "cron": "0 3 * * *",
+                    "execution_mode": "read_only",
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["task"], "Run evals")
+            self.assertEqual(body["cron"], "0 3 * * *")
+            self.assertTrue(body["id"].startswith("sched_"))
+            self.assertTrue(self._isolated_schedules_path().exists())
+
+    def test_schedule_create_endpoint_returns_400_on_invalid_cron(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post(
+                "/v1/schedules",
+                json={"task": "Run evals", "cron": "not-a-cron"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid schedule", response.json()["detail"])
+
+    def test_schedule_create_endpoint_returns_400_when_task_missing(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post(
+                "/v1/schedules",
+                json={"cron": "0 3 * * *"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_schedule_delete_endpoint_returns_403_when_writes_disabled(self) -> None:
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.delete("/v1/schedules/sched_anything")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("TEAMAI_ALLOW_WRITES", response.json()["detail"])
+
+    def test_schedule_delete_endpoint_removes_entry_when_writes_enabled(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            created = self.client.post(
+                "/v1/schedules",
+                json={"task": "Run evals", "cron": "0 3 * * *"},
+            ).json()
+            schedule_id = created["id"]
+
+            response = self.client.delete(f"/v1/schedules/{schedule_id}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"status": "removed", "id": schedule_id})
+            listed = self.client.get("/v1/schedules").json()
+            self.assertEqual(listed, [])
+
+    def test_schedule_delete_endpoint_returns_404_when_missing(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.delete("/v1/schedules/does-not-exist")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_schedule_toggle_endpoint_flips_enabled_state(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            created = self.client.post(
+                "/v1/schedules",
+                json={"task": "Run evals", "cron": "0 3 * * *", "enabled": True},
+            ).json()
+            schedule_id = created["id"]
+
+            first = self.client.post(f"/v1/schedules/{schedule_id}/toggle")
+            self.assertEqual(first.status_code, 200)
+            body = first.json()
+            self.assertEqual(body["status"], "toggled")
+            self.assertFalse(body["schedule"]["enabled"])
+
+            second = self.client.post(f"/v1/schedules/{schedule_id}/toggle")
+            self.assertEqual(second.status_code, 200)
+            self.assertTrue(second.json()["schedule"]["enabled"])
+
+    def test_schedule_toggle_endpoint_returns_403_when_writes_disabled(self) -> None:
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post("/v1/schedules/sched_anything/toggle")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("TEAMAI_ALLOW_WRITES", response.json()["detail"])
+
+    def test_schedule_toggle_endpoint_returns_404_when_missing(self) -> None:
+        self._build_client_with_settings(allow_writes=True)
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            response = self.client.post("/v1/schedules/does-not-exist/toggle")
+
+        self.assertEqual(response.status_code, 404)
+
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()
         template = _TemplateSupervisor()

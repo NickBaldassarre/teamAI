@@ -605,10 +605,48 @@ def render_dashboard_html() -> str:
                 <h2>Automation</h2>
                 <div class="panel-copy">Recurring tasks currently configured for this workspace.</div>
               </div>
+              <button class="button secondary" id="schedule-new-button" type="button">Add Schedule</button>
             </div>
+            <form id="schedule-form" hidden>
+              <input type="hidden" name="id" />
+              <label>
+                Task
+                <input name="task" type="text" required placeholder="e.g. Run nightly evals" />
+              </label>
+              <div class="field-grid">
+                <label>
+                  Cron
+                  <input name="cron" type="text" required placeholder="m h dom mon dow (e.g. 0 3 * * *)" />
+                </label>
+                <label>
+                  Execution mode
+                  <select name="execution_mode">
+                    <option value="read_only">read_only</option>
+                    <option value="workspace_write">workspace_write</option>
+                  </select>
+                </label>
+                <label>
+                  Workspace (optional)
+                  <input name="workspace" type="text" placeholder="Path. Leave blank for default." />
+                </label>
+                <label>
+                  Max rounds (optional)
+                  <input name="max_rounds" type="number" min="1" step="1" />
+                </label>
+              </div>
+              <label style="flex-direction: row; align-items: center; gap: 10px;">
+                <input name="enabled" type="checkbox" checked style="width:auto;" />
+                Enabled
+              </label>
+              <div class="action-row">
+                <button class="button action-button" type="submit" id="schedule-submit-button">Save Schedule</button>
+                <button class="button secondary action-button" type="button" id="schedule-cancel-button">Cancel</button>
+              </div>
+            </form>
             <div class="list" id="schedules-list">
-              <div class="empty">No automation configured. Add a schedule with `teamai daemon schedule add` or POST /v1/schedules.</div>
+              <div class="empty">No automation configured. Click <span class="mono">Add Schedule</span> or POST /v1/schedules.</div>
             </div>
+            <div class="banner" id="schedules-banner">Add, toggle, edit, or delete scheduled automation here.</div>
           </section>
 
           <section class="panel">
@@ -643,6 +681,7 @@ def render_dashboard_html() -> str:
         selectedJobId: null,
         loadingEventsFor: null,
         writesEnabled: false,
+        schedules: [],
       };
 
       function escapeHtml(value) {
@@ -834,22 +873,212 @@ def render_dashboard_html() -> str:
       function renderSchedules(items) {
         const container = document.getElementById("schedules-list");
         if (!items.length) {
-          container.innerHTML = '<div class="empty">No automation configured. Add a schedule with <span class="mono">teamai daemon schedule add</span> or POST /v1/schedules.</div>';
+          container.innerHTML = '<div class="empty">No automation configured. Click <span class="mono">Add Schedule</span> or POST /v1/schedules.</div>';
           return;
         }
-        container.innerHTML = items.map((item) => `
-          <div class="list-item">
-            <div class="list-title">
-              <strong>${escapeHtml(item.id)}</strong>
-              ${statusMarkup(item.enabled ? "enabled" : "disabled")}
+        const writesDisabled = !state.writesEnabled;
+        const writesTitle = writesDisabled
+          ? "Managing schedules is disabled because TEAMAI_ALLOW_WRITES is false."
+          : "";
+        container.innerHTML = items.map((item) => {
+          const idRaw = item.id || "";
+          const id = escapeHtml(idRaw);
+          const enabled = Boolean(item.enabled);
+          const toggleLabel = enabled ? "Disable" : "Enable";
+          const toggleTitle = writesDisabled ? writesTitle : `${toggleLabel} this schedule.`;
+          const editTitle = writesDisabled ? writesTitle : "Edit this schedule's fields.";
+          const deleteTitle = writesDisabled ? writesTitle : "Delete this schedule permanently.";
+          const workspace = item.workspace ? `<span>workspace: <span class="mono">${escapeHtml(item.workspace)}</span></span>` : "";
+          const rounds = item.max_rounds ? `<span>max_rounds: ${escapeHtml(String(item.max_rounds))}</span>` : "";
+          return `
+            <div class="list-item" data-schedule-id="${id}">
+              <div class="list-title">
+                <strong class="mono">${id}</strong>
+                ${statusMarkup(enabled ? "enabled" : "disabled")}
+              </div>
+              <div class="meta-row">
+                <span class="tag mono">${escapeHtml(item.cron)}</span>
+                <span>${escapeHtml(item.execution_mode || "read_only")}</span>
+                ${workspace}
+                ${rounds}
+              </div>
+              <div class="meta-row">${escapeHtml(item.task)}</div>
+              <div class="action-row">
+                <button
+                  type="button"
+                  class="button action-button"
+                  data-schedule-action="toggle"
+                  data-schedule-id="${id}"
+                  ${writesDisabled ? "disabled" : ""}
+                  title="${escapeHtml(toggleTitle)}"
+                >${toggleLabel}</button>
+                <button
+                  type="button"
+                  class="button secondary action-button"
+                  data-schedule-action="edit"
+                  data-schedule-id="${id}"
+                  ${writesDisabled ? "disabled" : ""}
+                  title="${escapeHtml(editTitle)}"
+                >Edit</button>
+                <button
+                  type="button"
+                  class="button secondary action-button"
+                  data-schedule-action="delete"
+                  data-schedule-id="${id}"
+                  ${writesDisabled ? "disabled" : ""}
+                  title="${escapeHtml(deleteTitle)}"
+                >Delete</button>
+              </div>
             </div>
-            <div class="meta-row">
-              <span class="tag mono">${escapeHtml(item.cron)}</span>
-              <span>${escapeHtml(item.execution_mode || "read_only")}</span>
-            </div>
-            <div class="meta-row">${escapeHtml(item.task)}</div>
-          </div>
-        `).join("");
+          `;
+        }).join("");
+      }
+
+      function setSchedulesBanner(message, tone) {
+        const banner = document.getElementById("schedules-banner");
+        if (!banner) {
+          return;
+        }
+        banner.textContent = message;
+        banner.dataset.tone = tone || "";
+      }
+
+      function findScheduleById(id) {
+        return (state.schedules || []).find((s) => s.id === id) || null;
+      }
+
+      function showScheduleForm(schedule) {
+        const form = document.getElementById("schedule-form");
+        if (!form) {
+          return;
+        }
+        form.elements.id.value = schedule ? schedule.id : "";
+        form.elements.task.value = schedule ? schedule.task || "" : "";
+        form.elements.cron.value = schedule ? schedule.cron || "" : "";
+        form.elements.execution_mode.value = (schedule && schedule.execution_mode) || "read_only";
+        form.elements.workspace.value = schedule ? schedule.workspace || "" : "";
+        form.elements.max_rounds.value = schedule && schedule.max_rounds ? String(schedule.max_rounds) : "";
+        form.elements.enabled.checked = schedule ? Boolean(schedule.enabled) : true;
+        form.hidden = false;
+        const submitButton = document.getElementById("schedule-submit-button");
+        if (submitButton) {
+          submitButton.textContent = schedule ? "Update Schedule" : "Save Schedule";
+        }
+        form.elements.task.focus();
+      }
+
+      function hideScheduleForm() {
+        const form = document.getElementById("schedule-form");
+        if (!form) {
+          return;
+        }
+        form.reset();
+        form.elements.id.value = "";
+        form.hidden = true;
+      }
+
+      async function submitScheduleForm(event) {
+        event.preventDefault();
+        if (!state.writesEnabled) {
+          setSchedulesBanner(
+            "Managing schedules is disabled because TEAMAI_ALLOW_WRITES is false.",
+            "fail",
+          );
+          return;
+        }
+        const form = event.currentTarget;
+        const task = form.elements.task.value.trim();
+        const cron = form.elements.cron.value.trim();
+        if (!task || !cron) {
+          setSchedulesBanner("Task and cron are required.", "fail");
+          return;
+        }
+        const payload = {
+          task,
+          cron,
+          execution_mode: form.elements.execution_mode.value || "read_only",
+          enabled: form.elements.enabled.checked,
+        };
+        const idValue = form.elements.id.value.trim();
+        if (idValue) {
+          payload.id = idValue;
+        }
+        const workspaceValue = form.elements.workspace.value.trim();
+        if (workspaceValue) {
+          payload.workspace = workspaceValue;
+        }
+        const maxRoundsValue = form.elements.max_rounds.value.trim();
+        if (maxRoundsValue) {
+          payload.max_rounds = Number(maxRoundsValue);
+        }
+        const verb = idValue ? "Updating" : "Creating";
+        setSchedulesBanner(`${verb} schedule...`, "");
+        try {
+          const response = await fetchJson("/v1/schedules", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const finished = idValue ? "updated" : "created";
+          setSchedulesBanner(`Schedule ${response.id} ${finished}.`, "ok");
+          hideScheduleForm();
+        } catch (error) {
+          setSchedulesBanner(error.message || String(error), "fail");
+        }
+        await loadSummary();
+      }
+
+      async function handleScheduleAction(scheduleId, action) {
+        if (!scheduleId || !action) {
+          return;
+        }
+        if (!state.writesEnabled) {
+          setSchedulesBanner(
+            "Managing schedules is disabled because TEAMAI_ALLOW_WRITES is false.",
+            "fail",
+          );
+          return;
+        }
+        if (action === "edit") {
+          const schedule = findScheduleById(scheduleId);
+          if (!schedule) {
+            setSchedulesBanner(`Schedule ${scheduleId} not found.`, "fail");
+            return;
+          }
+          showScheduleForm(schedule);
+          setSchedulesBanner(`Editing ${scheduleId}.`, "");
+          return;
+        }
+        if (action === "delete") {
+          if (!window.confirm(`Delete schedule ${scheduleId}?`)) {
+            return;
+          }
+          setSchedulesBanner(`Deleting schedule ${scheduleId}...`, "");
+          try {
+            await fetchJson(`/v1/schedules/${encodeURIComponent(scheduleId)}`, {
+              method: "DELETE",
+            });
+            setSchedulesBanner(`Schedule ${scheduleId} deleted.`, "ok");
+          } catch (error) {
+            setSchedulesBanner(error.message || String(error), "fail");
+          }
+          await loadSummary();
+          return;
+        }
+        if (action === "toggle") {
+          setSchedulesBanner(`Toggling schedule ${scheduleId}...`, "");
+          try {
+            const response = await fetchJson(
+              `/v1/schedules/${encodeURIComponent(scheduleId)}/toggle`,
+              { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+            );
+            const newState = response.schedule && response.schedule.enabled ? "enabled" : "disabled";
+            setSchedulesBanner(`Schedule ${scheduleId} ${newState}.`, "ok");
+          } catch (error) {
+            setSchedulesBanner(error.message || String(error), "fail");
+          }
+          await loadSummary();
+        }
       }
 
       function renderTeams(items) {
@@ -957,9 +1186,19 @@ def render_dashboard_html() -> str:
             state.selectedJobId = jobs.recent[0].job_id;
           }
 
+          state.schedules = schedules.items || [];
+
+          const scheduleNewButton = document.getElementById("schedule-new-button");
+          if (scheduleNewButton) {
+            scheduleNewButton.disabled = !writesEnabled;
+            scheduleNewButton.title = writesEnabled
+              ? "Create a new scheduled automation."
+              : "Managing schedules is disabled because TEAMAI_ALLOW_WRITES is false.";
+          }
+
           renderJobs(jobs.recent || []);
           renderApprovals(approvals.items || []);
-          renderSchedules(schedules.items || []);
+          renderSchedules(state.schedules);
           renderTeams(teams.items || []);
           renderConversations(conversations.items || []);
           await loadJobEvents(state.selectedJobId);
@@ -1038,6 +1277,31 @@ def render_dashboard_html() -> str:
         handleApprovalAction(approvalId, action);
       });
       document.getElementById("prune-stale-button").addEventListener("click", handlePruneStale);
+      document.getElementById("schedules-list").addEventListener("click", (event) => {
+        const button = event.target.closest("[data-schedule-action]");
+        if (!button || button.disabled) {
+          return;
+        }
+        const scheduleId = button.dataset.scheduleId;
+        const action = button.dataset.scheduleAction;
+        handleScheduleAction(scheduleId, action);
+      });
+      document.getElementById("schedule-new-button").addEventListener("click", () => {
+        if (!state.writesEnabled) {
+          setSchedulesBanner(
+            "Managing schedules is disabled because TEAMAI_ALLOW_WRITES is false.",
+            "fail",
+          );
+          return;
+        }
+        showScheduleForm(null);
+        setSchedulesBanner("Creating a new schedule.", "");
+      });
+      document.getElementById("schedule-cancel-button").addEventListener("click", () => {
+        hideScheduleForm();
+        setSchedulesBanner("Schedule form closed.", "");
+      });
+      document.getElementById("schedule-form").addEventListener("submit", submitScheduleForm);
 
       loadSummary();
       setInterval(loadSummary, 5000);

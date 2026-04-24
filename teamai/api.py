@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import queue
+import sys
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -246,6 +248,36 @@ def create_app(
                         break
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    # ---------------------------------------------------------------- settings
+    @app.post("/v1/settings/allow_writes")
+    def set_allow_writes(body: dict[str, object]) -> dict[str, object]:
+        """Flip the in-process allow_writes flag.
+
+        Not persisted — a daemon restart reverts to the TEAMAI_ALLOW_WRITES
+        env value. Accepts ``{"allow_writes": bool}``. Emits an audit line
+        on stderr. The same flag is surfaced by ``/v1/dashboard/summary.safety``
+        and gates the schedule/apply-approval endpoints, so toggling here
+        takes effect on the next request.
+        """
+        nonlocal app_settings
+        value = body.get("allow_writes") if isinstance(body, dict) else None
+        if not isinstance(value, bool):
+            raise HTTPException(
+                status_code=422,
+                detail="'allow_writes' must be a boolean.",
+            )
+        previous = bool(app_settings.allow_writes)
+        app_settings = dataclasses.replace(app_settings, allow_writes=value)
+        print(
+            f"[teamai] audit: allow_writes {previous} -> {value} via POST /v1/settings/allow_writes",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {
+            "allow_writes": bool(app_settings.allow_writes),
+            "posture": "writes_enabled" if app_settings.allow_writes else "read_only",
+        }
 
     # ---------------------------------------------------------------- scheduler
     def _fire_scheduled_task(entry: ScheduleEntry) -> str | None:

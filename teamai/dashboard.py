@@ -525,7 +525,7 @@ def render_dashboard_html() -> str:
           <span class="pill mono" id="hero-model">Loading model...</span>
           <span class="pill mono" id="hero-workspace">Loading workspace...</span>
           <span class="status" id="hero-status" data-tone="warn">Connecting...</span>
-          <span class="status" id="hero-writes" data-tone="ok" title="Write safety posture from TEAMAI_ALLOW_WRITES">writes: read-only</span>
+          <span class="status" id="hero-writes" data-tone="ok" role="button" tabindex="0" style="cursor:pointer" title="Click to toggle write safety posture (reverts on daemon restart)">writes: read-only</span>
         </div>
         <div class="tiles">
           <div class="tile">
@@ -1270,8 +1270,8 @@ def render_dashboard_html() -> str:
           writesElement.textContent = writesEnabled ? "writes: enabled" : "writes: read-only";
           writesElement.dataset.tone = writesEnabled ? "warn" : "ok";
           writesElement.title = writesEnabled
-            ? "TEAMAI_ALLOW_WRITES=true — approved patches can be applied to the workspace."
-            : "TEAMAI_ALLOW_WRITES=false — runs stay read-only. Set it true to enable approved writes.";
+            ? "Writes enabled — approved patches can be applied. Click to disable (reverts on daemon restart)."
+            : "Writes disabled — runs stay read-only. Click to enable (reverts on daemon restart).";
 
           document.getElementById("stat-jobs").textContent = String((jobs.recent || []).length);
           document.getElementById("stat-running").textContent = String((jobs.counts || {}).running || 0);
@@ -1304,6 +1304,44 @@ def render_dashboard_html() -> str:
           statusElement.dataset.tone = "fail";
           document.getElementById("submit-banner").textContent = error.message || String(error);
           document.getElementById("submit-banner").dataset.tone = "fail";
+        }
+      }
+
+      async function handleWritesToggle() {
+        const nextValue = !state.writesEnabled;
+        if (nextValue) {
+          const workspace = document.getElementById("hero-workspace").textContent || "the workspace";
+          const proceed = window.confirm(
+            `This permits approved patches to write to ${workspace}. Continue?`
+          );
+          if (!proceed) {
+            return;
+          }
+        }
+        const banner = document.getElementById("submit-banner");
+        banner.textContent = "Updating write safety posture...";
+        banner.dataset.tone = "";
+        try {
+          const body = await fetchJson("/v1/settings/allow_writes", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ allow_writes: nextValue }),
+          });
+          state.writesEnabled = Boolean(body.allow_writes);
+          const writesElement = document.getElementById("hero-writes");
+          writesElement.textContent = state.writesEnabled ? "writes: enabled" : "writes: read-only";
+          writesElement.dataset.tone = state.writesEnabled ? "warn" : "ok";
+          writesElement.title = state.writesEnabled
+            ? "Writes enabled — approved patches can be applied. Click to disable (reverts on daemon restart)."
+            : "Writes disabled — runs stay read-only. Click to enable (reverts on daemon restart).";
+          banner.textContent = state.writesEnabled
+            ? "Writes enabled. Approved patches can now be applied."
+            : "Writes disabled. Runs stay read-only.";
+          banner.dataset.tone = state.writesEnabled ? "warn" : "ok";
+          await loadSummary();
+        } catch (error) {
+          banner.textContent = error.message || String(error);
+          banner.dataset.tone = "fail";
         }
       }
 
@@ -1355,6 +1393,13 @@ def render_dashboard_html() -> str:
 
       document.getElementById("run-form").addEventListener("submit", submitJob);
       document.getElementById("refresh-button").addEventListener("click", loadSummary);
+      document.getElementById("hero-writes").addEventListener("click", handleWritesToggle);
+      document.getElementById("hero-writes").addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          handleWritesToggle();
+        }
+      });
       document.getElementById("jobs-list").addEventListener("click", (event) => {
         const button = event.target.closest("[data-job-id]");
         if (!button) {

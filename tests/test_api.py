@@ -591,6 +591,74 @@ class APIStreamingTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_settings_allow_writes_toggle_cycles_write_gates(self) -> None:
+        approval_id = self._seed_pending_approval()
+
+        # Initially blocked: setUp builds the app with allow_writes=False.
+        pre = self.client.post(f"/v1/approvals/{approval_id}/apply")
+        self.assertEqual(pre.status_code, 403)
+
+        toggle_on = self.client.post(
+            "/v1/settings/allow_writes",
+            json={"allow_writes": True},
+        )
+        self.assertEqual(toggle_on.status_code, 200)
+        body_on = toggle_on.json()
+        self.assertTrue(body_on["allow_writes"])
+        self.assertEqual(body_on["posture"], "writes_enabled")
+
+        # Same approval now applies because the endpoint gate reads the
+        # mutated settings via closure at request time.
+        apply_response = self.client.post(f"/v1/approvals/{approval_id}/apply")
+        self.assertEqual(apply_response.status_code, 200)
+        self.assertEqual(
+            (self.workspace / "note.md").read_text(encoding="utf-8"),
+            "after\n",
+        )
+
+        # Dashboard summary should reflect the toggled-on posture.
+        with patch("teamai.api.load_schedules", return_value=[]):
+            summary_on = self.client.get("/v1/dashboard/summary?limit=1")
+        self.assertEqual(summary_on.status_code, 200)
+        self.assertTrue(summary_on.json()["safety"]["allow_writes"])
+
+        toggle_off = self.client.post(
+            "/v1/settings/allow_writes",
+            json={"allow_writes": False},
+        )
+        self.assertEqual(toggle_off.status_code, 200)
+        body_off = toggle_off.json()
+        self.assertFalse(body_off["allow_writes"])
+        self.assertEqual(body_off["posture"], "read_only")
+
+        # Schedule creation should 403 again now that writes are off.
+        with patch(
+            "teamai.scheduler._schedules_path",
+            return_value=self._isolated_schedules_path(),
+        ):
+            sched_response = self.client.post(
+                "/v1/schedules",
+                json={"task": "Run evals", "cron": "0 3 * * *"},
+            )
+        self.assertEqual(sched_response.status_code, 403)
+
+    def test_settings_allow_writes_rejects_invalid_body(self) -> None:
+        missing = self.client.post("/v1/settings/allow_writes", json={})
+        self.assertEqual(missing.status_code, 422)
+        self.assertIn("allow_writes", missing.json()["detail"])
+
+        wrong_type = self.client.post(
+            "/v1/settings/allow_writes",
+            json={"allow_writes": "yes"},
+        )
+        self.assertEqual(wrong_type.status_code, 422)
+
+        # State must be unchanged after rejections.
+        with patch("teamai.api.load_schedules", return_value=[]):
+            summary = self.client.get("/v1/dashboard/summary?limit=1")
+        self.assertEqual(summary.status_code, 200)
+        self.assertFalse(summary.json()["safety"]["allow_writes"])
+
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()
         template = _TemplateSupervisor()

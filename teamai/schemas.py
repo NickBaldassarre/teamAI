@@ -333,7 +333,7 @@ class HandoffPacket(BaseModel):
 
 class JobResponse(BaseModel):
     job_id: str
-    status: Literal["queued", "running", "completed", "failed"]
+    status: Literal["queued", "running", "completed", "failed", "cancelled"]
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None

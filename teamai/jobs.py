@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from .events import build_status_event
 from .schemas import JobResponse, RunEvent, RunRequest, RunResult
 
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
 
 @dataclass
 class _JobRecord:
@@ -56,6 +58,8 @@ class InMemoryJobStore:
     def mark_running(self, job_id: str) -> None:
         with self._condition:
             record = self._records[job_id]
+            if record.status in _TERMINAL_STATUSES:
+                return
             record.status = "running"
             record.started_at = datetime.now(timezone.utc)
             self._append_record_event(
@@ -72,6 +76,8 @@ class InMemoryJobStore:
     def mark_completed(self, job_id: str, result: RunResult) -> None:
         with self._condition:
             record = self._records[job_id]
+            if record.status in _TERMINAL_STATUSES:
+                return
             record.status = "completed"
             record.result = result
             record.completed_at = datetime.now(timezone.utc)
@@ -90,6 +96,8 @@ class InMemoryJobStore:
     def mark_failed(self, job_id: str, error: str) -> None:
         with self._condition:
             record = self._records[job_id]
+            if record.status in _TERMINAL_STATUSES:
+                return
             record.status = "failed"
             record.error = error
             record.completed_at = datetime.now(timezone.utc)
@@ -104,6 +112,40 @@ class InMemoryJobStore:
                 ),
             )
             self._condition.notify_all()
+
+    def mark_cancelled(self, job_id: str) -> JobResponse:
+        """Flag a queued/running job as cancelled.
+
+        No thread-kill — the worker thread continues to execute, but once
+        the record is in the terminal "cancelled" state, subsequent
+        ``mark_completed``/``mark_failed`` calls become no-ops (see
+        guards above), so the worker's result is effectively discarded.
+
+        Raises ``KeyError`` if the job id is unknown and ``ValueError``
+        if the record is already in a terminal state.
+        """
+        with self._condition:
+            if job_id not in self._records:
+                raise KeyError("Job not found")
+            record = self._records[job_id]
+            if record.status in _TERMINAL_STATUSES:
+                raise ValueError(
+                    f"Job is already terminal (status={record.status})."
+                )
+            record.status = "cancelled"
+            record.completed_at = datetime.now(timezone.utc)
+            self._append_record_event(
+                record,
+                build_status_event(
+                    sequence=0,
+                    kind="job_cancelled",
+                    message="Job cancelled by user.",
+                    terminal=True,
+                    data={"job_id": job_id},
+                ),
+            )
+            self._condition.notify_all()
+            return self._to_response(record)
 
     def get(self, job_id: str) -> JobResponse:
         with self._lock:
@@ -125,6 +167,7 @@ class InMemoryJobStore:
                 "running": 0,
                 "completed": 0,
                 "failed": 0,
+                "cancelled": 0,
             }
             for record in self._records.values():
                 if record.status in counts:
@@ -159,7 +202,7 @@ class InMemoryJobStore:
 
     def is_terminal(self, job_id: str) -> bool:
         with self._lock:
-            return self._records[job_id].status in {"completed", "failed"}
+            return self._records[job_id].status in _TERMINAL_STATUSES
 
     @staticmethod
     def _to_response(record: _JobRecord) -> JobResponse:

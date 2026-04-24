@@ -215,6 +215,47 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Job not found") from exc
 
+    @app.post("/v1/jobs/{job_id}/cancel", response_model=JobResponse)
+    def cancel_job(job_id: str) -> JobResponse:
+        """Flag a queued/running job as cancelled.
+
+        No thread-kill — the worker thread continues executing, but once
+        the record is in the terminal ``cancelled`` state, the store
+        ignores its subsequent ``mark_completed``/``mark_failed`` calls,
+        so the result is effectively discarded. Returns the updated
+        ``JobResponse``. 404 if the id is missing; 409 if the record is
+        already in a terminal state.
+        """
+        try:
+            return job_store.mark_cancelled(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v1/jobs/{job_id}/transcript")
+    def get_job_transcript(job_id: str) -> dict[str, object]:
+        """Return the execution transcript for a completed job.
+
+        404 if the job id is missing. 409 if the job has not reached a
+        ``completed`` state (queued/running/failed/cancelled all lack a
+        final ``RunResult`` transcript).
+        """
+        try:
+            job = job_store.get(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+        if job.status != "completed" or job.result is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job has not completed yet (status={job.status}).",
+            )
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "transcript": job.result.transcript or "",
+        }
+
     @app.get("/v1/jobs/{job_id}/events", response_model=list[RunEvent])
     def get_job_events(job_id: str, after_sequence: int = 0) -> list[RunEvent]:
         try:

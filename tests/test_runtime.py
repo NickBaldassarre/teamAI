@@ -12,6 +12,7 @@ from unittest.mock import patch
 from teamai.config import Settings
 from teamai.runtime import (
     default_runtime_subprocess_runner,
+    detect_package_install_shadow,
     run_runtime_doctor,
     run_runtime_probe,
     select_runtime_python,
@@ -147,6 +148,30 @@ class RuntimeSelectionTest(unittest.TestCase):
         self.assertEqual(report.probe.status, "unavailable")
         self.assertEqual(report.probe.reason, "runtime_probe_subprocess_crash")
         self.assertIn("Terminal bridge", report.probe.summary)
+
+    def test_detect_package_install_shadow_flags_mismatched_source(self) -> None:
+        in_tree_init = self.project_root / "teamai" / "__init__.py"
+        in_tree_init.parent.mkdir(parents=True, exist_ok=True)
+        in_tree_init.write_text("", encoding="utf-8")
+        shadow_init = self.project_root / "site-packages" / "teamai" / "__init__.py"
+        shadow_init.parent.mkdir(parents=True, exist_ok=True)
+        shadow_init.write_text("", encoding="utf-8")
+
+        self.assertIsNone(
+            detect_package_install_shadow(
+                self.project_root,
+                package_init_path=in_tree_init,
+            )
+        )
+
+        warning = detect_package_install_shadow(
+            self.project_root,
+            package_init_path=shadow_init,
+        )
+        self.assertIsNotNone(warning)
+        assert warning is not None
+        self.assertIn("pip install -e .", warning)
+        self.assertIn(str(shadow_init.resolve()), warning)
 
 
 class RuntimeIntegrationTest(unittest.TestCase):

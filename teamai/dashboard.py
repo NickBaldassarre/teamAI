@@ -173,6 +173,30 @@ def render_dashboard_html() -> str:
         background: rgba(255, 125, 103, 0.12);
       }
 
+      .task-strip {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 10px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 6px;
+      }
+
+      .task-chip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        font-size: 0.85rem;
+      }
+
+      .task-deps {
+        color: var(--muted);
+        font-size: 0.78rem;
+        font-family: "SF Mono", "Cascadia Mono", "Menlo", "Consolas", monospace;
+      }
+
       .tiles {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -742,6 +766,8 @@ def render_dashboard_html() -> str:
         recentJobs: [],
         transcripts: {},
         selectedJobTranscriptOpen: false,
+        teamTasks: {},
+        openTeamTasks: new Set(),
       };
 
       function escapeHtml(value) {
@@ -1262,19 +1288,86 @@ def render_dashboard_html() -> str:
           container.innerHTML = '<div class="empty">No active team plans. Click <span class="mono">Launch Team</span> or POST /v1/team.</div>';
           return;
         }
-        container.innerHTML = items.map((item) => `
-          <div class="list-item">
-            <div class="list-title">
-              <strong>${escapeHtml(item.goal)}</strong>
-              ${statusMarkup(item.status)}
+        container.innerHTML = items.map((item) => {
+          const teamIdRaw = item.team_id || "";
+          const teamId = escapeHtml(teamIdRaw);
+          const tasksOpen = state.openTeamTasks.has(teamIdRaw);
+          const inspectLabel = tasksOpen ? "Hide Tasks" : "Show Tasks";
+          const tasksPane = tasksOpen
+            ? `<div class="task-strip" data-team-tasks-for="${teamId}">${renderTaskChips(state.teamTasks[teamIdRaw])}</div>`
+            : "";
+          return `
+            <div class="list-item" data-team-id="${teamId}">
+              <div class="list-title">
+                <strong>${escapeHtml(item.goal)}</strong>
+                ${statusMarkup(item.status)}
+              </div>
+              <div class="meta-row">
+                <span class="tag mono">${teamId}</span>
+                <span>${escapeHtml(String(item.task_count))} tasks</span>
+                <span>${escapeHtml(String(item.completed_tasks))} completed</span>
+              </div>
+              <div class="action-row">
+                <button
+                  type="button"
+                  class="button secondary action-button"
+                  data-team-action="inspect"
+                  data-team-id="${teamId}"
+                  title="Show per-task progress for this team plan."
+                >${inspectLabel}</button>
+              </div>
+              ${tasksPane}
             </div>
-            <div class="meta-row">
-              <span class="tag mono">${escapeHtml(item.team_id)}</span>
-              <span>${escapeHtml(String(item.task_count))} tasks</span>
-              <span>${escapeHtml(String(item.completed_tasks))} completed</span>
+          `;
+        }).join("");
+      }
+
+      function renderTaskChips(tasks) {
+        if (tasks === undefined) {
+          return '<span class="task-deps">Loading tasks...</span>';
+        }
+        if (!tasks.length) {
+          return '<span class="task-deps">(no tasks recorded)</span>';
+        }
+        return tasks.map((task) => {
+          const deps = (task.depends_on || []).map((d) => escapeHtml(d)).join(", ");
+          const depsMarkup = deps ? `<span class="task-deps">&larr; ${deps}</span>` : "";
+          const taskLabel = task.task ? `<span>${escapeHtml(task.task)}</span>` : "";
+          return `
+            <div class="task-chip">
+              <span class="mono">${escapeHtml(task.spawn_id || "")}</span>
+              ${statusMarkup(task.status || "pending")}
+              ${depsMarkup}
+              ${taskLabel}
             </div>
-          </div>
-        `).join("");
+          `;
+        }).join("");
+      }
+
+      async function handleTeamInspect(teamId) {
+        if (!teamId) {
+          return;
+        }
+        if (state.openTeamTasks.has(teamId)) {
+          state.openTeamTasks.delete(teamId);
+          delete state.teamTasks[teamId];
+          await loadSummary();
+          return;
+        }
+        state.openTeamTasks.add(teamId);
+        await loadSummary();
+        await refreshTeamTasks(teamId);
+        await loadSummary();
+      }
+
+      async function refreshTeamTasks(teamId) {
+        try {
+          const tasks = await fetchJson(`/v1/team/${encodeURIComponent(teamId)}/tasks`);
+          state.teamTasks[teamId] = Array.isArray(tasks) ? tasks : [];
+        } catch (error) {
+          state.teamTasks[teamId] = [];
+          setTeamsBanner(error.message || String(error), "fail");
+        }
       }
 
       function renderConversations(items) {
@@ -1429,7 +1522,14 @@ def render_dashboard_html() -> str:
           renderJobs(jobs.recent || []);
           renderApprovals(approvals.items || []);
           renderSchedules(state.schedules);
-          renderTeams(teams.items || []);
+          const teamItems = teams.items || [];
+          const openTeamIds = teamItems
+            .map((t) => t.team_id)
+            .filter((id) => id && state.openTeamTasks.has(id));
+          if (openTeamIds.length) {
+            await Promise.all(openTeamIds.map((id) => refreshTeamTasks(id)));
+          }
+          renderTeams(teamItems);
           renderConversations(conversations.items || []);
           await loadJobEvents(state.selectedJobId);
         } catch (error) {
@@ -1569,6 +1669,17 @@ def render_dashboard_html() -> str:
         const scheduleId = button.dataset.scheduleId;
         const action = button.dataset.scheduleAction;
         handleScheduleAction(scheduleId, action);
+      });
+      document.getElementById("teams-list").addEventListener("click", (event) => {
+        const button = event.target.closest("[data-team-action]");
+        if (!button || button.disabled) {
+          return;
+        }
+        const teamId = button.dataset.teamId;
+        const action = button.dataset.teamAction;
+        if (action === "inspect") {
+          handleTeamInspect(teamId);
+        }
       });
       document.getElementById("schedule-new-button").addEventListener("click", () => {
         if (!state.writesEnabled) {

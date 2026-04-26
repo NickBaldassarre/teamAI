@@ -790,6 +790,53 @@ class APIStreamingTest(unittest.TestCase):
             restarted = Settings.from_env()
         self.assertTrue(restarted.allow_writes)
 
+    def test_team_tasks_endpoint_returns_task_list_shape(self) -> None:
+        # Mock AgentTeam so decompose returns a known plan and execute is a
+        # no-op; the dashboard's "Show Tasks" toggle reads this endpoint each
+        # poll tick to render the per-task chip strip.
+        from unittest.mock import MagicMock
+
+        from teamai.schemas import SpawnedTaskRecord, TeamPlan
+
+        fake_plan = TeamPlan(
+            team_id="team_test_progress",
+            goal="Test goal",
+            tasks=[
+                SpawnedTaskRecord(
+                    spawn_id="spawn_a",
+                    task="First subtask",
+                    status="completed",
+                ),
+                SpawnedTaskRecord(
+                    spawn_id="spawn_b",
+                    task="Depends on first",
+                    status="running",
+                    depends_on=["spawn_a"],
+                ),
+            ],
+        )
+        fake_team = MagicMock()
+        fake_team.decompose.return_value = fake_plan
+
+        with patch("teamai.spawn.AgentTeam", return_value=fake_team):
+            create = self.client.post("/v1/team", json={"goal": "Test goal"})
+        self.assertEqual(create.status_code, 200)
+        self.assertEqual(create.json()["team_id"], "team_test_progress")
+
+        tasks_response = self.client.get("/v1/team/team_test_progress/tasks")
+        self.assertEqual(tasks_response.status_code, 200)
+        body = tasks_response.json()
+        self.assertEqual(len(body), 2)
+        self.assertEqual(body[0]["spawn_id"], "spawn_a")
+        self.assertEqual(body[0]["status"], "completed")
+        self.assertEqual(body[0]["depends_on"], [])
+        self.assertEqual(body[1]["spawn_id"], "spawn_b")
+        self.assertEqual(body[1]["status"], "running")
+        self.assertEqual(body[1]["depends_on"], ["spawn_a"])
+
+        missing = self.client.get("/v1/team/team_does_not_exist/tasks")
+        self.assertEqual(missing.status_code, 404)
+
     def test_team_endpoint_rejects_missing_goal(self) -> None:
         # The teams-launch dashboard form posts {goal, workspace_path?} —
         # the endpoint must reject empty bodies before spawning the

@@ -849,6 +849,62 @@ class APIStreamingTest(unittest.TestCase):
         empty_goal = self.client.post("/v1/team", json={"goal": ""})
         self.assertEqual(empty_goal.status_code, 400)
 
+    def test_team_endpoint_happy_path_seeds_store_and_starts_execution(self) -> None:
+        import threading
+        from unittest.mock import MagicMock
+
+        from teamai.schemas import SpawnedTaskRecord, TeamPlan
+
+        fake_plan = TeamPlan(
+            team_id="team_happy_path",
+            goal="Refactor the cache layer",
+            tasks=[
+                SpawnedTaskRecord(spawn_id="spawn_a", task="Audit usages"),
+                SpawnedTaskRecord(
+                    spawn_id="spawn_b",
+                    task="Apply rename",
+                    depends_on=["spawn_a"],
+                ),
+                SpawnedTaskRecord(
+                    spawn_id="spawn_c",
+                    task="Run regression tests",
+                    depends_on=["spawn_b"],
+                ),
+            ],
+        )
+        execute_called = threading.Event()
+        fake_team = MagicMock()
+        fake_team.decompose.return_value = fake_plan
+        fake_team.execute.side_effect = lambda *args, **kwargs: execute_called.set()
+
+        with patch("teamai.spawn.AgentTeam", return_value=fake_team) as agent_team_cls:
+            response = self.client.post(
+                "/v1/team",
+                json={"goal": "Refactor the cache layer"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["team_id"], "team_happy_path")
+        self.assertEqual(body["goal"], "Refactor the cache layer")
+        self.assertEqual(len(body["tasks"]), 3)
+        self.assertEqual([t["spawn_id"] for t in body["tasks"]], ["spawn_a", "spawn_b", "spawn_c"])
+
+        # The plan was decomposed once with the user's goal and the team is
+        # observable via GET /v1/team/{id} — proves it landed in _team_store.
+        agent_team_cls.assert_called_once()
+        fake_team.decompose.assert_called_once_with(
+            "Refactor the cache layer",
+            workspace_path=None,
+        )
+        get_response = self.client.get("/v1/team/team_happy_path")
+        self.assertEqual(get_response.status_code, 200)
+        self.assertEqual(get_response.json()["team_id"], "team_happy_path")
+
+        # The background thread eventually invokes team.execute. Wait briefly
+        # so the assertion is not racy on slow CI.
+        self.assertTrue(execute_called.wait(timeout=2.0))
+
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()
         template = _TemplateSupervisor()

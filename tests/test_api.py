@@ -749,6 +749,18 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(summary.status_code, 200)
         self.assertFalse(summary.json()["safety"]["allow_writes"])
 
+    def test_team_endpoint_rejects_missing_goal(self) -> None:
+        # The teams-launch dashboard form posts {goal, workspace_path?} —
+        # the endpoint must reject empty bodies before spawning the
+        # background AgentTeam thread, otherwise an empty goal would
+        # leak into decomposition.
+        missing = self.client.post("/v1/team", json={})
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("goal", missing.json()["detail"])
+
+        empty_goal = self.client.post("/v1/team", json={"goal": ""})
+        self.assertEqual(empty_goal.status_code, 400)
+
     def test_run_endpoint_clones_supervisor_per_request_when_supported(self) -> None:
         self.client.close()
         template = _TemplateSupervisor()

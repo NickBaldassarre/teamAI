@@ -694,10 +694,26 @@ def render_dashboard_html() -> str:
                 <h2>Team Plans</h2>
                 <div class="panel-copy">Multi-agent plans and current execution state.</div>
               </div>
+              <button class="button secondary" id="team-new-button" type="button">Launch Team</button>
             </div>
+            <form id="team-form" hidden>
+              <label>
+                Goal
+                <input name="goal" type="text" required placeholder="e.g. Audit the supervisor for missing test coverage" />
+              </label>
+              <label>
+                Workspace (optional)
+                <input name="workspace_path" type="text" placeholder="Path. Leave blank for default." />
+              </label>
+              <div class="action-row">
+                <button class="button action-button" type="submit" id="team-submit-button">Launch</button>
+                <button class="button secondary action-button" type="button" id="team-cancel-button">Cancel</button>
+              </div>
+            </form>
             <div class="list" id="teams-list">
-              <div class="empty">No active team plans. Start one with `teamai team run` or POST /v1/team.</div>
+              <div class="empty">No active team plans. Click <span class="mono">Launch Team</span> or POST /v1/team.</div>
             </div>
+            <div class="banner" id="teams-banner">Launch a multi-agent plan here. Decomposition runs in the background.</div>
           </section>
 
           <section class="panel">
@@ -1184,10 +1200,66 @@ def render_dashboard_html() -> str:
         }
       }
 
+      function setTeamsBanner(message, tone) {
+        const banner = document.getElementById("teams-banner");
+        if (!banner) {
+          return;
+        }
+        banner.textContent = message;
+        banner.dataset.tone = tone || "";
+      }
+
+      function showTeamForm() {
+        const form = document.getElementById("team-form");
+        if (!form) {
+          return;
+        }
+        form.reset();
+        form.hidden = false;
+        form.elements.goal.focus();
+      }
+
+      function hideTeamForm() {
+        const form = document.getElementById("team-form");
+        if (!form) {
+          return;
+        }
+        form.reset();
+        form.hidden = true;
+      }
+
+      async function submitTeamForm(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const goal = form.elements.goal.value.trim();
+        if (!goal) {
+          setTeamsBanner("A goal is required.", "fail");
+          return;
+        }
+        const payload = { goal };
+        const workspaceValue = form.elements.workspace_path.value.trim();
+        if (workspaceValue) {
+          payload.workspace_path = workspaceValue;
+        }
+        setTeamsBanner("Launching team plan...", "");
+        try {
+          const response = await fetchJson("/v1/team", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          setTeamsBanner(`Team ${response.team_id} launched (${response.tasks ? response.tasks.length : 0} tasks).`, "ok");
+          hideTeamForm();
+        } catch (error) {
+          setTeamsBanner(error.message || String(error), "fail");
+        }
+        await loadSummary();
+      }
+
       function renderTeams(items) {
         const container = document.getElementById("teams-list");
         if (!items.length) {
-          container.innerHTML = '<div class="empty">No active team plans. Start one with <span class="mono">teamai team run</span> or POST /v1/team.</div>';
+          container.innerHTML = '<div class="empty">No active team plans. Click <span class="mono">Launch Team</span> or POST /v1/team.</div>';
           return;
         }
         container.innerHTML = items.map((item) => `
@@ -1514,6 +1586,15 @@ def render_dashboard_html() -> str:
         setSchedulesBanner("Schedule form closed.", "");
       });
       document.getElementById("schedule-form").addEventListener("submit", submitScheduleForm);
+      document.getElementById("team-new-button").addEventListener("click", () => {
+        showTeamForm();
+        setTeamsBanner("Describe the goal — the planner will decompose it into subtasks.", "");
+      });
+      document.getElementById("team-cancel-button").addEventListener("click", () => {
+        hideTeamForm();
+        setTeamsBanner("Team form closed.", "");
+      });
+      document.getElementById("team-form").addEventListener("submit", submitTeamForm);
 
       loadSummary();
       setInterval(loadSummary, 5000);

@@ -87,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional feature-branch override used with --auto-push. Protected default branches are blocked.",
     )
     run_parser.add_argument(
+        "--verify-before-commit",
+        action="store_true",
+        help=(
+            "Run the verification gate before auto-committing — on failure, the run aborts the commit "
+            "instead of recording it. Opt-in for `teamai run`; `teamai self` enables this by default."
+        ),
+    )
+    run_parser.add_argument(
         "--stream-format",
         choices=["text", "jsonl"],
         default="text",
@@ -555,6 +563,7 @@ def main() -> int:
             auto_push=bool(args.auto_push),
             push_remote="origin",
             push_branch_name=args.push_branch,
+            verify_before_commit=bool(args.verify_before_commit),
             handoff_engine=args.handoff_engine,
             handoff_model=args.handoff_model,
         )

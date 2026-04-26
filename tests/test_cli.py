@@ -775,6 +775,26 @@ class CLIStreamingTest(unittest.TestCase):
             self.assertEqual(failure_log.read_text(encoding="utf-8"), "tests failed\n")
 
 
+class CLIRunSubcommandFlagsTest(unittest.TestCase):
+    """Argparse-level coverage for the `teamai run` CLI surface."""
+
+    def test_run_subparser_exposes_verify_before_commit_flag(self) -> None:
+        from teamai.cli import build_parser
+
+        parser = build_parser()
+
+        default_args = parser.parse_args(["run", "inspect repo"])
+        self.assertEqual(default_args.command, "run")
+        # Defaults to off so existing `teamai run --auto-commit` workflows
+        # keep their non-gated behavior; opt-in via the explicit flag below.
+        self.assertFalse(default_args.verify_before_commit)
+
+        explicit_args = parser.parse_args(
+            ["run", "inspect repo", "--verify-before-commit"]
+        )
+        self.assertTrue(explicit_args.verify_before_commit)
+
+
 class CLISelfSubcommandTest(unittest.TestCase):
     """Smoke-level coverage for the `teamai self` CLI surface."""
 

@@ -95,6 +95,11 @@ class APIStreamingTest(unittest.TestCase):
             clear=False,
         )
         self.tool_api_env.start()
+        self._runtime_settings_patch = patch(
+            "teamai.runtime_state._runtime_settings_path",
+            return_value=self.workspace / "runtime_settings.json",
+        )
+        self._runtime_settings_patch.start()
         self.settings = Settings(
             model_id="dummy",
             model_revision=None,
@@ -119,6 +124,7 @@ class APIStreamingTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.client.close()
+        self._runtime_settings_patch.stop()
         self.tool_api_env.stop()
         self.temp_dir.cleanup()
 
@@ -748,6 +754,41 @@ class APIStreamingTest(unittest.TestCase):
             summary = self.client.get("/v1/dashboard/summary?limit=1")
         self.assertEqual(summary.status_code, 200)
         self.assertFalse(summary.json()["safety"]["allow_writes"])
+
+    def test_runtime_settings_round_trip_overlays_env_value(self) -> None:
+        from teamai.runtime_state import (
+            load_runtime_settings,
+            save_runtime_settings,
+        )
+
+        save_runtime_settings({"allow_writes": True})
+        self.assertEqual(load_runtime_settings(), {"allow_writes": True})
+
+        # Settings.from_env honours the persisted value even when the env
+        # var defaults to False.
+        with patch.dict(os.environ, {"TEAMAI_ALLOW_WRITES": "0"}, clear=False):
+            reloaded = Settings.from_env()
+        self.assertTrue(reloaded.allow_writes)
+
+        save_runtime_settings({"allow_writes": False})
+        with patch.dict(os.environ, {"TEAMAI_ALLOW_WRITES": "1"}, clear=False):
+            reloaded_off = Settings.from_env()
+        self.assertFalse(reloaded_off.allow_writes)
+
+    def test_settings_allow_writes_endpoint_persists_through_restart(self) -> None:
+        # Toggle ON via the endpoint.
+        toggle = self.client.post(
+            "/v1/settings/allow_writes",
+            json={"allow_writes": True},
+        )
+        self.assertEqual(toggle.status_code, 200)
+        self.assertTrue((self.workspace / "runtime_settings.json").exists())
+
+        # A fresh Settings.from_env (analogous to a daemon restart) sees the
+        # persisted toggle even though the env var stays at its default.
+        with patch.dict(os.environ, {"TEAMAI_ALLOW_WRITES": "0"}, clear=False):
+            restarted = Settings.from_env()
+        self.assertTrue(restarted.allow_writes)
 
     def test_team_endpoint_rejects_missing_goal(self) -> None:
         # The teams-launch dashboard form posts {goal, workspace_path?} —

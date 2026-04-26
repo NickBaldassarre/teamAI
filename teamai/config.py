@@ -86,6 +86,17 @@ class Settings:
             os.getenv("TEAMAI_WORKSPACE_ROOT", ".").strip() or "."
         ).expanduser()
 
+        from .runtime_state import load_runtime_settings
+
+        runtime_state = load_runtime_settings()
+        env_allow_writes = _env_bool("TEAMAI_ALLOW_WRITES", False)
+        persisted_allow_writes = runtime_state.get("allow_writes")
+        allow_writes = (
+            bool(persisted_allow_writes)
+            if isinstance(persisted_allow_writes, bool)
+            else env_allow_writes
+        )
+
         return cls(
             model_id=os.getenv("TEAMAI_MODEL_ID", DEFAULT_MODEL_ID).strip()
             or DEFAULT_MODEL_ID,
@@ -107,7 +118,7 @@ class Settings:
             ),
             temperature=_env_float("TEAMAI_TEMPERATURE", DEFAULT_TEMPERATURE, 0.0, 2.0),
             allow_shell=_env_bool("TEAMAI_ALLOW_SHELL", True),
-            allow_writes=_env_bool("TEAMAI_ALLOW_WRITES", False),
+            allow_writes=allow_writes,
             command_timeout_seconds=_env_int(
                 "TEAMAI_COMMAND_TIMEOUT_SECONDS",
                 DEFAULT_COMMAND_TIMEOUT_SECONDS,

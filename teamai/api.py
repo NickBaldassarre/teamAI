@@ -293,14 +293,17 @@ def create_app(
     # ---------------------------------------------------------------- settings
     @app.post("/v1/settings/allow_writes")
     def set_allow_writes(body: dict[str, object]) -> dict[str, object]:
-        """Flip the in-process allow_writes flag.
+        """Flip the in-process allow_writes flag and persist it.
 
-        Not persisted — a daemon restart reverts to the TEAMAI_ALLOW_WRITES
-        env value. Accepts ``{"allow_writes": bool}``. Emits an audit line
-        on stderr. The same flag is surfaced by ``/v1/dashboard/summary.safety``
-        and gates the schedule/apply-approval endpoints, so toggling here
-        takes effect on the next request.
+        Accepts ``{"allow_writes": bool}``. Persists the chosen value to
+        ``~/.teamai/runtime_settings.json`` so it survives daemon restarts
+        (``Settings.from_env`` overlays the file on top of TEAMAI_ALLOW_WRITES).
+        Emits an audit line on stderr. The flag is surfaced by
+        ``/v1/dashboard/summary.safety`` and gates the schedule/apply-approval
+        endpoints, so toggling here takes effect on the next request.
         """
+        from .runtime_state import load_runtime_settings, save_runtime_settings
+
         nonlocal app_settings
         value = body.get("allow_writes") if isinstance(body, dict) else None
         if not isinstance(value, bool):
@@ -310,6 +313,9 @@ def create_app(
             )
         previous = bool(app_settings.allow_writes)
         app_settings = dataclasses.replace(app_settings, allow_writes=value)
+        persisted = load_runtime_settings()
+        persisted["allow_writes"] = value
+        save_runtime_settings(persisted)
         print(
             f"[teamai] audit: allow_writes {previous} -> {value} via POST /v1/settings/allow_writes",
             file=sys.stderr,

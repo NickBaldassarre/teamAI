@@ -158,6 +158,29 @@ class RuntimeDoctorReport(BaseModel):
     suggested_run_command: str
     suggested_eval_command: str
     suggested_bridge_command: str
+    package_install_warning: str | None = None
+
+
+def detect_package_install_shadow(
+    project_root: Path,
+    *,
+    package_init_path: Path | None = None,
+) -> str | None:
+    if package_init_path is None:
+        import teamai
+
+        package_file = getattr(teamai, "__file__", None)
+        if package_file is None:
+            return None
+        package_init_path = Path(package_file)
+    actual = package_init_path.resolve()
+    expected = (project_root / "teamai" / "__init__.py").resolve()
+    if actual == expected:
+        return None
+    return (
+        f"teamai package imported from {actual}, not the project source at {expected}. "
+        "Reinstall with `pip install -e .` so the .venv shim resolves to the live source tree."
+    )
 
 
 RuntimeSubprocessRunner = Callable[
@@ -360,6 +383,7 @@ def run_runtime_doctor(
             f"{command_prefix} bridge-launch "
             "\"Inspect this repository and identify the next engineering tasks.\" --workspace ."
         ),
+        package_install_warning=detect_package_install_shadow(project_root),
     )
 
 
@@ -399,6 +423,8 @@ def render_runtime_doctor_markdown(report: RuntimeDoctorReport) -> str:
     if report.probe.warnings:
         lines.append("- Warnings:")
         lines.extend(f"  - {warning}" for warning in report.probe.warnings)
+    if report.package_install_warning:
+        lines.append(f"- Package install warning: {report.package_install_warning}")
     lines.extend(
         [
             "",

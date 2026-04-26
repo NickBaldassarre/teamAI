@@ -611,7 +611,11 @@ def render_dashboard_html() -> str:
                 <h2>Run Activity</h2>
                 <div class="panel-copy">Execution events for the selected run.</div>
               </div>
-              <div class="pill mono" id="selected-job-pill">No run selected</div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button class="button secondary" id="job-cancel-button" type="button" hidden>Cancel</button>
+                <button class="button secondary" id="job-log-button" type="button" hidden>Open Log</button>
+                <div class="pill mono" id="selected-job-pill">No run selected</div>
+              </div>
             </div>
             <div class="events" id="events-list">
               <div class="empty">Select a run to inspect its execution events.</div>
@@ -719,6 +723,9 @@ def render_dashboard_html() -> str:
         schedules: [],
         approvalDiffs: {},
         openApprovalDiffs: new Set(),
+        recentJobs: [],
+        transcripts: {},
+        selectedJobTranscriptOpen: false,
       };
 
       function escapeHtml(value) {
@@ -1219,19 +1226,24 @@ def render_dashboard_html() -> str:
       }
 
       async function loadJobEvents(jobId) {
+        const container = document.getElementById("events-list");
         if (!jobId) {
           document.getElementById("selected-job-pill").textContent = "No run selected";
-          document.getElementById("events-list").innerHTML = '<div class="empty">Select a run to inspect its execution events.</div>';
+          container.innerHTML = '<div class="empty">Select a run to inspect its execution events.</div>';
           return;
         }
         state.loadingEventsFor = jobId;
         document.getElementById("selected-job-pill").textContent = jobId;
+        if (state.selectedJobTranscriptOpen && state.transcripts[jobId] !== undefined) {
+          const body = state.transcripts[jobId] || "(empty transcript)";
+          container.innerHTML = `<pre class="mono diff" style="max-height:480px;">${escapeHtml(body)}</pre>`;
+          return;
+        }
         try {
           const items = await fetchJson(`/v1/jobs/${encodeURIComponent(jobId)}/events`);
           if (state.loadingEventsFor !== jobId) {
             return;
           }
-          const container = document.getElementById("events-list");
           if (!items.length) {
             container.innerHTML = '<div class="empty">No events recorded for this run yet.</div>';
             return;
@@ -1243,8 +1255,56 @@ def render_dashboard_html() -> str:
             </div>
           `).join("");
         } catch (error) {
-          document.getElementById("events-list").innerHTML = `<div class="empty">${escapeHtml(error.message || error)}</div>`;
+          container.innerHTML = `<div class="empty">${escapeHtml(error.message || error)}</div>`;
         }
+      }
+
+      function updateJobInspectorControls() {
+        const cancelBtn = document.getElementById("job-cancel-button");
+        const logBtn = document.getElementById("job-log-button");
+        const selected = state.recentJobs.find((job) => job.job_id === state.selectedJobId);
+        if (!selected) {
+          cancelBtn.hidden = true;
+          logBtn.hidden = true;
+          return;
+        }
+        const cancelable = selected.status === "queued" || selected.status === "running";
+        cancelBtn.hidden = !cancelable;
+        const hasTranscript = selected.status === "completed";
+        logBtn.hidden = !hasTranscript;
+        logBtn.textContent = state.selectedJobTranscriptOpen ? "Hide Log" : "Open Log";
+      }
+
+      async function handleCancelJob() {
+        const jobId = state.selectedJobId;
+        if (!jobId) return;
+        const confirmed = window.confirm(
+          `Cancel run ${jobId}?\n\nThe worker keeps executing, but its result will be discarded once the record is terminal.`
+        );
+        if (!confirmed) return;
+        try {
+          await fetchJson(`/v1/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+          await loadSummary();
+        } catch (error) {
+          document.getElementById("events-list").innerHTML =
+            `<div class="empty">Cancel failed: ${escapeHtml(error.message || error)}</div>`;
+        }
+      }
+
+      async function handleToggleLog() {
+        const jobId = state.selectedJobId;
+        if (!jobId) return;
+        state.selectedJobTranscriptOpen = !state.selectedJobTranscriptOpen;
+        if (state.selectedJobTranscriptOpen && state.transcripts[jobId] === undefined) {
+          try {
+            const body = await fetchJson(`/v1/jobs/${encodeURIComponent(jobId)}/transcript`);
+            state.transcripts[jobId] = body.transcript || "";
+          } catch (error) {
+            state.transcripts[jobId] = `Failed to load transcript: ${error.message || error}`;
+          }
+        }
+        updateJobInspectorControls();
+        await loadJobEvents(jobId);
       }
 
       async function loadSummary() {
@@ -1278,9 +1338,11 @@ def render_dashboard_html() -> str:
           document.getElementById("stat-schedules").textContent = String((schedules.items || []).length);
           document.getElementById("stat-approvals").textContent = String(approvals.count || (approvals.items || []).length || 0);
 
-          if (!state.selectedJobId && (jobs.recent || []).length) {
-            state.selectedJobId = jobs.recent[0].job_id;
+          state.recentJobs = jobs.recent || [];
+          if (!state.selectedJobId && state.recentJobs.length) {
+            state.selectedJobId = state.recentJobs[0].job_id;
           }
+          updateJobInspectorControls();
 
           state.schedules = schedules.items || [];
 
@@ -1405,9 +1467,14 @@ def render_dashboard_html() -> str:
         if (!button) {
           return;
         }
+        if (state.selectedJobId !== button.dataset.jobId) {
+          state.selectedJobTranscriptOpen = false;
+        }
         state.selectedJobId = button.dataset.jobId;
         loadSummary();
       });
+      document.getElementById("job-cancel-button").addEventListener("click", handleCancelJob);
+      document.getElementById("job-log-button").addEventListener("click", handleToggleLog);
       document.getElementById("approvals-list").addEventListener("click", (event) => {
         const button = event.target.closest("[data-approval-action]");
         if (!button || button.disabled) {

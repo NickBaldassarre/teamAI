@@ -591,6 +591,96 @@ class APIStreamingTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_cancel_job_endpoint_marks_queued_record_cancelled(self) -> None:
+        # Seed a queued record directly — no worker thread runs, so the
+        # record stays queued until the cancel endpoint flips it.
+        request = RunRequest(
+            task="inspect",
+            workspace_path=".",
+            execution_mode="read_only",
+        )
+        record = self.jobs.create(request)
+
+        response = self.client.post(f"/v1/jobs/{record.job_id}/cancel")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["job_id"], record.job_id)
+        self.assertEqual(body["status"], "cancelled")
+        self.assertEqual(self.jobs.get(record.job_id).status, "cancelled")
+
+    def test_cancel_job_endpoint_returns_409_when_terminal(self) -> None:
+        request = RunRequest(
+            task="inspect",
+            workspace_path=".",
+            execution_mode="read_only",
+        )
+        record = self.jobs.create(request)
+        result = RunResult(
+            status="completed",
+            model_id="dummy",
+            workspace=str(self.workspace),
+            execution_mode="read_only",
+            stop_reason="verifier_declared_complete",
+            final_answer="done",
+            transcript="demo transcript",
+            warnings=[],
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        self.jobs.mark_running(record.job_id)
+        self.jobs.mark_completed(record.job_id, result)
+
+        response = self.client.post(f"/v1/jobs/{record.job_id}/cancel")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("terminal", response.json()["detail"])
+
+    def test_cancel_job_endpoint_returns_404_when_missing(self) -> None:
+        response = self.client.post("/v1/jobs/does-not-exist/cancel")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_transcript_endpoint_returns_text_when_completed(self) -> None:
+        create_response = self.client.post(
+            "/v1/jobs",
+            json={"task": "inspect", "workspace_path": ".", "execution_mode": "read_only"},
+        )
+        self.assertEqual(create_response.status_code, 200)
+        job_id = create_response.json()["job_id"]
+        for _ in range(50):
+            if self.client.get(f"/v1/jobs/{job_id}").json()["status"] == "completed":
+                break
+            time.sleep(0.01)
+        else:  # pragma: no cover - defensive timeout
+            self.fail("job did not complete in time")
+
+        response = self.client.get(f"/v1/jobs/{job_id}/transcript")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["job_id"], job_id)
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["transcript"], "demo transcript")
+
+    def test_transcript_endpoint_returns_409_when_not_completed(self) -> None:
+        request = RunRequest(
+            task="inspect",
+            workspace_path=".",
+            execution_mode="read_only",
+        )
+        record = self.jobs.create(request)
+
+        response = self.client.get(f"/v1/jobs/{record.job_id}/transcript")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("queued", response.json()["detail"])
+
+    def test_transcript_endpoint_returns_404_when_missing(self) -> None:
+        response = self.client.get("/v1/jobs/does-not-exist/transcript")
+
+        self.assertEqual(response.status_code, 404)
+
     def test_settings_allow_writes_toggle_cycles_write_gates(self) -> None:
         approval_id = self._seed_pending_approval()
 

@@ -339,6 +339,9 @@ class JobResponse(BaseModel):
     completed_at: datetime | None = None
     result: RunResult | None = None
     error: str | None = None
+    task: str | None = None
+    workspace_path: str | None = None
+    execution_mode: Literal["read_only", "workspace_write"] | None = None
 
 
 # ---------------------------------------------------------------------------

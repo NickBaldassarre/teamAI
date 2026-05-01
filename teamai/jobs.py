@@ -214,6 +214,9 @@ class InMemoryJobStore:
             completed_at=record.completed_at,
             result=record.result,
             error=record.error,
+            task=record.request.task,
+            workspace_path=record.request.workspace_path,
+            execution_mode=record.request.execution_mode,
         )
 
     @staticmethod

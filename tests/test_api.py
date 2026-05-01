@@ -270,7 +270,12 @@ class APIStreamingTest(unittest.TestCase):
         payload = summary_response.json()
         self.assertEqual(payload["health"]["status"], "ok")
         self.assertGreaterEqual(payload["jobs"]["counts"]["completed"], 1)
-        self.assertTrue(any(item["job_id"] == job_id for item in payload["jobs"]["recent"]))
+        recent_job = next(
+            item for item in payload["jobs"]["recent"] if item["job_id"] == job_id
+        )
+        self.assertEqual(recent_job["task"], "Inspect repo.")
+        self.assertEqual(recent_job["workspace_path"], ".")
+        self.assertEqual(recent_job["execution_mode"], "read_only")
         self.assertEqual(payload["conversations"]["count"], 1)
         self.assertEqual(payload["conversations"]["items"][0]["task_id"], "task-dashboard")
         self.assertIn("safety", payload)

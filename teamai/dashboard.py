@@ -378,6 +378,14 @@ def render_dashboard_html() -> str:
         font-size: 0.98rem;
       }
 
+      .job-task {
+        margin-top: 6px;
+        color: var(--text);
+        font-size: 0.94rem;
+        line-height: 1.35;
+        word-break: break-word;
+      }
+
       .mono {
         font-family: "SF Mono", "Cascadia Mono", "Menlo", "Consolas", monospace;
         font-size: 0.9rem;
@@ -824,7 +832,11 @@ def render_dashboard_html() -> str:
           const active = job.job_id === state.selectedJobId;
           const stopReason = job.result?.stop_reason ? `<span class="tag mono">${escapeHtml(job.result.stop_reason)}</span>` : "";
           const taskRoute = job.result?.task_route ? `<span class="tag mono">${escapeHtml(job.result.task_route)}</span>` : "";
-          const mode = job.request?.execution_mode ? `<span class="tag mono">${escapeHtml(job.request.execution_mode)}</span>` : "";
+          const mode = job.execution_mode ? `<span class="tag mono">${escapeHtml(job.execution_mode)}</span>` : "";
+          const taskText = (job.task || "").trim();
+          const taskLine = taskText
+            ? `<div class="job-task" title="${escapeHtml(taskText)}">${escapeHtml(truncate(taskText, 140))}</div>`
+            : "";
           return `
             <button
               type="button"
@@ -837,6 +849,7 @@ def render_dashboard_html() -> str:
                 <strong class="mono">${escapeHtml(job.job_id)}</strong>
                 ${statusMarkup(job.status)}
               </div>
+              ${taskLine}
               <div class="meta-row">
                 <span>${formatDate(job.created_at)}</span>
                 ${mode}
@@ -846,6 +859,12 @@ def render_dashboard_html() -> str:
             </button>
           `;
         }).join("");
+      }
+
+      function truncate(text, limit) {
+        const value = String(text || "");
+        if (value.length <= limit) return value;
+        return value.slice(0, Math.max(0, limit - 1)).trimEnd() + "…";
       }
 
       function renderApprovals(items) {
@@ -1707,8 +1726,54 @@ def render_dashboard_html() -> str:
       });
       document.getElementById("team-form").addEventListener("submit", submitTeamForm);
 
-      loadSummary();
-      setInterval(loadSummary, 5000);
+      const SUMMARY_POLL_ACTIVE_MS = 2000;
+      const SUMMARY_POLL_IDLE_MS = 10000;
+      let summaryPollTimer = null;
+
+      function summaryPollDelay() {
+        const counts = (state.recentJobs || []).reduce(
+          (acc, job) => {
+            const status = (job && job.status) || "";
+            if (status === "running" || status === "queued") acc.active += 1;
+            return acc;
+          },
+          { active: 0 },
+        );
+        return counts.active > 0 ? SUMMARY_POLL_ACTIVE_MS : SUMMARY_POLL_IDLE_MS;
+      }
+
+      function scheduleSummaryPoll() {
+        if (summaryPollTimer !== null) {
+          clearTimeout(summaryPollTimer);
+          summaryPollTimer = null;
+        }
+        if (typeof document !== "undefined" && document.hidden) {
+          return;
+        }
+        summaryPollTimer = setTimeout(async () => {
+          summaryPollTimer = null;
+          try {
+            await loadSummary();
+          } finally {
+            scheduleSummaryPoll();
+          }
+        }, summaryPollDelay());
+      }
+
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) {
+            if (summaryPollTimer !== null) {
+              clearTimeout(summaryPollTimer);
+              summaryPollTimer = null;
+            }
+          } else {
+            loadSummary().finally(scheduleSummaryPoll);
+          }
+        });
+      }
+
+      loadSummary().finally(scheduleSummaryPoll);
     </script>
   </body>
 </html>

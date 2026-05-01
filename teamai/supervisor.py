@@ -2876,6 +2876,8 @@ class ClosedLoopSupervisor:
         agent_id = str(getattr(agent, "id", "")).strip().lower()
         if agent_type == "openai" or agent_id.startswith("codex"):
             return "codex"
+        if agent_type in {"gemini_cli", "gemini-cli"} or agent_id.startswith("gemini_cli"):
+            return "gemini-cli"
         if agent_type == "google" or agent_id.startswith("gemini"):
             return "gemini"
         if agent_type in {"xai", "grok"} or agent_id.startswith("grok"):
@@ -2887,7 +2889,7 @@ class ClosedLoopSupervisor:
     def _select_verified_handoff_target(self, request: RunRequest) -> tuple[str, str | None] | None:
         requested_engine = (request.handoff_engine or "").strip().lower()
         requested_model = (request.handoff_model or "").strip() or None
-        if requested_engine in {"codex", "gemini", "grok", "local"}:
+        if requested_engine in {"codex", "gemini", "gemini-cli", "grok", "local"}:
             return requested_engine, requested_model
 
         decision = None
@@ -2930,6 +2932,7 @@ class ClosedLoopSupervisor:
         fallback_engine = (self._settings.default_handoff_engine or "").strip().lower()
         fallback_allowed = (
             fallback_engine == "local"
+            or fallback_engine == "gemini-cli"
             or (fallback_engine == "codex" and bool(os.getenv("OPENAI_API_KEY", "").strip()))
             or (
                 fallback_engine == "gemini"
@@ -2937,7 +2940,7 @@ class ClosedLoopSupervisor:
             )
             or (fallback_engine == "grok" and bool(os.getenv("XAI_API_KEY", "").strip()))
         )
-        if fallback_engine in {"codex", "gemini", "grok", "local"} and fallback_allowed:
+        if fallback_engine in {"codex", "gemini", "gemini-cli", "grok", "local"} and fallback_allowed:
             return fallback_engine, requested_model
         return None
 

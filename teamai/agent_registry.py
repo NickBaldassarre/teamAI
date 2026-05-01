@@ -25,7 +25,7 @@ _DEFAULT_REGISTRY_SEARCH = [
     Path("agents.yaml"),
     Path("~/.teamai/agents.yaml"),
 ]
-_LOCAL_AGENT_TYPES = {"deterministic", "local_mlx"}
+_LOCAL_AGENT_TYPES = {"deterministic", "local_mlx", "gemini_cli"}
 _TASK_TAG_RE = re.compile(r"\b[\w./-]+\.(py|ts|tsx|js|jsx|md|json|toml|yaml|yml)\b")
 
 

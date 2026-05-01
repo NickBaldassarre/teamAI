@@ -23,6 +23,17 @@ from .gemini_bridge import (
     GeminiHandoffExecutionResult,
     execute_gemini_handoff,
 )
+from .gemini_cli_bridge import (
+    DEFAULT_GEMINI_CLI_FAILURE_CONTEXT_FILE,
+    DEFAULT_GEMINI_CLI_MODEL,
+    DEFAULT_GEMINI_CLI_PATCH_FILE,
+    DEFAULT_GEMINI_CLI_PAYLOAD_FILE,
+    GeminiCLIBridge,
+    GeminiCLIHandoffExecutionResult,
+    VerifiedGeminiCLIHandoffExecutionResult,
+    execute_gemini_cli_handoff,
+    execute_verified_gemini_cli_handoff,
+)
 from .grok_bridge import (
     DEFAULT_GROK_FAILURE_CONTEXT_FILE,
     DEFAULT_GROK_MODEL,
@@ -50,6 +61,8 @@ def get_bridge(engine: str) -> AgentBridge:
         return CodexBridge()
     if normalized == "gemini":
         return GeminiBridge()
+    if normalized in {"gemini-cli", "gemini_cli"}:
+        return GeminiCLIBridge()
     if normalized == "grok":
         return GrokBridge()
     if normalized == "local":
@@ -67,6 +80,10 @@ __all__ = [
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_CODEX_PATCH_FILE",
     "DEFAULT_CODEX_PAYLOAD_FILE",
+    "DEFAULT_GEMINI_CLI_FAILURE_CONTEXT_FILE",
+    "DEFAULT_GEMINI_CLI_MODEL",
+    "DEFAULT_GEMINI_CLI_PATCH_FILE",
+    "DEFAULT_GEMINI_CLI_PAYLOAD_FILE",
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_GROK_FAILURE_CONTEXT_FILE",
     "DEFAULT_GROK_MODEL",
@@ -76,18 +93,23 @@ __all__ = [
     "DEFAULT_LOCAL_BRIDGE_PATCH_FILE",
     "DEFAULT_LOCAL_BRIDGE_PAYLOAD_FILE",
     "GeminiBridge",
+    "GeminiCLIBridge",
+    "GeminiCLIHandoffExecutionResult",
     "GeminiHandoffExecutionResult",
     "GrokBridge",
     "GrokHandoffExecutionResult",
     "LocalMLXBridge",
     "VerifiedBridgeExecutionResult",
     "VerifiedCodexHandoffExecutionResult",
+    "VerifiedGeminiCLIHandoffExecutionResult",
     "VerifiedGrokHandoffExecutionResult",
     "execute_codex_handoff",
+    "execute_gemini_cli_handoff",
     "execute_gemini_handoff",
     "execute_grok_handoff",
     "execute_local_handoff",
     "execute_verified_codex_handoff",
+    "execute_verified_gemini_cli_handoff",
     "execute_verified_grok_handoff",
     "execute_verified_local_handoff",
     "get_bridge",

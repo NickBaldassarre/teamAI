@@ -278,7 +278,7 @@ class RunRequest(BaseModel):
     push_remote: str = "origin"
     push_branch_name: str | None = None
     verify_before_commit: bool = False
-    handoff_engine: Literal["codex", "gemini", "grok", "local"] | None = None
+    handoff_engine: Literal["codex", "gemini", "gemini-cli", "grok", "local"] | None = None
     handoff_model: str | None = None
     max_handoff_revision_attempts: int | None = None
     continuation_context: dict[str, Any] = Field(default_factory=dict)

@@ -327,6 +327,16 @@ Other CLI entry points:
   teamai execute-handoff "Implement the requested change." --workspace .
   ```
 
+  Available engines: `codex`, `gemini`, `gemini-cli`, `grok`, `local`. The
+  `gemini-cli` engine drives the local Gemma model through the official
+  [Gemini CLI](https://geminicli.com), so it stays fully offline and quota-free.
+  Install it once with `npm install -g @google/gemini-cli` and run
+  `gemini gemma setup` to provision the local Gemma server. teamAI invokes the
+  CLI as a subprocess; you can override the executable path with
+  `TEAMAI_GEMINI_CLI_BIN`, the model with `TEAMAI_GEMINI_CLI_MODEL` (default
+  `gemma-3-4b-it`), and the per-call timeout with
+  `TEAMAI_GEMINI_CLI_TIMEOUT_SECONDS`.
+
 - Start the persistent daemon, submit a task, and inspect status:
 
   ```bash

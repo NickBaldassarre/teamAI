@@ -116,6 +116,25 @@ agents:
       Useful for whole-repository tasks where the full codebase needs to fit
       in the downstream execution model.
 
+  - id: gemini_cli_local_gemma
+    name: "Gemma 3 4B (Local via Gemini CLI)"
+    type: gemini_cli
+    model_id: "gemma-3-4b-it"
+    capabilities:
+      - verified_handoff_execution
+      - codex_handoff
+    max_context_tokens: 8192
+    cost: free
+    latency: medium
+    requires_env: []
+    rate_limit_sensitivity: low
+    notes: >
+      Verified-handoff engine that drives the local Gemma model through the
+      official Google Gemini CLI (`gemini`) on this machine. Run
+      `gemini gemma setup` once to provision the local Gemma server, then
+      invocations through this agent stay fully offline and quota-free while
+      reusing the same handoff prompt format as the cloud engines.
+
   - id: grok_fast
     name: "Grok 4.20 Reasoning (xAI)"
     type: xai

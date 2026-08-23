@@ -31,10 +31,12 @@ from .tool_api import create_tool_router
 
 
 def _build_supervisor_factory(
-    settings: Settings,
+    settings_provider: Callable[[], Settings],
     supervisor: Any | None,
 ) -> tuple[Callable[[], Any], Any]:
-    template = supervisor or ClosedLoopSupervisor(settings)
+    template = supervisor or ClosedLoopSupervisor(settings_provider())
+    if supervisor is None and hasattr(template, "isolated_copy"):
+        return lambda: template.isolated_copy(settings_provider()), template
     if hasattr(template, "isolated_copy"):
         return lambda: template.isolated_copy(), template
     return lambda: template, template
@@ -47,7 +49,7 @@ def create_app(
     jobs: InMemoryJobStore | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings.from_env()
-    build_supervisor, supervisor_template = _build_supervisor_factory(app_settings, supervisor)
+    build_supervisor, supervisor_template = _build_supervisor_factory(lambda: app_settings, supervisor)
     job_store = jobs or InMemoryJobStore()
 
     # Scheduler is created here so the lifespan can reference it, but

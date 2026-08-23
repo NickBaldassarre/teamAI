@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .autonomy import derive_write_policy
 from .events import build_status_event
 from .schemas import JobResponse, RunEvent, RunRequest, RunResult
 
@@ -217,6 +218,10 @@ class InMemoryJobStore:
             task=record.request.task,
             workspace_path=record.request.workspace_path,
             execution_mode=record.request.execution_mode,
+            write_policy=derive_write_policy(
+                execution_mode=record.request.execution_mode,
+                requested_policy=record.request.write_policy,
+            ),
         )
 
     @staticmethod

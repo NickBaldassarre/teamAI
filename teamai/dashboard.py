@@ -596,14 +596,35 @@ def render_dashboard_html() -> str:
               </label>
               <div class="field-grid">
                 <label>
+                  Run Profile
+                  <select id="run-profile-input" name="run_profile">
+                    <option value="read_only">Read-only inspection</option>
+                    <option value="patch_proposal">Patch proposal</option>
+                    <option value="autonomous_coding">Autonomous coding</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <label>
                   Workspace
                   <input id="workspace-input" name="workspace_path" placeholder="." />
                 </label>
+              </div>
+              <div class="field-grid">
                 <label>
                   Execution Mode
                   <select id="execution-mode-input" name="execution_mode">
                     <option value="read_only">read_only</option>
                     <option value="workspace_write">workspace_write</option>
+                  </select>
+                </label>
+                <label>
+                  Write Policy
+                  <select id="write-policy-input" name="write_policy">
+                    <option value="read_only">read_only</option>
+                    <option value="propose_only">propose_only</option>
+                    <option value="auto_apply_low_risk">auto_apply_low_risk</option>
+                    <option value="auto_apply_scoped">auto_apply_scoped</option>
+                    <option value="full_auto">full_auto</option>
                   </select>
                 </label>
               </div>
@@ -833,6 +854,8 @@ def render_dashboard_html() -> str:
           const stopReason = job.result?.stop_reason ? `<span class="tag mono">${escapeHtml(job.result.stop_reason)}</span>` : "";
           const taskRoute = job.result?.task_route ? `<span class="tag mono">${escapeHtml(job.result.task_route)}</span>` : "";
           const mode = job.execution_mode ? `<span class="tag mono">${escapeHtml(job.execution_mode)}</span>` : "";
+          const policyValue = job.write_policy || job.result?.write_policy;
+          const writePolicy = policyValue ? `<span class="tag mono">${escapeHtml(policyValue)}</span>` : "";
           const taskText = (job.task || "").trim();
           const taskLine = taskText
             ? `<div class="job-task" title="${escapeHtml(taskText)}">${escapeHtml(truncate(taskText, 140))}</div>`
@@ -853,6 +876,7 @@ def render_dashboard_html() -> str:
               <div class="meta-row">
                 <span>${formatDate(job.created_at)}</span>
                 ${mode}
+                ${writePolicy}
                 ${taskRoute}
                 ${stopReason}
               </div>
@@ -939,7 +963,7 @@ def render_dashboard_html() -> str:
         if (!text) {
           return '<span class="diff-meta">(no textual diff)</span>';
         }
-        return text.split("\n").map((line) => {
+        return text.split("\\n").map((line) => {
           let className = "diff-meta";
           if (line.startsWith("+++") || line.startsWith("---")) {
             className = "diff-meta";
@@ -1598,11 +1622,73 @@ def render_dashboard_html() -> str:
         }
       }
 
+      const RUN_PROFILES = {
+        read_only: {
+          executionMode: "read_only",
+          writePolicy: "read_only",
+        },
+        patch_proposal: {
+          executionMode: "workspace_write",
+          writePolicy: "propose_only",
+        },
+        autonomous_coding: {
+          executionMode: "workspace_write",
+          writePolicy: "auto_apply_low_risk",
+        },
+      };
+
+      function applyRunProfile(profile) {
+        const config = RUN_PROFILES[profile];
+        if (!config) {
+          return;
+        }
+        document.getElementById("execution-mode-input").value = config.executionMode;
+        document.getElementById("write-policy-input").value = config.writePolicy;
+      }
+
+      function syncRunProfileFromFields() {
+        const executionMode = document.getElementById("execution-mode-input").value;
+        const writePolicy = document.getElementById("write-policy-input").value;
+        const profileInput = document.getElementById("run-profile-input");
+        if (executionMode === "read_only" && writePolicy === "read_only") {
+          profileInput.value = "read_only";
+        } else if (executionMode === "workspace_write" && writePolicy === "propose_only") {
+          profileInput.value = "patch_proposal";
+        } else if (executionMode === "workspace_write" && writePolicy === "auto_apply_low_risk") {
+          profileInput.value = "autonomous_coding";
+        } else {
+          profileInput.value = "custom";
+        }
+      }
+
+      function handleExecutionModeChange() {
+        const executionModeInput = document.getElementById("execution-mode-input");
+        const writePolicyInput = document.getElementById("write-policy-input");
+        if (executionModeInput.value === "read_only") {
+          writePolicyInput.value = "read_only";
+        } else if (writePolicyInput.value === "read_only") {
+          writePolicyInput.value = "auto_apply_low_risk";
+        }
+        syncRunProfileFromFields();
+      }
+
+      function handleWritePolicyChange() {
+        const executionModeInput = document.getElementById("execution-mode-input");
+        const writePolicyInput = document.getElementById("write-policy-input");
+        if (writePolicyInput.value === "read_only") {
+          executionModeInput.value = "read_only";
+        } else if (executionModeInput.value === "read_only") {
+          executionModeInput.value = "workspace_write";
+        }
+        syncRunProfileFromFields();
+      }
+
       async function submitJob(event) {
         event.preventDefault();
         const task = document.getElementById("task-input").value.trim();
         const workspacePath = document.getElementById("workspace-input").value.trim();
         const executionMode = document.getElementById("execution-mode-input").value;
+        const writePolicy = document.getElementById("write-policy-input").value;
         const maxRoundsRaw = document.getElementById("max-rounds-input").value.trim();
         const temperatureRaw = document.getElementById("temperature-input").value.trim();
 
@@ -1610,9 +1696,17 @@ def render_dashboard_html() -> str:
           return;
         }
 
+        const banner = document.getElementById("submit-banner");
+        if (executionMode === "workspace_write" && !state.writesEnabled) {
+          banner.textContent = "Workspace write runs need writes enabled. Click the writes safety pill first.";
+          banner.dataset.tone = "fail";
+          return;
+        }
+
         const payload = {
           task,
           execution_mode: executionMode,
+          write_policy: executionMode === "read_only" ? "read_only" : writePolicy,
         };
         if (workspacePath) {
           payload.workspace_path = workspacePath;
@@ -1624,7 +1718,6 @@ def render_dashboard_html() -> str:
           payload.temperature = Number(temperatureRaw);
         }
 
-        const banner = document.getElementById("submit-banner");
         banner.textContent = "Queueing run...";
         banner.dataset.tone = "";
 
@@ -1644,6 +1737,11 @@ def render_dashboard_html() -> str:
         }
       }
 
+      document.getElementById("run-profile-input").addEventListener("change", (event) => {
+        applyRunProfile(event.currentTarget.value);
+      });
+      document.getElementById("execution-mode-input").addEventListener("change", handleExecutionModeChange);
+      document.getElementById("write-policy-input").addEventListener("change", handleWritePolicyChange);
       document.getElementById("run-form").addEventListener("submit", submitJob);
       document.getElementById("refresh-button").addEventListener("click", loadSummary);
       document.getElementById("hero-writes").addEventListener("click", handleWritesToggle);

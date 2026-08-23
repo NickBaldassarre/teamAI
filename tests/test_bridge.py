@@ -22,6 +22,11 @@ class BridgeLauncherTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.project_root = Path(self.temp_dir.name)
+        self._runtime_settings_patch = patch(
+            "teamai.runtime_state._runtime_settings_path",
+            return_value=self.project_root / "runtime_settings.json",
+        )
+        self._runtime_settings_patch.start()
         self.artifacts = default_bridge_artifacts(self.project_root)
         self.config = BridgeLaunchConfig(
             task="Inspect this repository and identify the next engineering tasks.",
@@ -39,6 +44,7 @@ class BridgeLauncherTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self._runtime_settings_patch.stop()
         self.temp_dir.cleanup()
 
     def test_render_bridge_script_contains_run_command_and_status_updates(self) -> None:

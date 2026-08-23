@@ -342,6 +342,7 @@ class JobResponse(BaseModel):
     task: str | None = None
     workspace_path: str | None = None
     execution_mode: Literal["read_only", "workspace_write"] | None = None
+    write_policy: WritePolicy | None = None
 
 
 # ---------------------------------------------------------------------------

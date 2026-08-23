@@ -3,6 +3,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -78,6 +81,35 @@ class _IsolatedSupervisor:
             stop_reason="verifier_declared_complete",
             final_answer=f"child-{self._clone_id}",
             transcript="demo transcript",
+            warnings=[],
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+
+
+class _SettingsEchoSupervisor:
+    def __init__(self, settings, backend=None) -> None:  # noqa: ANN001, ARG002
+        self.settings = settings
+        self.model_loaded = False
+
+    def isolated_copy(self, settings=None):  # noqa: ANN001, ANN202
+        return _SettingsEchoSupervisor(settings or self.settings)
+
+    def run(self, request, progress_callback=None, event_callback=None):  # noqa: ANN001
+        if progress_callback is not None:
+            progress_callback(f"allow_writes={self.settings.allow_writes}")
+        write_policy = request.write_policy or (
+            "auto_apply_low_risk" if request.execution_mode == "workspace_write" else "read_only"
+        )
+        return RunResult(
+            status="completed",
+            model_id="settings-echo",
+            workspace=str(self.settings.workspace_root),
+            execution_mode=request.execution_mode,
+            write_policy=write_policy,
+            stop_reason="settings_echo_complete",
+            final_answer=f"allow_writes={self.settings.allow_writes}",
+            transcript="settings echo transcript",
             warnings=[],
             started_at=datetime.now(timezone.utc),
             completed_at=datetime.now(timezone.utc),
@@ -239,6 +271,12 @@ class APIStreamingTest(unittest.TestCase):
         self.assertIn("teamAI Console", dashboard_response.text)
         self.assertIn("Pending Approvals", dashboard_response.text)
         self.assertIn("writes: read-only", dashboard_response.text)
+        self.assertIn("Run Profile", dashboard_response.text)
+        self.assertIn("Autonomous coding", dashboard_response.text)
+        self.assertIn("auto_apply_low_risk", dashboard_response.text)
+        self.assertIn("Workspace write runs need writes enabled", dashboard_response.text)
+        self.assertIn('return text.split("\\n").map', dashboard_response.text)
+        self.assertNotIn('return text.split("\n").map', dashboard_response.text)
 
         self.client.post(
             "/v1/conversation/task-dashboard/post",
@@ -276,6 +314,7 @@ class APIStreamingTest(unittest.TestCase):
         self.assertEqual(recent_job["task"], "Inspect repo.")
         self.assertEqual(recent_job["workspace_path"], ".")
         self.assertEqual(recent_job["execution_mode"], "read_only")
+        self.assertEqual(recent_job["write_policy"], "read_only")
         self.assertEqual(payload["conversations"]["count"], 1)
         self.assertEqual(payload["conversations"]["items"][0]["task_id"], "task-dashboard")
         self.assertIn("safety", payload)
@@ -284,6 +323,53 @@ class APIStreamingTest(unittest.TestCase):
         self.assertIn("approvals", payload)
         self.assertEqual(payload["approvals"]["count"], 0)
         self.assertEqual(payload["approvals"]["items"], [])
+
+    def test_job_response_exposes_effective_write_policy(self) -> None:
+        create_response = self.client.post(
+            "/v1/jobs",
+            json={
+                "task": "Make a low-risk code edit.",
+                "workspace_path": ".",
+                "execution_mode": "workspace_write",
+                "write_policy": "auto_apply_low_risk",
+            },
+        )
+        self.assertEqual(create_response.status_code, 200)
+        body = create_response.json()
+        self.assertEqual(body["execution_mode"], "workspace_write")
+        self.assertEqual(body["write_policy"], "auto_apply_low_risk")
+
+        job_response = self.client.get(f"/v1/jobs/{body['job_id']}")
+        self.assertEqual(job_response.status_code, 200)
+        self.assertEqual(job_response.json()["write_policy"], "auto_apply_low_risk")
+
+    def test_dashboard_rendered_script_has_valid_javascript_syntax(self) -> None:
+        dashboard_response = self.client.get("/dashboard")
+        self.assertEqual(dashboard_response.status_code, 200)
+        match = re.search(r"<script>([\s\S]*)</script>", dashboard_response.text)
+        self.assertIsNotNone(match)
+        assert match is not None
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is required to validate rendered dashboard JavaScript syntax")
+
+        completed = subprocess.run(
+            [
+                node,
+                "-e",
+                (
+                    "let script = '';"
+                    "process.stdin.on('data', chunk => script += chunk);"
+                    "process.stdin.on('end', () => { new Function(script); });"
+                ),
+            ],
+            input=match.group(1),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_dashboard_summary_surfaces_pending_approvals(self) -> None:
         from teamai.approvals import PatchApprovalStore
@@ -742,6 +828,40 @@ class APIStreamingTest(unittest.TestCase):
                 json={"task": "Run evals", "cron": "0 3 * * *"},
             )
         self.assertEqual(sched_response.status_code, 403)
+
+    def test_settings_allow_writes_toggle_reaches_background_job_supervisor(self) -> None:
+        self.client.close()
+        jobs = InMemoryJobStore()
+        with patch("teamai.api.ClosedLoopSupervisor", _SettingsEchoSupervisor):
+            self.client = TestClient(create_app(self.settings, jobs=jobs))
+            toggle_on = self.client.post(
+                "/v1/settings/allow_writes",
+                json={"allow_writes": True},
+            )
+            self.assertEqual(toggle_on.status_code, 200)
+
+            create_response = self.client.post(
+                "/v1/jobs",
+                json={
+                    "task": "Make yourself better.",
+                    "execution_mode": "workspace_write",
+                    "write_policy": "auto_apply_low_risk",
+                },
+            )
+
+            self.assertEqual(create_response.status_code, 200)
+            job_id = create_response.json()["job_id"]
+            for _ in range(50):
+                job_response = self.client.get(f"/v1/jobs/{job_id}")
+                if job_response.json()["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            else:  # pragma: no cover - defensive timeout
+                self.fail("job did not complete in time")
+
+            body = job_response.json()
+            self.assertEqual(body["result"]["final_answer"], "allow_writes=True")
+            self.assertEqual(body["result"]["write_policy"], "auto_apply_low_risk")
 
     def test_settings_allow_writes_rejects_invalid_body(self) -> None:
         missing = self.client.post("/v1/settings/allow_writes", json={})
